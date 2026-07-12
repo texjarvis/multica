@@ -483,6 +483,11 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	if baseRef == "" {
 		return nil, fmt.Errorf("cannot resolve default branch for %s: bare cache at %s has no usable refs (origin/* is empty or ambiguous and bare HEAD has no match). The cache may be corrupted; delete it and retry", params.RepoURL, barePath)
 	}
+	baseOut, err := runGitCombinedOutput("-C", barePath, "rev-parse", "--verify", baseRef+"^{commit}")
+	if err != nil {
+		return nil, fmt.Errorf("resolve checkout base %q: %s: %w", baseRef, strings.TrimSpace(string(baseOut)), err)
+	}
+	baseCommit := strings.TrimSpace(string(baseOut))
 
 	// Build branch name: agent/{sanitized-name}/{short-task-id}
 	branchName := fmt.Sprintf("agent/%s/%s", sanitizeName(params.AgentName), shortID(params.TaskID))
@@ -491,10 +496,20 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	dirName := repoNameFromURL(params.RepoURL)
 	worktreePath := filepath.Join(params.WorkDir, dirName)
 
+	// Migrate checkouts created by older daemons. Their .git file points into
+	// the shared cache, which a workspace-write task cannot safely mutate.
+	// Reuse already promises a clean reset, so replace the legacy worktree with
+	// an isolated checkout before handing it back to the task.
+	if isLegacyGitWorktree(worktreePath) {
+		if out, err := runGitCombinedOutput("-C", barePath, "worktree", "remove", "--force", worktreePath); err != nil {
+			return nil, fmt.Errorf("migrate legacy worktree: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
+
 	// If worktree already exists (reused environment from a prior task),
 	// update it to the latest remote code instead of creating a new one.
 	if isGitWorktree(worktreePath) {
-		actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseRef)
+		actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseCommit)
 		if err != nil {
 			return nil, fmt.Errorf("update existing worktree: %w", err)
 		}
@@ -504,10 +519,8 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 		}
 
 		// Install or remove the Co-authored-by hook based on the workspace
-		// setting. The hook lives in the bare repo's shared hooks dir, so we
-		// must actively remove it when disabled — otherwise a previously
-		// installed hook keeps appending the trailer to every commit even
-		// after the user toggles the setting off.
+		// setting. Isolated task checkouts keep hooks in their local .git dir,
+		// so a sibling task cannot change this checkout's behavior.
 		if params.CoAuthoredByEnabled {
 			if err := installCoAuthoredByHook(worktreePath); err != nil {
 				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
@@ -533,7 +546,7 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 
 	// Create a new worktree. createWorktree may rename the branch to avoid
 	// collisions with stale per-task refs left over from previous runs.
-	actualBranch, err := createWorktree(barePath, worktreePath, branchName, baseRef)
+	actualBranch, err := createWorktree(barePath, params.RepoURL, worktreePath, branchName, baseCommit)
 	if err != nil {
 		return nil, fmt.Errorf("create worktree: %w", err)
 	}
@@ -597,7 +610,7 @@ func gitRefExists(repoPath, ref string) bool {
 // createWorktree creates a git worktree at the given path with a new branch.
 // Returns the actual branch name used — which may differ from the requested
 // branchName if a collision was resolved by appending a timestamp suffix.
-func createWorktree(gitRoot, worktreePath, branchName, baseRef string) (string, error) {
+func createWorktree(gitRoot, repoURL, worktreePath, branchName, baseCommit string) (string, error) {
 	// Pre-check: if the worktree path already exists we would get a confusing
 	// "already exists" error from `git worktree add` — which used to be
 	// misclassified as a branch collision, causing the retry to leak branches
@@ -607,11 +620,11 @@ func createWorktree(gitRoot, worktreePath, branchName, baseRef string) (string, 
 		return "", fmt.Errorf("worktree path already exists and is not a valid git worktree: %s", worktreePath)
 	}
 
-	err := runWorktreeAdd(gitRoot, worktreePath, branchName, baseRef)
+	err := runWorktreeAdd(gitRoot, repoURL, worktreePath, branchName, baseCommit)
 	if err != nil && isBranchCollisionError(err) {
 		// Branch name collision: append timestamp and retry once.
 		branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
-		err = runWorktreeAdd(gitRoot, worktreePath, branchName, baseRef)
+		err = runWorktreeAdd(gitRoot, repoURL, worktreePath, branchName, baseCommit)
 	}
 	if err != nil {
 		return "", err
@@ -619,10 +632,37 @@ func createWorktree(gitRoot, worktreePath, branchName, baseRef string) (string, 
 	return branchName, nil
 }
 
-func runWorktreeAdd(gitRoot, worktreePath, branchName, baseRef string) error {
-	if out, err := runGitCombinedOutput("-C", gitRoot, "worktree", "add", "-b", branchName, worktreePath, baseRef); err != nil {
-		return fmt.Errorf("git worktree add: %s: %w", strings.TrimSpace(string(out)), err)
+func runWorktreeAdd(gitRoot, repoURL, worktreePath, branchName, baseCommit string) error {
+	if out, err := runGitCombinedOutput("init", worktreePath); err != nil {
+		return fmt.Errorf("git init: %s: %w", strings.TrimSpace(string(out)), err)
 	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(worktreePath)
+		}
+	}()
+	gitDir := filepath.Join(worktreePath, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects", "info"), 0o755); err != nil {
+		return fmt.Errorf("create alternates directory: %w", err)
+	}
+	// Reuse the daemon cache for reads while keeping every mutable Git file
+	// (index, refs, locks, config, hooks, and newly-created objects) task-local.
+	// A newline is required by Git's alternates file format.
+	if err := os.WriteFile(filepath.Join(gitDir, "objects", "info", "alternates"), []byte(filepath.Join(gitRoot, "objects")+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write object alternates: %w", err)
+	}
+	commands := [][]string{
+		{"remote", "add", "origin", repoURL},
+		{"config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"},
+		{"checkout", "-b", branchName, baseCommit},
+	}
+	for _, args := range commands {
+		if out, err := runGitCombinedOutput(append([]string{"-C", worktreePath}, args...)...); err != nil {
+			return fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+		}
+	}
+	cleanup = false
 	return nil
 }
 
@@ -641,17 +681,23 @@ func isBranchCollisionError(err error) bool {
 }
 
 // isGitWorktree checks if a path is an existing git worktree.
-// Worktrees have a .git *file* (not directory) that points to the main repo.
+// Task checkouts use a local .git directory whose object alternates file
+// points read-only at the daemon cache.
 func isGitWorktree(path string) bool {
+	info, err := os.Stat(filepath.Join(path, ".git"))
+	return err == nil && info.IsDir()
+}
+
+func isLegacyGitWorktree(path string) bool {
 	info, err := os.Stat(filepath.Join(path, ".git"))
 	return err == nil && !info.IsDir()
 }
 
-// updateExistingWorktree resets the worktree to a clean state and checks out a
-// new branch from the default branch. The caller is responsible for fetching
-// the bare cache beforehand (worktrees share the same object store).
+// updateExistingWorktree resets the checkout to a clean state and checks out a
+// new branch from the exact commit resolved in the freshly-fetched bare cache.
+// The task-local repo reads that commit through its object alternates file.
 // Returns the actual branch name used (may differ from input on collision).
-func updateExistingWorktree(worktreePath, branchName, baseRef string) (string, error) {
+func updateExistingWorktree(worktreePath, branchName, baseCommit string) (string, error) {
 	// Discard any leftover uncommitted changes from the previous task.
 	if out, err := runGitCombinedOutput("-C", worktreePath, "reset", "--hard"); err != nil {
 		return "", fmt.Errorf("git reset --hard: %s: %w", strings.TrimSpace(string(out)), err)
@@ -663,11 +709,10 @@ func updateExistingWorktree(worktreePath, branchName, baseRef string) (string, e
 	}
 
 	// Create a new branch from the resolved default-branch ref and switch to
-	// it. baseRef is a ref path returned by getRemoteDefaultBranch — usually
-	// "refs/remotes/origin/<branch>" but may be "refs/heads/<branch>" on a
-	// legacy/migration-pending cache. Either form is valid as a checkout
-	// startpoint.
-	out, err := runGitCombinedOutput("-C", worktreePath, "checkout", "-b", branchName, baseRef)
+	// it. baseCommit is the exact commit ID resolved in the bare cache, not a
+	// remote-tracking name (those refs intentionally do not live in the
+	// task-local repository).
+	out, err := runGitCombinedOutput("-C", worktreePath, "checkout", "-b", branchName, baseCommit)
 	if err == nil {
 		return branchName, nil
 	}
@@ -677,7 +722,7 @@ func updateExistingWorktree(worktreePath, branchName, baseRef string) (string, e
 	}
 	// Branch name collision: append timestamp and retry once.
 	branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
-	if out2, err2 := runGitCombinedOutput("-C", worktreePath, "checkout", "-b", branchName, baseRef); err2 != nil {
+	if out2, err2 := runGitCombinedOutput("-C", worktreePath, "checkout", "-b", branchName, baseCommit); err2 != nil {
 		return "", fmt.Errorf("git checkout -b (retry): %s: %w", strings.TrimSpace(string(out2)), err2)
 	}
 	return branchName, nil

@@ -514,6 +514,133 @@ func TestCreateWorktree(t *testing.T) {
 	}
 }
 
+func TestCreateWorktreeReusesIsolatedCheckoutAtLatestBase(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	workDir := t.TempDir()
+	params := WorktreeParams{
+		WorkspaceID: "ws-1",
+		RepoURL:     sourceRepo,
+		WorkDir:     workDir,
+		AgentName:   "Architect",
+		TaskID:      "aaaaaaaa-0000-0000-0000-000000000000",
+	}
+	first, err := cache.CreateWorktree(params)
+	if err != nil {
+		t.Fatalf("first checkout failed: %v", err)
+	}
+	firstHead := gitHead(t, first.Path)
+
+	addEmptyCommit(t, sourceRepo, "advance default branch")
+	wantHead := gitHead(t, sourceRepo)
+	if wantHead == firstHead {
+		t.Fatal("test setup failed: source HEAD did not advance")
+	}
+
+	second, err := cache.CreateWorktree(params)
+	if err != nil {
+		t.Fatalf("reused checkout failed: %v", err)
+	}
+	if second.Path != first.Path {
+		t.Fatalf("reuse path changed: got %s want %s", second.Path, first.Path)
+	}
+	if got := gitHead(t, second.Path); got != wantHead {
+		t.Fatalf("reused checkout HEAD = %s, want latest base %s", got, wantHead)
+	}
+	if info, err := os.Stat(filepath.Join(second.Path, ".git")); err != nil || !info.IsDir() {
+		t.Fatalf("reused checkout does not have task-local Git metadata: info=%v err=%v", info, err)
+	}
+}
+
+func TestCreateWorktreeMigratesLegacyLinkedWorktree(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	workDir := t.TempDir()
+	legacyPath := filepath.Join(workDir, repoNameFromURL(sourceRepo))
+	barePath := cache.Lookup("ws-1", sourceRepo)
+	baseRef := getRemoteDefaultBranch(barePath)
+	cmd := exec.Command("git", "-C", barePath, "worktree", "add", "-b", "legacy-task-branch", legacyPath, baseRef)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create legacy linked worktree: %s: %v", out, err)
+	}
+	if info, err := os.Stat(filepath.Join(legacyPath, ".git")); err != nil || info.IsDir() {
+		t.Fatalf("test setup did not create a legacy .git file: info=%v err=%v", info, err)
+	}
+
+	result, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-1",
+		RepoURL:     sourceRepo,
+		WorkDir:     workDir,
+		AgentName:   "Architect",
+		TaskID:      "cccccccc-0000-0000-0000-000000000000",
+	})
+	if err != nil {
+		t.Fatalf("migrate legacy checkout: %v", err)
+	}
+	if result.Path != legacyPath {
+		t.Fatalf("migrated path = %s, want %s", result.Path, legacyPath)
+	}
+	if info, err := os.Stat(filepath.Join(result.Path, ".git")); err != nil || !info.IsDir() {
+		t.Fatalf("migrated checkout does not have task-local Git metadata: info=%v err=%v", info, err)
+	}
+}
+
+func TestTaskCheckoutCommitIsIsolatedFromCacheAndSibling(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	first, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-1", RepoURL: sourceRepo, WorkDir: t.TempDir(),
+		AgentName: "Architect", TaskID: "aaaaaaaa-0000-0000-0000-000000000000",
+	})
+	if err != nil {
+		t.Fatalf("first checkout failed: %v", err)
+	}
+	second, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-1", RepoURL: sourceRepo, WorkDir: t.TempDir(),
+		AgentName: "Sentry", TaskID: "bbbbbbbb-0000-0000-0000-000000000000",
+	})
+	if err != nil {
+		t.Fatalf("second checkout failed: %v", err)
+	}
+	secondHead := strings.TrimSpace(runGitTestOutput(t, second.Path, "rev-parse", "HEAD"))
+
+	if err := os.WriteFile(filepath.Join(first.Path, "bounded.txt"), []byte("task-local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAuthored(t, first.Path, "add", "bounded.txt")
+	runGitAuthored(t, first.Path, "commit", "-m", "bounded commit")
+	commit := strings.TrimSpace(runGitTestOutput(t, first.Path, "rev-parse", "HEAD"))
+	if status := runGitTestOutput(t, first.Path, "status", "--porcelain"); status != "" {
+		t.Fatalf("task checkout is dirty after commit: %q", status)
+	}
+
+	barePath := cache.Lookup("ws-1", sourceRepo)
+	if err := exec.Command("git", "-C", barePath, "cat-file", "-e", commit+"^{commit}").Run(); err == nil {
+		t.Fatal("task commit leaked into daemon cache object storage")
+	}
+	if got := strings.TrimSpace(runGitTestOutput(t, second.Path, "rev-parse", "HEAD")); got != secondHead {
+		t.Fatalf("sibling HEAD changed: got %s want %s", got, secondHead)
+	}
+	if status := runGitTestOutput(t, second.Path, "status", "--porcelain"); status != "" {
+		t.Fatalf("sibling checkout changed: %q", status)
+	}
+}
+
 func TestCreateWorktreeExcludesOpenCodeSkills(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createTestRepo(t)
@@ -751,6 +878,16 @@ func runGitAuthored(t *testing.T, repoPath string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v in %s: %s: %v", args, repoPath, out, err)
 	}
+}
+
+func runGitTestOutput(t *testing.T, repoPath string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repoPath}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s failed: %v", strings.Join(args, " "), err)
+	}
+	return string(out)
 }
 
 // TestCreateWorktreeFetchesDespiteAgentBranchOnRemote reproduces the original
@@ -1219,12 +1356,8 @@ func TestCoAuthoredByHookIdempotent(t *testing.T) {
 	}
 }
 
-// TestCreateWorktreeRemovesCoAuthoredByHookWhenDisabled verifies the toggle-off
-// path: a bare cache that already carries the Multica prepare-commit-msg hook
-// (e.g. from a prior worktree created with the setting on) must drop the hook
-// when the next CreateWorktree call passes CoAuthoredByEnabled=false.
-// Otherwise commits keep getting the trailer even after the user disables the
-// workspace setting.
+// TestCreateWorktreeKeepsCoAuthorHooksTaskLocal verifies that one task's hook
+// setting cannot affect another checkout or mutate the shared bare cache.
 func TestCreateWorktreeRemovesCoAuthoredByHookWhenDisabled(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createTestRepo(t)
@@ -1235,24 +1368,29 @@ func TestCreateWorktreeRemovesCoAuthoredByHookWhenDisabled(t *testing.T) {
 		t.Fatalf("sync failed: %v", err)
 	}
 
-	// First worktree: setting enabled → hook installed in the bare cache's
-	// shared hooks dir.
+	// First checkout: setting enabled → hook installed only in its local
+	// Git directory.
 	workDir1 := t.TempDir()
-	if _, err := cache.CreateWorktree(WorktreeParams{
+	first, err := cache.CreateWorktree(WorktreeParams{
 		WorkspaceID:         "ws-1",
 		RepoURL:             sourceRepo,
 		WorkDir:             workDir1,
 		AgentName:           "Test Agent",
 		TaskID:              "11111111-0000-0000-0000-000000000000",
 		CoAuthoredByEnabled: true,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreateWorktree (enabled) failed: %v", err)
 	}
 
 	barePath := cache.Lookup("ws-1", sourceRepo)
-	hookPath := filepath.Join(barePath, "hooks", "prepare-commit-msg")
-	if _, err := os.Stat(hookPath); err != nil {
-		t.Fatalf("precondition: expected hook to be installed at %s: %v", hookPath, err)
+	sharedHookPath := filepath.Join(barePath, "hooks", "prepare-commit-msg")
+	localHookPath := filepath.Join(first.Path, ".git", "hooks", "prepare-commit-msg")
+	if _, err := os.Stat(localHookPath); err != nil {
+		t.Fatalf("expected task-local hook at %s: %v", localHookPath, err)
+	}
+	if _, err := os.Stat(sharedHookPath); !os.IsNotExist(err) {
+		t.Fatalf("shared cache hook unexpectedly changed at %s: %v", sharedHookPath, err)
 	}
 
 	// Second worktree on the same bare cache: setting disabled → hook must
@@ -1271,8 +1409,11 @@ func TestCreateWorktreeRemovesCoAuthoredByHookWhenDisabled(t *testing.T) {
 		t.Fatalf("CreateWorktree (disabled) failed: %v", err)
 	}
 
-	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
-		t.Errorf("expected hook to be removed at %s, stat err=%v", hookPath, err)
+	if _, err := os.Stat(localHookPath); err != nil {
+		t.Errorf("first task hook was changed by sibling checkout: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(result.Path, ".git", "hooks", "prepare-commit-msg")); !os.IsNotExist(err) {
+		t.Errorf("disabled checkout unexpectedly has a hook, stat err=%v", err)
 	}
 
 	if err := os.WriteFile(filepath.Join(result.Path, "test.txt"), []byte("hello\n"), 0o644); err != nil {
@@ -1291,13 +1432,8 @@ func TestCreateWorktreeRemovesCoAuthoredByHookWhenDisabled(t *testing.T) {
 	}
 }
 
-// TestCreateWorktreeRemovesLegacyCoAuthoredByHook verifies the migration
-// path: bare clones already on disk from previous daemon versions carry a
-// prepare-commit-msg hook that does NOT include the multicaHookMarker
-// sentinel — only the older `# Installed by the Multica daemon.` comment.
-// Toggling the workspace setting off must still remove those legacy hooks,
-// otherwise users who flip the toggle in production keep seeing the trailer
-// indefinitely (the exact bug reported in MUL-1704).
+// TestCreateWorktreeIgnoresLegacySharedCoAuthoredByHook verifies that legacy
+// cache hooks neither run in nor get mutated by isolated task checkouts.
 func TestCreateWorktreeRemovesLegacyCoAuthoredByHook(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createTestRepo(t)
@@ -1358,8 +1494,8 @@ git interpret-trailers --in-place --trailer "$TRAILER" "$COMMIT_MSG_FILE"
 		t.Fatalf("CreateWorktree (disabled) failed: %v", err)
 	}
 
-	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
-		t.Errorf("expected legacy hook to be removed at %s, stat err=%v", hookPath, err)
+	if _, err := os.Stat(hookPath); err != nil {
+		t.Errorf("legacy shared hook was unexpectedly mutated: %v", err)
 	}
 
 	if err := os.WriteFile(filepath.Join(result.Path, "test.txt"), []byte("hello\n"), 0o644); err != nil {
