@@ -3,6 +3,7 @@ package featureflags
 import (
 	"context"
 
+	"github.com/multica-ai/multica/server/pkg/agentroute"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/multica-ai/multica/server/pkg/providerfailover"
 )
@@ -38,6 +39,14 @@ const (
 	// active handoffs is a deliberate two-step so shadow evaluation always
 	// precedes action.
 	ProviderFailoverActive = "provider_failover_active"
+
+	// AdaptiveAgentRouting gates transactional, per-task runtime/model/thinking
+	// admission for agents that explicitly declare validated candidates in
+	// runtime_config.adaptive_routing. ON alone is shadow-only.
+	AdaptiveAgentRouting = "adaptive_agent_routing"
+	// AdaptiveAgentRoutingActive is the independent actuator gate. It has no
+	// effect unless AdaptiveAgentRouting is also enabled.
+	AdaptiveAgentRoutingActive = "adaptive_agent_routing_active"
 )
 
 var frontendPublicFlags = []string{
@@ -71,6 +80,18 @@ func ProviderFailoverMode(ctx context.Context, flags *featureflag.Service) provi
 		return providerfailover.ModeActive
 	}
 	return providerfailover.ModeShadow
+}
+
+// AdaptiveAgentRoutingMode composes the two rollout gates. An accidental
+// active-only enable is inert; operators must observe shadow decisions first.
+func AdaptiveAgentRoutingMode(ctx context.Context, flags *featureflag.Service) agentroute.Mode {
+	if !flags.IsEnabled(ctx, AdaptiveAgentRouting, false) {
+		return agentroute.ModeOff
+	}
+	if flags.IsEnabled(ctx, AdaptiveAgentRoutingActive, false) {
+		return agentroute.ModeActive
+	}
+	return agentroute.ModeShadow
 }
 
 func EvaluateFrontendPublicFlags(ctx context.Context, flags *featureflag.Service) map[string]bool {

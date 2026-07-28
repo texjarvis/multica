@@ -27,6 +27,7 @@ func TestReasonStringWireValues(t *testing.T) {
 		{ReasonIterationLimit, "iteration_limit"},
 		{ReasonAgentBlocked, "agent_blocked"},
 		{ReasonAPIInvalidRequest, "api_invalid_request"},
+		{ReasonAdaptiveRoutingAdmissionFailed, "adaptive_routing_admission_failed"},
 		// Agent-side.
 		{ReasonAgentProviderAuthOrAccess, "agent_error.provider_auth_or_access"},
 		{ReasonAgentProviderQuotaLimit, "agent_error.provider_quota_limit"},
@@ -44,7 +45,7 @@ func TestReasonStringWireValues(t *testing.T) {
 		{ReasonAgentUnknown, "agent_error.unknown"},
 	}
 
-	if got, want := len(cases), 22; got != want {
+	if got, want := len(cases), 23; got != want {
 		t.Fatalf("constant count = %d, want %d (canonical taxonomy size)", got, want)
 	}
 
@@ -68,9 +69,11 @@ func TestIsAgentError(t *testing.T) {
 		ReasonRuntimeOffline,
 		ReasonRuntimeRecovery,
 		ReasonTimeout,
+		ReasonProviderLivenessTimeout,
 		ReasonIterationLimit,
 		ReasonAgentBlocked,
 		ReasonAPIInvalidRequest,
+		ReasonAdaptiveRoutingAdmissionFailed,
 	}
 	for _, r := range platformSide {
 		if r.IsAgentError() {
@@ -111,8 +114,8 @@ func TestAllReasonsContents(t *testing.T) {
 	t.Parallel()
 
 	got := AllReasons()
-	if len(got) != 22 {
-		t.Fatalf("AllReasons() returned %d entries, want 22", len(got))
+	if len(got) != 23 {
+		t.Fatalf("AllReasons() returned %d entries, want 23", len(got))
 	}
 
 	seen := make(map[Reason]bool, len(got))
@@ -129,8 +132,8 @@ func TestAllReasonsContents(t *testing.T) {
 		}
 	}
 
-	if platformCount != 8 {
-		t.Errorf("AllReasons(): platform-side count = %d, want 8", platformCount)
+	if platformCount != 9 {
+		t.Errorf("AllReasons(): platform-side count = %d, want 9", platformCount)
 	}
 	if agentCount != 14 {
 		t.Errorf("AllReasons(): agent-side count = %d, want 14", agentCount)
@@ -144,6 +147,7 @@ func TestAllReasonsContents(t *testing.T) {
 		ReasonQueuedExpired, ReasonRuntimeOffline, ReasonRuntimeRecovery,
 		ReasonTimeout, ReasonProviderLivenessTimeout, ReasonIterationLimit,
 		ReasonAgentBlocked, ReasonAPIInvalidRequest,
+		ReasonAdaptiveRoutingAdmissionFailed,
 		ReasonAgentProviderAuthOrAccess, ReasonAgentProviderQuotaLimit,
 		ReasonAgentProviderCapacityOrRateLimit, ReasonAgentProviderServerError,
 		ReasonAgentProviderNetwork, ReasonAgentProcessFailure,
