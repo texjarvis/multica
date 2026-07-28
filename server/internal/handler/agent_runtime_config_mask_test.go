@@ -1,63 +1,125 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 )
 
-func TestMaskGatewayTokenReplacesNonEmpty(t *testing.T) {
+func TestSanitizeRuntimeConfigForAgentResponseAllowlist(t *testing.T) {
 	t.Parallel()
 
-	rc := map[string]any{
+	const secret = "sentinel-runtime-config-secret"
+	raw := []byte(`{
+		"mode":"gateway",
+		"gateway":{
+			"host":"` + secret + `",
+			"port":18789,
+			"token":"` + secret + `",
+			"tls":true,
+			"Authorization":"Bearer ` + secret + `"
+		},
+		"api_key":"` + secret + `",
+		"headers":{"X-Token":"` + secret + `"},
+		"env":{"TOKEN":"` + secret + `"},
+		"unknown":{"nested":"` + secret + `"}
+	}`)
+
+	got, hasConfig, redacted, keyCount := sanitizeRuntimeConfigForAgentResponse(raw)
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal projection: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(secret)) {
+		t.Fatalf("runtime_config projection leaked sentinel: %s", encoded)
+	}
+	if !hasConfig || !redacted || keyCount != 6 {
+		t.Fatalf("metadata = has:%v redacted:%v keys:%d, want true/true/6", hasConfig, redacted, keyCount)
+	}
+
+	var want any
+	if err := json.Unmarshal([]byte(`{
+		"mode":"gateway",
+		"gateway":{"host":"****","port":18789,"token":"****","tls":true},
+		"_redacted":"****"
+	}`), &want); err != nil {
+		t.Fatalf("unmarshal expected: %v", err)
+	}
+	if gotEncoded, _ := json.Marshal(got); !jsonBytesEqual(gotEncoded, mustJSONMarshal(t, want)) {
+		t.Fatalf("projection = %s", gotEncoded)
+	}
+}
+
+func TestSanitizeRuntimeConfigForAgentResponseSafeAndEmpty(t *testing.T) {
+	t.Parallel()
+
+	safe, hasConfig, redacted, keyCount := sanitizeRuntimeConfigForAgentResponse(
+		[]byte(`{"mode":"local","gateway":{"port":18789,"tls":false}}`),
+	)
+	if !hasConfig || redacted || keyCount != 2 {
+		t.Fatalf("safe metadata = has:%v redacted:%v keys:%d", hasConfig, redacted, keyCount)
+	}
+	if _, present := safe[runtimeConfigRedactionMarker]; present {
+		t.Fatalf("safe config unexpectedly marked redacted: %#v", safe)
+	}
+
+	for _, raw := range [][]byte{nil, {}, []byte(`null`), []byte(`{}`)} {
+		got, has, wasRedacted, count := sanitizeRuntimeConfigForAgentResponse(raw)
+		if len(got) != 0 || has || wasRedacted || count != 0 {
+			t.Fatalf("empty %q = %#v, %v/%v/%d", raw, got, has, wasRedacted, count)
+		}
+	}
+}
+
+func TestSanitizeRuntimeConfigForAgentResponseFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	const secret = "sentinel-malformed-runtime-secret"
+	tests := [][]byte{
+		[]byte(`{"token":"` + secret + `","token":"overwritten"}`),
+		[]byte(`{"gateway":`),
+		[]byte(`["` + secret + `"]`),
+	}
+	for _, raw := range tests {
+		got, has, redacted, _ := sanitizeRuntimeConfigForAgentResponse(raw)
+		encoded, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal projection: %v", err)
+		}
+		if bytes.Contains(encoded, []byte(secret)) {
+			t.Fatalf("failed-closed projection leaked sentinel: %s", encoded)
+		}
+		if !has || !redacted || got[runtimeConfigRedactionMarker] != envSentinel {
+			t.Fatalf("failed-closed projection = %#v, has:%v redacted:%v", got, has, redacted)
+		}
+	}
+}
+
+func TestRuntimeConfigPublicProjectionIsPreservedOnBlindWriteback(t *testing.T) {
+	t.Parallel()
+
+	projected := map[string]any{
 		"mode": "gateway",
 		"gateway": map[string]any{
-			"host":  "gw.internal",
-			"port":  float64(18789), // json.Unmarshal yields float64 for numbers
-			"token": "real-secret",
-			"tls":   true,
+			"host":  envSentinel,
+			"token": envSentinel,
 		},
+		runtimeConfigRedactionMarker: envSentinel,
 	}
-	maskGatewayToken(rc)
-	gw := rc["gateway"].(map[string]any)
-	if gw["token"] != runtimeConfigGatewayTokenMask {
-		t.Errorf("token: got %v, want %q", gw["token"], runtimeConfigGatewayTokenMask)
+	if !runtimeConfigContainsPublicProjection(projected) {
+		t.Fatal("current public projection must be detected at the write boundary")
 	}
-	if gw["host"] != "gw.internal" {
-		t.Errorf("host must not be touched, got %v", gw["host"])
-	}
-}
-
-func TestMaskGatewayTokenSkipsEmptyToken(t *testing.T) {
-	t.Parallel()
-
-	// host+port-only configs (token still inherited from the user's local
-	// openclaw.json) must not surface a misleading "***" placeholder.
-	rc := map[string]any{
+	if runtimeConfigContainsPublicProjection(map[string]any{
+		"mode": "gateway",
 		"gateway": map[string]any{
-			"host": "gw.internal",
-			"port": float64(18789),
+			"host": "explicit-host",
 		},
-	}
-	maskGatewayToken(rc)
-	gw := rc["gateway"].(map[string]any)
-	if _, present := gw["token"]; present {
-		t.Errorf("empty token must not gain a mask, got %v", gw["token"])
+	}) {
+		t.Fatal("complete explicit replacement must remain writable")
 	}
 }
 
-func TestMaskGatewayTokenNoOpOnNonOpenclawShape(t *testing.T) {
-	t.Parallel()
-
-	// rc with no `gateway` key (e.g. other providers' runtime_config) must
-	// pass through untouched.
-	rc := map[string]any{"some_other_key": "value"}
-	maskGatewayToken(rc)
-	if _, present := rc["gateway"]; present {
-		t.Errorf("must not synthesise gateway key, got %v", rc)
-	}
-}
-
-func TestPreserveMaskedGatewayTokenRestoresFromPersisted(t *testing.T) {
+func TestPreserveLegacyMaskedGatewayToken(t *testing.T) {
 	t.Parallel()
 
 	persisted := []byte(`{"mode":"gateway","gateway":{"token":"real-secret","host":"gw.internal"}}`)
@@ -66,65 +128,52 @@ func TestPreserveMaskedGatewayTokenRestoresFromPersisted(t *testing.T) {
 		"gateway": map[string]any{
 			"host":  "gw.internal",
 			"port":  float64(18789),
-			"token": runtimeConfigGatewayTokenMask,
+			"token": runtimeConfigLegacyGatewayTokenMask,
 		},
 	}
-	preserveMaskedGatewayToken(incoming, persisted)
-	gw := incoming["gateway"].(map[string]any)
-	if gw["token"] != "real-secret" {
-		t.Errorf("token should be restored from persisted row, got %v", gw["token"])
+	if !runtimeConfigContainsLegacyGatewayMask(incoming) {
+		t.Fatal("legacy gateway token mask must be recognized")
+	}
+	preserveLegacyMaskedGatewayToken(incoming, persisted)
+	if got := incoming["gateway"].(map[string]any)["token"]; got != "real-secret" {
+		t.Fatalf("token should be restored from persisted row, got %v", got)
+	}
+
+	explicit := map[string]any{"gateway": map[string]any{"token": "rotated-secret"}}
+	preserveLegacyMaskedGatewayToken(explicit, persisted)
+	if got := explicit["gateway"].(map[string]any)["token"]; got != "rotated-secret" {
+		t.Fatalf("explicit replacement must win, got %v", got)
+	}
+
+	missing := map[string]any{"gateway": map[string]any{"token": runtimeConfigLegacyGatewayTokenMask}}
+	preserveLegacyMaskedGatewayToken(missing, []byte(`{"gateway":{"host":"gw.internal"}}`))
+	if _, present := missing["gateway"].(map[string]any)["token"]; present {
+		t.Fatal("legacy placeholder must be dropped when no stored token exists")
 	}
 }
 
-func TestPreserveMaskedGatewayTokenPassesThroughRealValue(t *testing.T) {
-	t.Parallel()
-
-	// A genuine new token in the PATCH body must overwrite the persisted one.
-	persisted := []byte(`{"gateway":{"token":"old-secret"}}`)
-	incoming := map[string]any{
-		"gateway": map[string]any{"token": "rotated-secret"},
-	}
-	preserveMaskedGatewayToken(incoming, persisted)
-	gw := incoming["gateway"].(map[string]any)
-	if gw["token"] != "rotated-secret" {
-		t.Errorf("real PATCH token must win, got %v", gw["token"])
-	}
+func jsonBytesEqual(left, right []byte) bool {
+	var leftValue any
+	var rightValue any
+	return json.Unmarshal(left, &leftValue) == nil &&
+		json.Unmarshal(right, &rightValue) == nil &&
+		jsonEqual(leftValue, rightValue)
 }
 
-func TestPreserveMaskedGatewayTokenDropsMaskWhenNoPersistedToken(t *testing.T) {
-	t.Parallel()
-
-	// A first-time gateway config that only contained host/port has no
-	// stored token. If a later PATCH sends the mask back (e.g. a UI that
-	// always includes the field), we must drop the placeholder rather than
-	// landing the literal "***" string in the database as a fake bearer.
-	persisted := []byte(`{"gateway":{"host":"gw.internal"}}`)
-	incoming := map[string]any{
-		"gateway": map[string]any{"token": runtimeConfigGatewayTokenMask},
-	}
-	preserveMaskedGatewayToken(incoming, persisted)
-	gw := incoming["gateway"].(map[string]any)
-	if _, present := gw["token"]; present {
-		t.Errorf("token must be dropped, got %v", gw["token"])
-	}
+func jsonEqual(left, right any) bool {
+	return string(mustMarshalJSON(left)) == string(mustMarshalJSON(right))
 }
 
-// Round-trip: marshal a runtime_config, mask it, ensure it stays a valid
-// shape that can survive json.Marshal again (no NaNs, no funny types).
-func TestMaskGatewayTokenRoundTripsAsJSON(t *testing.T) {
-	t.Parallel()
+func mustMarshalJSON(value any) []byte {
+	data, _ := json.Marshal(value)
+	return data
+}
 
-	raw := []byte(`{"gateway":{"token":"plaintext","host":"gw"}}`)
-	var rc any
-	if err := json.Unmarshal(raw, &rc); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	maskGatewayToken(rc)
-	out, err := json.Marshal(rc)
+func mustJSONMarshal(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
 	if err != nil {
-		t.Fatalf("marshal after mask: %v", err)
+		t.Fatalf("marshal JSON: %v", err)
 	}
-	if string(out) == string(raw) {
-		t.Errorf("mask should change the bytes, got %q", out)
-	}
+	return data
 }

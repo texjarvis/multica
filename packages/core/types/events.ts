@@ -138,7 +138,10 @@ export interface PropertyChangedPayload {
 }
 
 export interface AgentStatusPayload {
-  agent: Agent;
+  // Task-driven status reconciliation publishes a deliberately minimal
+  // invalidation hint. Clients refetch the public Agent resource rather than
+  // treating a full persisted row as WebSocket data.
+  agent: Pick<Agent, "id" | "workspace_id" | "status" | "updated_at">;
 }
 
 export interface AgentCreatedPayload {

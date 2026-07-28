@@ -1,53 +1,109 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  queryOptions,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { api } from "../api";
 import { useWorkspaceId } from "../hooks";
-import type { Agent } from "../types";
+import type {
+  Agent,
+  AgentComposioToolkitAllowlistResponse,
+  AgentComposioToolkitAllowlistUpdateResponse,
+} from "../types";
 import { workspaceKeys } from "../workspace/queries";
 
+export const agentComposioToolkitAllowlistKeys = {
+  detail: (agentId: string) =>
+    ["agents", agentId, "composio-toolkit-allowlist"] as const,
+};
+
 /**
- * Mutation hook for the creator-only MCP tab: writes an agent's Composio
- * toolkit allowlist via `PUT /api/agents/:id` ({ composio_toolkit_allowlist })
- * — no dedicated endpoint, the existing agent PATCH path carries it (MUL-3870).
- *
- * The hook is optimistic: it patches the matching agent in the cached
- * workspace list before the round-trip so the checkbox flips instantly, then
- * rolls back to the captured snapshot on error and always invalidates on
- * settle so the cache reconverges with the server's normalised slugs
- * (lowercase / trimmed / deduped). The server silently drops the write for
- * non-owners, which is why this is only wired into the owner-gated tab.
- *
- * Accepts the full desired allowlist (`string[]`) — callers compute the next
- * array (add / remove a slug) and pass it wholesale, matching the backend's
- * replace semantics. Pass `[]` to clear every toolkit.
+ * The only query that may hold raw toolkit slugs. Generic Agent caches remain
+ * count/redacted-only; opening the authorized editor performs this explicit
+ * audited reveal.
+ */
+export function agentComposioToolkitAllowlistOptions(
+  agentId: string,
+) {
+  return queryOptions({
+    queryKey: agentComposioToolkitAllowlistKeys.detail(agentId),
+    queryFn: () => api.getAgentComposioToolkitAllowlist(agentId),
+    enabled: !!agentId,
+  });
+}
+
+type MutationContext = {
+  previousAgents?: Agent[];
+  previousAllowlist?: AgentComposioToolkitAllowlistResponse;
+};
+
+/**
+ * Replaces or clears the allowlist through the dedicated human-only endpoint.
+ * A non-empty desired list sends explicit replace intent; an empty list sends
+ * explicit clear intent. Optimistic raw values stay only in the dedicated
+ * query cache, while the generic Agent list receives count/redacted metadata.
  */
 export function useUpdateAgentAllowlist(agentId: string) {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
+  const agentsKey = workspaceKeys.agents(wsId);
+  const allowlistKey = agentComposioToolkitAllowlistKeys.detail(agentId);
 
-  return useMutation<Agent, Error, string[], { previous?: Agent[] }>({
+  return useMutation<
+    AgentComposioToolkitAllowlistUpdateResponse,
+    Error,
+    string[],
+    MutationContext
+  >({
     mutationFn: (allowlist) =>
-      api.updateAgent(agentId, { composio_toolkit_allowlist: allowlist }),
+      api.updateAgentComposioToolkitAllowlist(
+        agentId,
+        allowlist.length > 0
+          ? { intent: "replace", toolkit_slugs: allowlist }
+          : { intent: "clear" },
+      ),
     onMutate: async (allowlist) => {
-      const queryKey = workspaceKeys.agents(wsId);
-      // Cancel in-flight refetches so they can't clobber the optimistic write.
-      await qc.cancelQueries({ queryKey });
-      const previous = qc.getQueryData<Agent[]>(queryKey);
-      qc.setQueryData<Agent[]>(queryKey, (old) =>
-        old?.map((a) =>
-          a.id === agentId
-            ? ({ ...a, composio_toolkit_allowlist: allowlist } as Agent)
-            : a,
-        ),
+      await Promise.all([
+        qc.cancelQueries({ queryKey: agentsKey }),
+        qc.cancelQueries({ queryKey: allowlistKey }),
+      ]);
+      const previousAgents = qc.getQueryData<Agent[]>(agentsKey);
+      const previousAllowlist =
+        qc.getQueryData<AgentComposioToolkitAllowlistResponse>(allowlistKey);
+
+      qc.setQueryData<AgentComposioToolkitAllowlistResponse>(allowlistKey, {
+        agent_id: agentId,
+        toolkit_slugs: [...allowlist],
+      });
+      qc.setQueryData<Agent[]>(agentsKey, (old) =>
+        old?.map((agent) => {
+          if (agent.id !== agentId) return agent;
+          const {
+            composio_toolkit_allowlist: _discardLegacyRawAllowlist,
+            ...valueFreeAgent
+          } = agent;
+          return {
+            ...valueFreeAgent,
+            composio_toolkit_allowlist_count: allowlist.length,
+            composio_toolkit_allowlist_redacted: allowlist.length > 0,
+          } as Agent;
+        }),
       );
-      return { previous };
+      return { previousAgents, previousAllowlist };
     },
     onError: (_error, _allowlist, context) => {
-      if (context?.previous) {
-        qc.setQueryData(workspaceKeys.agents(wsId), context.previous);
+      if (context?.previousAgents) {
+        qc.setQueryData(agentsKey, context.previousAgents);
+      }
+      if (context?.previousAllowlist) {
+        qc.setQueryData(allowlistKey, context.previousAllowlist);
+      } else {
+        qc.removeQueries({ queryKey: allowlistKey, exact: true });
       }
     },
     onSettled: () => {
-      qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
+      qc.invalidateQueries({ queryKey: agentsKey });
+      qc.invalidateQueries({ queryKey: allowlistKey });
     },
   });
 }

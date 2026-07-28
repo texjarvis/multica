@@ -24,8 +24,13 @@ export function parseWithFallback<T>(
   const result = schema.safeParse(data);
   if (result.success) return result.data as T;
   console.warn(`[api] schema validation failed: ${opts.endpoint}`, {
-    issues: result.error.issues,
-    received: data,
+    issue_count: result.error.issues.length,
+    issues: result.error.issues.map((issue) => ({
+      code: issue.code,
+      path: issue.path.map((segment) =>
+        typeof segment === "number" ? segment : "<field>",
+      ),
+    })),
   });
   return fallback;
 }

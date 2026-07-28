@@ -1,9 +1,25 @@
 package redact
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestFailureLogAttrsNeverReturnsFailureText(t *testing.T) {
+	const sentinel = "provider-failure-secret-sentinel"
+	attrs := FailureLogAttrs(
+		`argv --token `+sentinel,
+		`mcp_config server `+sentinel,
+	)
+	rendered := fmt.Sprint(attrs)
+	if strings.Contains(rendered, sentinel) {
+		t.Fatalf("failure log attrs exposed failure content: %s", rendered)
+	}
+	if rendered != "[has_task_error true has_failure_reason true]" {
+		t.Fatalf("unexpected failure presence attrs: %s", rendered)
+	}
+}
 
 func TestRedactAWSAccessKey(t *testing.T) {
 	t.Parallel()

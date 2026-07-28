@@ -889,8 +889,9 @@ func runDaemonForeground(cmd *cobra.Command) error {
 // revoked, and the server can be unreachable — either passes the local check,
 // kills the working daemon in the stop phase, and then fails the replacement
 // child's preflight, leaving no daemon at all (#5165). So probe the server
-// the daemon will talk to with the stored token (same whoami call as
-// `multica auth status`) and refuse to touch the running daemon on failure.
+// the daemon will talk to with the stored token. Use the daemon-safe minimal
+// workspace endpoint rather than the human-only account identity endpoint so
+// this preflight works for MDT and cloud-machine credentials too.
 func requireDaemonRestartPreflight(cmd *cobra.Command, profile string) error {
 	if err := requireDaemonAuth(profile); err != nil {
 		return err
@@ -916,7 +917,7 @@ func requireDaemonRestartPreflight(cmd *cobra.Command, profile string) error {
 
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
-	if err := cli.NewAPIClient(baseURL, "", cfg.Token).GetJSON(ctx, "/api/me", nil); err != nil {
+	if err := cli.NewAPIClient(baseURL, "", cfg.Token).GetJSON(ctx, "/api/daemon/workspaces", nil); err != nil {
 		var httpErr *cli.HTTPError
 		if errors.As(err, &httpErr) {
 			if httpErr.StatusCode == http.StatusUnauthorized {

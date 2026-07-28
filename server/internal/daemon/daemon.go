@@ -377,6 +377,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	// Tag every daemon HTTP request with the daemon's CLI version so the
 	// server can split logs/metrics by client version (parallel to the CLI).
 	client.SetVersion(cfg.CLIVersion)
+	client.SetDaemonID(cfg.DaemonID)
 	d := &Daemon{
 		cfg:                       cfg,
 		client:                    client,
@@ -2859,7 +2860,10 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 
 	output, err := d.runUpdateFn(update.TargetVersion)
 	if err != nil {
-		d.logger.Error("CLI update failed", "error", err, "output", output)
+		d.logger.Error("CLI update failed",
+			"has_error", true,
+			"output_char_count", len(output),
+		)
 		d.reportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
 			"status": "failed",
 			"error":  err.Error(),
@@ -2867,7 +2871,7 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 		return
 	}
 
-	d.logger.Info("CLI update completed successfully", "output", output)
+	d.logger.Info("CLI update completed successfully", "output_char_count", len(output))
 	d.reportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
 		"status": "completed",
 		"output": fmt.Sprintf("Updated to %s", update.TargetVersion),
@@ -3894,9 +3898,9 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 	reused := task.PriorWorkDir != "" && envWorkDir == task.PriorWorkDir
 	if !reused && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: workdir not reused, per-cwd session cannot resolve",
-			"session_id", task.PriorSessionID,
-			"prior_workdir", task.PriorWorkDir,
-			"workdir", envWorkDir,
+			"has_session_id", true,
+			"has_prior_workdir", task.PriorWorkDir != "",
+			"has_workdir", envWorkDir != "",
 		)
 		task.PriorSessionID = ""
 		taskCtx.PriorSessionResumed = false
@@ -3998,7 +4002,7 @@ func gateCodexResumeToRolloutPresence(task *Task, taskCtx *execenv.TaskContextFo
 		return
 	}
 	taskLog.Warn("dropping prior codex session: rollout not present in task CODEX_HOME; starting a fresh thread",
-		"session_id", task.PriorSessionID, "codex_home", codexHome)
+		"has_session_id", true, "has_codex_home", true)
 	task.PriorSessionID = ""
 	taskCtx.PriorSessionResumed = false
 	// The user expected this run to continue the prior conversation; surface the
@@ -4807,12 +4811,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 
 	taskLog.Info("starting agent",
 		"provider", provider,
-		"workdir", env.WorkDir,
-		"model", entry.Model,
+		"has_workdir", env.WorkDir != "",
+		"has_model", entry.Model != "",
 		"reused", reused,
 	)
 	if task.PriorSessionID != "" {
-		taskLog.Info("resuming session", "session_id", task.PriorSessionID)
+		taskLog.Info("resuming session", "has_session_id", true)
 	}
 
 	taskStart := time.Now()
@@ -4862,15 +4866,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if err != nil {
 			taskLog.Warn("service_tier: catalog lookup failed; passing through",
 				"provider", provider,
-				"model", model,
-				"service_tier", serviceTier,
-				"error", err,
+				"has_model", model != "",
+				"has_service_tier", true,
+				"has_error", true,
 			)
 		} else if !ok {
 			taskLog.Warn("service_tier: not valid for this (provider, model); skipping injection",
 				"provider", provider,
-				"model", model,
-				"service_tier", serviceTier,
+				"has_model", model != "",
+				"has_service_tier", true,
 			)
 			serviceTier = ""
 		}
@@ -4891,15 +4895,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if err != nil {
 			taskLog.Warn("thinking_level: catalog lookup failed; passing through",
 				"provider", provider,
-				"model", model,
-				"thinking_level", thinkingLevel,
-				"error", err,
+				"has_model", model != "",
+				"has_thinking_level", true,
+				"has_error", true,
 			)
 		} else if !ok {
 			taskLog.Warn("thinking_level: not valid for this (provider, model); skipping injection",
 				"provider", provider,
-				"model", model,
-				"thinking_level", thinkingLevel,
+				"has_model", model != "",
+				"has_thinking_level", true,
 			)
 			thinkingLevel = ""
 		}
@@ -4959,7 +4963,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 
 	taskLog.Debug("invoking backend",
 		"provider", provider,
-		"model", model,
+		"has_model", model != "",
 		"prompt_bytes", len(prompt),
 		"custom_args", len(customArgs),
 		"extra_args", len(extraArgs),
@@ -4982,7 +4986,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
-		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
+		taskLog.Warn("session resume failed, retrying with fresh session", "has_error", result.Error != "")
 
 		// Rebuild cold-session context before the single retry. The prior
 		// provider transcript is gone (missing, account-mismatched, or —
@@ -5003,7 +5007,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		task.PriorSessionID = ""
 		taskCtx.PriorSessionResumed = false
 		if freshBrief, briefErr := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx); briefErr != nil {
-			taskLog.Warn("execenv: re-inject cold runtime config for fresh retry failed (non-fatal)", "error", briefErr)
+			taskLog.Warn("execenv: re-inject cold runtime config for fresh retry failed (non-fatal)", "has_error", true)
 		} else {
 			runtimeBrief = freshBrief
 			if providerNeedsInlineSystemPrompt(provider) {
@@ -5014,11 +5018,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 
 		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {
-			taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error", retryErr)
+			taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "has_error", true)
 		} else if retryResult.Status != "completed" && retryResult.SessionID == "" {
 			taskLog.Warn("fresh session retry also failed without establishing a new session; keeping the original poisoned result",
 				"retry_status", retryResult.Status,
-				"retry_error", retryResult.Error,
+				"has_retry_error", retryResult.Error != "",
 			)
 		}
 		// The poisoned prior session id lives ONLY on firstResult (classified
@@ -5034,14 +5038,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	taskLog.Info("agent finished",
 		"status", result.Status,
 		"duration", elapsed.String(),
-		"tools", tools,
+		"tool_count", tools,
 	)
 	taskLog.Debug("agent result detail",
 		"status", result.Status,
 		"output_bytes", len(result.Output),
-		"session_id", result.SessionID,
+		"has_session_id", result.SessionID != "",
 		"models_with_usage", len(result.Usage),
-		"agent_error", result.Error,
+		"has_agent_error", result.Error != "",
 	)
 
 	// Convert agent usage map to task usage entries.
@@ -5074,7 +5078,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var sessionRolloutMissing bool
 	if result.SessionID != "" && !codexSessionResumable(env.CodexHome, result.SessionID, codexRolloutFlushWait) {
 		taskLog.Warn("codex session rollout not present in task CODEX_HOME; withholding resume pointer and flagging continuity gap",
-			"session_id", result.SessionID, "codex_home", env.CodexHome, "status", result.Status)
+			"has_session_id", true, "has_codex_home", env.CodexHome != "", "status", result.Status)
 		result.SessionID = ""
 		sessionRolloutMissing = true
 	}
@@ -5541,7 +5545,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						go func() {
 							if !waitCodexRolloutPresent(drainCtx, codexHome, sid) {
 								taskLog.Debug("skip pinning codex session: rollout not present before run ended",
-									"session_id", sid, "codex_home", codexHome)
+									"has_session_id", sid != "", "has_codex_home", codexHome != "")
 								return
 							}
 							pinCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -5554,7 +5558,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 				case agent.MessageToolUse:
 					n := toolCount.Add(1)
 					inFlightTools.Add(1)
-					taskLog.Info(fmt.Sprintf("tool #%d: %s", n, msg.Tool))
+					taskLog.Info("agent tool started", "sequence", n, "has_tool", msg.Tool != "")
 					if msg.CallID != "" {
 						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
@@ -5595,7 +5599,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						toolName = callIDToTool[msg.CallID]
 						mu.Unlock()
 					}
-					taskLog.Info("tool_result observed", "seq", s, "tool", toolName, "call_id", msg.CallID)
+					taskLog.Info("tool_result observed", "seq", s, "has_tool", toolName != "", "has_call_id", msg.CallID != "")
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
 						Seq:    int(s),
@@ -5612,13 +5616,13 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					}
 				case agent.MessageText:
 					if msg.Content != "" {
-						taskLog.Debug("agent", "text", truncateLog(msg.Content, 200))
+						taskLog.Debug("agent text received", "content_char_count", len(msg.Content))
 						mu.Lock()
 						pendingText.WriteString(msg.Content)
 						mu.Unlock()
 					}
 				case agent.MessageError:
-					taskLog.Error("agent error", "content", msg.Content)
+					taskLog.Error("agent error", "content_char_count", len(msg.Content))
 					s := msgSeq.Add(1)
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
@@ -5988,17 +5992,6 @@ func shortID(id string) string {
 	return id[:8]
 }
 
-// truncateLog truncates a string to maxLen, appending "…" if truncated.
-// Also collapses newlines to spaces for single-line log output.
-func truncateLog(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.TrimSpace(s)
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "…"
-}
-
 func convertSkillsForEnv(skills []SkillData) []execenv.SkillContextForEnv {
 	if len(skills) == 0 {
 		return nil
@@ -6166,7 +6159,7 @@ func layerCustomEnvAndHermesHome(agentEnv, customEnv map[string]string, overlayH
 	for k, v := range customEnv {
 		if isBlockedEnvKey(k) {
 			if logger != nil {
-				logger.Warn("custom_env: blocked key skipped", "key", k)
+				logger.Warn("custom_env: blocked key skipped")
 			}
 			continue
 		}

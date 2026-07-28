@@ -109,6 +109,7 @@ func setHandlerTestWorkspaceRepos(t *testing.T, repos []map[string]string) {
 // newDaemonTokenRequest creates an HTTP request with daemon token context set
 // (simulating DaemonAuth middleware for mdt_ tokens).
 func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID string) *http.Request {
+	bindClaimReclaimFixtureToDaemon(path, body, daemonID)
 	var buf bytes.Buffer
 	if body != nil {
 		json.NewEncoder(&buf).Encode(body)
@@ -118,6 +119,100 @@ func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID 
 	// No X-User-ID — daemon tokens don't set it.
 	ctx := middleware.WithDaemonContext(req.Context(), workspaceID, daemonID)
 	return req.WithContext(ctx)
+}
+
+// newDaemonPATRequest simulates the user-token branch of DaemonAuth for
+// handler tests that call DaemonRegister directly.
+func newDaemonPATRequest(method, path string, body any) *http.Request {
+	req := newRequest(method, path, body)
+	ctx := middleware.WithDaemonUserAuthContext(
+		req.Context(),
+		middleware.DaemonAuthPathPAT,
+		"",
+		"",
+	)
+	return req.WithContext(ctx)
+}
+
+// bindClaimReclaimFixtureToDaemon gives legacy handler fixtures the runtime
+// identity that production registration would have written. The stricter raw
+// claim boundary intentionally rejects NULL daemon_id rows; old tests created
+// their disposable "claim reclaim fixture" rows directly with daemon_id=NULL
+// and then simulated a token without registering first. Bind only those exact
+// disposable rows, and only while NULL, so explicit wrong-daemon fixtures keep
+// exercising the denial path.
+func bindClaimReclaimFixtureToDaemon(path string, body any, daemonID string) {
+	if testPool == nil || strings.TrimSpace(daemonID) == "" {
+		return
+	}
+	bindRuntime := func(runtimeID string) {
+		if _, err := uuid.Parse(runtimeID); err != nil {
+			return
+		}
+		_, _ = testPool.Exec(context.Background(), `
+			UPDATE agent_runtime
+			SET daemon_id = $2
+			WHERE id = $1
+			  AND daemon_id IS NULL
+			  AND device_info = 'claim reclaim fixture'
+		`, runtimeID, daemonID)
+	}
+
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i, part := range parts {
+		if part == "runtimes" && i+1 < len(parts) {
+			bindRuntime(parts[i+1])
+			break
+		}
+		if part == "tasks" && i+1 < len(parts) {
+			taskID := parts[i+1]
+			if _, err := uuid.Parse(taskID); err == nil {
+				_, _ = testPool.Exec(context.Background(), `
+					UPDATE agent_runtime AS runtime
+					SET daemon_id = $2
+					FROM agent_task_queue AS task
+					WHERE task.id = $1
+					  AND runtime.id = task.runtime_id
+					  AND runtime.daemon_id IS NULL
+					  AND runtime.device_info = 'claim reclaim fixture'
+				`, taskID, daemonID)
+			}
+			break
+		}
+	}
+
+	requestBody, ok := body.(map[string]any)
+	if !ok {
+		return
+	}
+	switch runtimeIDs := requestBody["runtime_ids"].(type) {
+	case []string:
+		for _, runtimeID := range runtimeIDs {
+			bindRuntime(runtimeID)
+		}
+	case []any:
+		for _, value := range runtimeIDs {
+			if runtimeID, ok := value.(string); ok {
+				bindRuntime(runtimeID)
+			}
+		}
+	}
+}
+
+func runtimeDaemonIDForTest(t *testing.T, runtimeID string) string {
+	t.Helper()
+	var daemonID string
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT daemon_id FROM agent_runtime WHERE id = $1`,
+		runtimeID,
+	).Scan(&daemonID); err != nil {
+		t.Fatalf("load runtime daemon identity: %v", err)
+	}
+	if strings.TrimSpace(daemonID) == "" {
+		t.Fatal("runtime fixture is missing its daemon identity")
+	}
+	return daemonID
 }
 
 func TestListDaemonWorkspaces_UserScopedAndConditional(t *testing.T) {
@@ -1054,7 +1149,10 @@ func TestHandleDaemonWSHeartbeat_RuntimeGoneReturnsAckNotError(t *testing.T) {
 	// must turn the resulting pgx.ErrNoRows into a RuntimeGone ack.
 	missingRuntime := uuid.New().String()
 	ack, err := testHandler.HandleDaemonWSHeartbeat(context.Background(),
-		daemonws.ClientIdentity{WorkspaceID: testWorkspaceID},
+		daemonws.ClientIdentity{
+			WorkspaceID: testWorkspaceID,
+			RuntimeIDs:  []string{missingRuntime},
+		},
 		missingRuntime, false)
 	if err != nil {
 		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
@@ -1088,6 +1186,12 @@ func TestHandleDaemonWSHeartbeat_AllowsAnyAuthorizedWorkspace(t *testing.T) {
 	`, "WS Heartbeat Scope", slug, "Temporary workspace for WS heartbeat tests", "HWS").Scan(&workspaceID); err != nil {
 		t.Fatalf("setup: create workspace: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'member')
+	`, workspaceID, testUserID); err != nil {
+		t.Fatalf("setup: create workspace membership: %v", err)
+	}
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, workspaceID)
 	})
@@ -1108,7 +1212,12 @@ func TestHandleDaemonWSHeartbeat_AllowsAnyAuthorizedWorkspace(t *testing.T) {
 	})
 
 	ack, err := testHandler.HandleDaemonWSHeartbeat(ctx,
-		daemonws.ClientIdentity{WorkspaceIDs: []string{testWorkspaceID, workspaceID}},
+		daemonws.ClientIdentity{
+			WorkspaceIDs: []string{testWorkspaceID, workspaceID},
+			RuntimeIDs:   []string{runtimeID},
+			UserID:       testUserID,
+			AuthPath:     middleware.DaemonAuthPathPAT,
+		},
 		runtimeID, false)
 	if err != nil {
 		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
@@ -1166,7 +1275,7 @@ func TestDaemonHeartbeat_SlowProbeDoesNotWedge(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
 		"runtime_id": runtimeID,
-	}, testWorkspaceID, "runtime-local-skills-daemon")
+	}, testWorkspaceID, runtimeDaemonIDForTest(t, runtimeID))
 
 	start := time.Now()
 	testHandler.DaemonHeartbeat(w, req)
@@ -1206,7 +1315,7 @@ func TestDaemonHeartbeat_EmptyQueueSkipsPopPending(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
 		"runtime_id": runtimeID,
-	}, testWorkspaceID, "runtime-local-skills-daemon")
+	}, testWorkspaceID, runtimeDaemonIDForTest(t, runtimeID))
 
 	testHandler.DaemonHeartbeat(w, req)
 	if w.Code != http.StatusOK {
@@ -1921,7 +2030,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	// Register under the new stable UUID, declaring the prior hostname-derived
 	// id as legacy. The handler should merge the legacy row into the new one.
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{legacyDaemonID},
@@ -2015,7 +2124,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_ReverseDotLocal(t *testing.T
 	})
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{"ReverseDotLocalHost", emittedLegacyID},
@@ -2073,7 +2182,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_CaseDrift(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{emittedLegacyID},
@@ -2169,7 +2278,7 @@ func TestDaemonRegister_MergesAllCaseDuplicateLegacyRuntimes(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, lowerAgentID) })
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{storedLowerID}, // a single candidate must resolve both stored casings
@@ -2226,7 +2335,7 @@ func TestDaemonRegister_LegacyIDNoMatchIsNoop(t *testing.T) {
 	ctx := context.Background()
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         "0192a7a1-5e3c-7be9-9a7d-6e0f1cb3deab",
 		"legacy_daemon_ids": []string{"NeverSeenHost", "NeverSeenHost.local"},

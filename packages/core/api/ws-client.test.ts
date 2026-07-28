@@ -74,7 +74,7 @@ describe("WSClient", () => {
     expect(url.searchParams.has("client_os")).toBe(false);
   });
 
-  it("truncates the logged payload when an unparseable frame is large", () => {
+  it("logs only length metadata for an unparseable frame", () => {
     const logger = {
       debug: vi.fn(),
       info: vi.fn(),
@@ -84,15 +84,16 @@ describe("WSClient", () => {
     const ws = new WSClient("ws://example.test/ws", { logger });
     ws.connect();
 
-    const huge = "x".repeat(5000);
+    const sentinel = "ws-unparseable-secret-sentinel";
+    const huge = sentinel + "x".repeat(5000);
     FakeWebSocket.lastInstance!.onmessage?.({ data: huge });
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
-    const [, summary] = logger.warn.mock.calls[0] as [string, string];
-    expect(summary.length).toBeLessThan(huge.length);
-    expect(summary).toContain("truncated");
-    expect(summary).toContain("5000");
-    expect(summary.startsWith("x".repeat(200))).toBe(true);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "ws: received unparseable message",
+      { frame_char_count: huge.length },
+    );
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(sentinel);
   });
 
   it("logs and skips malformed frames without breaking later messages", () => {
@@ -120,7 +121,7 @@ describe("WSClient", () => {
 
     expect(logger.warn).toHaveBeenCalledWith(
       "ws: received unparseable message",
-      `{"type":"issue`,
+      { frame_char_count: `{"type":"issue`.length },
     );
     expect(handler).toHaveBeenCalledWith(
       { id: "issue-1" },
@@ -150,8 +151,9 @@ describe("WSClient", () => {
     ws.on("issue:updated", issueHandler);
     ws.connect();
 
+    const sentinel = "ws-missing-type-secret-sentinel";
     const badFrames = [
-      JSON.stringify({ payload: {} }), // object, no type
+      JSON.stringify({ payload: { custom_env: { TOKEN: sentinel } } }), // object, no type
       "42", // bare number
       "true", // bare bool
       "[]", // array
@@ -178,6 +180,7 @@ describe("WSClient", () => {
     expect(logger.warn.mock.calls[0]?.[0]).toBe(
       "ws: dropping frame without a string type",
     );
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(sentinel);
   });
 
   it("passes actor_id and actor_type to event handlers", () => {

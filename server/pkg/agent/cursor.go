@@ -41,7 +41,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	cmd := exec.CommandContext(runCtx, argv0, cmdArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", argv0, "args", cmdArgs)
+	logAgentCommand(b.cfg.Logger, argv0, cmdArgs)
 	cmd.WaitDelay = 500 * time.Millisecond
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -69,7 +69,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("start cursor-agent: %w", err)
 	}
 
-	b.cfg.Logger.Info("cursor-agent started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "cursor", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)

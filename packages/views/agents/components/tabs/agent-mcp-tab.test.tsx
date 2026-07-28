@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -11,18 +11,18 @@ import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../../locales/en/common.json";
 import enAgents from "../../../locales/en/agents.json";
 
-// AgentMcpTab reads its connection list + toolkit catalog from two queries and
-// writes through the useUpdateAgentAllowlist mutation. We stub all three at the
-// module boundary so the tests assert the tab's own logic (which slugs are
-// selectable, what the toggle computes, the empty/redacted branches) rather
-// than the query/mutation plumbing, which is covered elsewhere.
 const connectionsRef = vi.hoisted(() => ({
   current: [] as { toolkit_slug: string; status: string }[],
 }));
 const toolkitsRef = vi.hoisted(() => ({
   current: [] as { slug: string; name: string }[],
 }));
-const queryStateRef = vi.hoisted(() => ({
+const allowlistRef = vi.hoisted(() => ({ current: [] as string[] }));
+const connectionStateRef = vi.hoisted(() => ({
+  isLoading: false,
+  isError: false,
+}));
+const allowlistStateRef = vi.hoisted(() => ({
   isLoading: false,
   isError: false,
 }));
@@ -36,23 +36,47 @@ vi.mock("@tanstack/react-query", () => ({
   useQuery: (opts: { queryKey: unknown[]; enabled?: boolean }) => {
     queryCallsRef.current.push(opts);
     const key = JSON.stringify(opts.queryKey);
-    if (queryStateRef.isLoading) return { data: undefined, isLoading: true, isError: false };
-    if (queryStateRef.isError) return { data: undefined, isLoading: false, isError: true };
-    if (key.includes("connections"))
-      return { data: connectionsRef.current, isLoading: false, isError: false };
-    if (key.includes("toolkits"))
+    if (key.includes("composio-toolkit-allowlist")) {
+      return {
+        data: allowlistStateRef.isLoading || allowlistStateRef.isError
+          ? undefined
+          : { agent_id: "agent-1", toolkit_slugs: allowlistRef.current },
+        isLoading: allowlistStateRef.isLoading,
+        isError: allowlistStateRef.isError,
+      };
+    }
+    if (connectionStateRef.isLoading) {
+      return { data: undefined, isLoading: true, isError: false };
+    }
+    if (connectionStateRef.isError) {
+      return { data: undefined, isLoading: false, isError: true };
+    }
+    if (key.includes("connections")) {
+      return {
+        data: connectionsRef.current,
+        isLoading: false,
+        isError: false,
+      };
+    }
+    if (key.includes("toolkits")) {
       return { data: toolkitsRef.current, isLoading: false, isError: false };
+    }
     return { data: undefined, isLoading: false, isError: false };
   },
   queryOptions: <T,>(opts: T) => opts,
 }));
 
 vi.mock("@multica/core/composio", () => ({
-  composioConnectionsOptions: () => ({ queryKey: ["composio", "connections"] }),
+  composioConnectionsOptions: () => ({
+    queryKey: ["composio", "connections"],
+  }),
   composioToolkitsOptions: () => ({ queryKey: ["composio", "toolkits"] }),
 }));
 
 vi.mock("@multica/core/agents", () => ({
+  agentComposioToolkitAllowlistOptions: (agentId: string) => ({
+    queryKey: ["agents", agentId, "composio-toolkit-allowlist"],
+  }),
   useUpdateAgentAllowlist: () => ({
     mutate: mutateSpy,
     isPending: isPendingRef.current,
@@ -88,6 +112,8 @@ const baseAgent: Agent = {
   runtime_mode: "local",
   runtime_config: {},
   custom_args: [],
+  composio_toolkit_allowlist_count: 1,
+  composio_toolkit_allowlist_redacted: true,
   visibility: "workspace",
   permission_mode: "public_to",
   invocation_targets: [{ target_type: "workspace", target_id: null }],
@@ -122,35 +148,54 @@ describe("AgentMcpTab", () => {
       { slug: "notion", name: "Notion" },
       { slug: "slack", name: "Slack" },
     ];
-    queryStateRef.isLoading = false;
-    queryStateRef.isError = false;
+    allowlistRef.current = ["notion"];
+    connectionStateRef.isLoading = false;
+    connectionStateRef.isError = false;
+    allowlistStateRef.isLoading = false;
+    allowlistStateRef.isError = false;
     isPendingRef.current = false;
     queryCallsRef.current = [];
-    configStore.getState().setFeatureFlags({ [COMPOSIO_MCP_APPS_FLAG]: true });
+    configStore.getState().setFeatureFlags({
+      [COMPOSIO_MCP_APPS_FLAG]: true,
+    });
   });
 
-  it("renders nothing and disables Composio queries when the feature flag is off", () => {
-    configStore.getState().setFeatureFlags({ [COMPOSIO_MCP_APPS_FLAG]: false });
+  it("renders nothing and disables all Composio queries when the feature flag is off", () => {
+    configStore.getState().setFeatureFlags({
+      [COMPOSIO_MCP_APPS_FLAG]: false,
+    });
 
-    const { container } = renderTab({ composio_toolkit_allowlist: ["notion"] });
+    const { container } = renderTab();
 
     expect(container.firstChild).toBeNull();
-    expect(queryCallsRef.current).toHaveLength(2);
-    expect(queryCallsRef.current.every((call) => call.enabled === false)).toBe(true);
+    expect(queryCallsRef.current).toHaveLength(3);
+    expect(
+      queryCallsRef.current.every((call) => call.enabled === false),
+    ).toBe(true);
   });
 
-  it("lists active connections with checkbox state reflecting the allowlist", () => {
-    renderTab({ composio_toolkit_allowlist: ["notion"] });
+  it("uses the dedicated reveal despite a redacted generic Agent response", () => {
+    renderTab();
 
-    const notion = screen.getByLabelText(/Allow Notion for this agent/i);
-    const slack = screen.getByLabelText(/Allow Slack for this agent/i);
-    expect(notion.getAttribute("aria-checked")).toBe("true");
-    expect(slack.getAttribute("aria-checked")).toBe("false");
+    expect(
+      screen.queryByText(/hidden from your view/i),
+    ).toBeNull();
+    expect(
+      screen.getByLabelText(/Allow Notion for this agent/i).getAttribute(
+        "aria-checked",
+      ),
+    ).toBe("true");
+    expect(
+      screen.getByLabelText(/Allow Slack for this agent/i).getAttribute(
+        "aria-checked",
+      ),
+    ).toBe("false");
   });
 
-  it("checking a toolkit writes the augmented allowlist via the mutation", async () => {
+  it("checking a toolkit writes the augmented revealed allowlist", async () => {
     const user = userEvent.setup();
-    renderTab({ composio_toolkit_allowlist: [] });
+    allowlistRef.current = [];
+    renderTab();
 
     await user.click(screen.getByLabelText(/Allow Notion for this agent/i));
 
@@ -160,7 +205,8 @@ describe("AgentMcpTab", () => {
 
   it("unchecking a toolkit removes only that slug", async () => {
     const user = userEvent.setup();
-    renderTab({ composio_toolkit_allowlist: ["notion", "slack"] });
+    allowlistRef.current = ["notion", "slack"];
+    renderTab();
 
     await user.click(screen.getByLabelText(/Allow Notion for this agent/i));
 
@@ -168,12 +214,40 @@ describe("AgentMcpTab", () => {
     expect(mutateSpy.mock.calls[0]?.[0]).toEqual(["slack"]);
   });
 
-  it("only offers active connections — expired/revoked are not selectable", () => {
+  it("unchecking the final toolkit requests an explicit clear through the hook", async () => {
+    const user = userEvent.setup();
+    allowlistRef.current = ["notion"];
+    renderTab();
+
+    await user.click(screen.getByLabelText(/Allow Notion for this agent/i));
+
+    expect(mutateSpy).toHaveBeenCalledTimes(1);
+    expect(mutateSpy.mock.calls[0]?.[0]).toEqual([]);
+  });
+
+  it("locks the editor when the privileged reveal fails", () => {
+    allowlistStateRef.isError = true;
+    renderTab();
+
+    expect(screen.getByText(/hidden from your view/i)).toBeTruthy();
+    expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not render empty unchecked controls while the reveal is loading", () => {
+    allowlistStateRef.isLoading = true;
+    renderTab();
+
+    expect(screen.getByText(/Loading your connections/i)).toBeTruthy();
+    expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+  });
+
+  it("only offers active connections", () => {
     connectionsRef.current = [
       { toolkit_slug: "notion", status: "active" },
       { toolkit_slug: "github", status: "expired" },
     ];
-    renderTab({ composio_toolkit_allowlist: [] });
+    renderTab();
 
     expect(screen.getByLabelText(/Allow Notion for this agent/i)).toBeTruthy();
     expect(screen.queryByLabelText(/Allow github for this agent/i)).toBeNull();
@@ -181,25 +255,20 @@ describe("AgentMcpTab", () => {
 
   it("shows an empty state with a Settings link when there are no active connections", () => {
     connectionsRef.current = [];
-    renderTab({ composio_toolkit_allowlist: [] });
+    allowlistRef.current = [];
+    renderTab();
 
     expect(screen.getByText(/No connected apps yet/i)).toBeTruthy();
-    const link = screen.getByTestId("app-link");
-    expect(link.getAttribute("href")).toBe("/ws/settings?tab=integrations");
-  });
-
-  it("renders a defensive hidden state when the allowlist is redacted", () => {
-    renderTab({ composio_toolkit_allowlist_redacted: true });
-
-    expect(screen.getByText(/hidden from your view/i)).toBeTruthy();
-    expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+    expect(screen.getByTestId("app-link").getAttribute("href")).toBe(
+      "/ws/settings?tab=integrations",
+    );
   });
 
   it("shows the strong workspace warning for a public_to-workspace agent", () => {
+    allowlistRef.current = [];
     renderTab({
       permission_mode: "public_to",
       invocation_targets: [{ target_type: "workspace", target_id: null }],
-      composio_toolkit_allowlist: [],
     });
 
     expect(
@@ -208,11 +277,11 @@ describe("AgentMcpTab", () => {
   });
 
   it("shows the generic shared warning for a public_to-member agent", () => {
+    allowlistRef.current = [];
     renderTab({
       visibility: "private",
       permission_mode: "public_to",
       invocation_targets: [{ target_type: "member", target_id: "user-2" }],
-      composio_toolkit_allowlist: [],
     });
 
     expect(screen.getByText(/This agent is shared\./i)).toBeTruthy();
@@ -226,7 +295,6 @@ describe("AgentMcpTab", () => {
       visibility: "private",
       permission_mode: "private",
       invocation_targets: [],
-      composio_toolkit_allowlist: ["notion"],
     });
 
     expect(screen.queryByText(/This agent is shared\./i)).toBeNull();
@@ -235,22 +303,14 @@ describe("AgentMcpTab", () => {
     ).toBeNull();
   });
 
-  // Regression: GH #4915. Legacy self-host backends / stale caches may
-  // return an agent without `invocation_targets` even though the modern
-  // type declares a required array. The tab must degrade to the "not
-  // workspace-public" copy instead of crashing the whole detail route
-  // with "Cannot read properties of undefined (reading 'some')".
   it("does not crash when invocation_targets is undefined", () => {
     expect(() =>
       renderTab({
         permission_mode: "public_to",
         invocation_targets:
           undefined as unknown as Agent["invocation_targets"],
-        composio_toolkit_allowlist: ["notion"],
       }),
     ).not.toThrow();
-    // Falls back to the generic shared warning (no workspace target
-    // resolves to `false`), not the workspace-wide one.
     expect(
       screen.queryByText(/any workspace member may use these Composio apps/i),
     ).toBeNull();

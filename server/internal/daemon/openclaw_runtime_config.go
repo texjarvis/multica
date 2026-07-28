@@ -67,8 +67,7 @@ func decodeOpenclawRuntimeConfig(raw json.RawMessage, logger *slog.Logger) (stri
 	// as local — a typo like "gatway" would otherwise leave the user wondering
 	// why their gateway config is ignored.
 	if cfg.Mode != "" && cfg.Mode != "local" && cfg.Mode != "gateway" {
-		logger.Warn("openclaw runtime_config: unrecognized mode; falling back to local mode",
-			"mode", cfg.Mode)
+		logger.Warn("openclaw runtime_config: unrecognized mode; falling back to local mode")
 	}
 	// Only gateway mode consults the pin. For every other mode (local / empty /
 	// unrecognized) drop the gateway block so a stray

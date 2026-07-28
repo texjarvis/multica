@@ -278,4 +278,130 @@ describe("RuntimeProfilesDialog", () => {
       screen.queryByText("Create your first custom runtime"),
     ).not.toBeInTheDocument();
   });
+
+  it("preserves hidden fixed args when editing unrelated fields", async () => {
+    const hidden = profile({
+      fixed_args: [],
+      fixed_args_count: 2,
+      fixed_args_redacted: true,
+    });
+    renderDialog({ intent: "edit", initialProfile: hidden });
+
+    expect(
+      screen.getByText("2 saved arguments are hidden"),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Renamed Codex" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(mutationState.updateProfile).toHaveBeenCalledWith({
+        profileId: "prof-1",
+        patch: {
+          display_name: "Renamed Codex",
+          command_name: "codex",
+          description: null,
+        },
+      }),
+    );
+  });
+
+  it("sends clear intent for an explicitly visible empty fixed-argument list", async () => {
+    renderDialog({
+      intent: "edit",
+      initialProfile: profile({ fixed_args: [], fixed_args_redacted: false }),
+    });
+
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Renamed Empty Args" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(mutationState.updateProfile).toHaveBeenCalledWith({
+        profileId: "prof-1",
+        patch: {
+          display_name: "Renamed Empty Args",
+          command_name: "codex",
+          description: null,
+          fixed_args: [],
+          fixed_args_intent: "clear",
+        },
+      }),
+    );
+  });
+
+  it("replaces hidden fixed args only after an explicit replace action", async () => {
+    const hidden = profile({
+      fixed_args: [],
+      fixed_args_count: 2,
+      fixed_args_redacted: true,
+    });
+    renderDialog({ intent: "edit", initialProfile: hidden });
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace arguments" }));
+    fireEvent.change(screen.getByLabelText("Command"), {
+      target: { value: "codex --token fresh-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(mutationState.updateProfile).toHaveBeenCalledWith({
+        profileId: "prof-1",
+        patch: {
+          display_name: "Team Codex",
+          command_name: "codex",
+          description: null,
+          fixed_args: ["--token", "fresh-token"],
+          fixed_args_intent: "replace",
+        },
+      }),
+    );
+  });
+
+  it("requires at least one fresh argument for hidden replace mode", async () => {
+    const hidden = profile({
+      fixed_args: [],
+      fixed_args_count: 2,
+      fixed_args_redacted: true,
+    });
+    renderDialog({ intent: "edit", initialProfile: hidden });
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace arguments" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await screen.findByText(/enter at least one argument/i),
+    ).toBeInTheDocument();
+    expect(mutationState.updateProfile).not.toHaveBeenCalled();
+  });
+
+  it("clears hidden fixed args only after an explicit clear action", async () => {
+    const hidden = profile({
+      fixed_args: [],
+      fixed_args_count: 2,
+      fixed_args_redacted: true,
+    });
+    renderDialog({ intent: "edit", initialProfile: hidden });
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear arguments" }));
+    expect(
+      screen.getByText(/saving clears every hidden argument/i),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(mutationState.updateProfile).toHaveBeenCalledWith({
+        profileId: "prof-1",
+        patch: {
+          display_name: "Team Codex",
+          command_name: "codex",
+          description: null,
+          fixed_args: [],
+          fixed_args_intent: "clear",
+        },
+      }),
+    );
+  });
 });

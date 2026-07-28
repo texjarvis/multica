@@ -59,7 +59,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 	kimiArgs := append([]string{"acp"}, filterCustomArgs(opts.CustomArgs, kimiBlockedArgs, b.cfg.Logger)...)
 	cmd := exec.CommandContext(runCtx, execPath, kimiArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", kimiArgs)
+	logAgentCommand(b.cfg.Logger, execPath, kimiArgs)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -106,7 +106,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("kimi acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	logProviderStarted(b.cfg.Logger, "kimi", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -233,8 +233,8 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "kimi",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_present", opts.ResumeSessionID != "",
+					"actual_present", sessionID != "",
 				)
 			}
 		} else {
@@ -258,7 +258,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("kimi session created", "session_id", sessionID)
+		b.cfg.Logger.Info("kimi session created", "has_session_id", sessionID != "")
 
 		// 3. If the caller picked a model (via agent.model from the
 		// UI dropdown), ask kimi to switch the session to it before
@@ -275,7 +275,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("kimi set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("kimi set_session_model failed", "has_error", true, "has_requested_model", true)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("kimi could not switch to model %q: %v", opts.Model, err)
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
@@ -285,7 +285,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 					// the daemon's resume-failure fallback retries fresh.
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "kimi",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -299,7 +299,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				}
 				return
 			}
-			b.cfg.Logger.Info("kimi session model set", "model", opts.Model)
+			b.cfg.Logger.Info("kimi session model set", "has_requested_model", true)
 		}
 
 		// 4. Build the prompt content. If we have a system prompt, prepend it.
@@ -334,7 +334,7 @@ func (b *kimiBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 					// store the replacement id.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "kimi",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true

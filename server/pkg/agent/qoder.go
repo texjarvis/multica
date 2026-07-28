@@ -96,7 +96,7 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	)
 	cmd := exec.CommandContext(runCtx, execPath, qoderArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", qoderArgs)
+	logAgentCommand(b.cfg.Logger, execPath, qoderArgs)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -136,7 +136,7 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("qoder acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	logProviderStarted(b.cfg.Logger, "qoder", cmd.Process.Pid, opts)
 
 	msgStream := newQoderMessageStream(256)
 	resCh := make(chan Result, 1)
@@ -257,8 +257,8 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "qoder",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_present", opts.ResumeSessionID != "",
+					"actual_present", sessionID != "",
 				)
 			}
 			if effectiveModel == "" {
@@ -288,14 +288,14 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("qoder session created", "session_id", sessionID)
+		b.cfg.Logger.Info("qoder session created", "has_session_id", sessionID != "")
 
 		if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("qoder set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("qoder set_session_model failed", "has_error", true, "has_requested_model", true)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("qoder could not switch to model %q: %v", opts.Model, err)
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
@@ -305,7 +305,7 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					// retries fresh and stores the replacement session.
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "qoder",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -319,7 +319,7 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				}
 				return
 			}
-			b.cfg.Logger.Info("qoder session model set", "model", opts.Model)
+			b.cfg.Logger.Info("qoder session model set", "has_requested_model", true)
 		}
 
 		userText := prompt
@@ -353,7 +353,7 @@ func (b *qoderBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					// session instead of pinning future runs to the stale id.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "qoder",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true

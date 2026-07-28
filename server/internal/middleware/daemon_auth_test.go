@@ -187,25 +187,28 @@ func TestDaemonAuth_MCN_NoVerifierConfigured(t *testing.T) {
 // Fleet verify, DaemonAuth surfaces owner_id as X-User-ID and tags the
 // auth path as cloud_pat for telemetry. We use a stub Fleet here
 // (no Redis) so the test runs without external services.
-func TestDaemonAuth_MCN_ValidTokenSetsUserID(t *testing.T) {
+func TestDaemonAuth_MCN_ValidTokenSetsUserAndInstanceIdentity(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"valid": true,
 			"owner_id": "01972f7e-7e8d-77ef-a13d-1b0ce3e9c001",
-			"instance_id": "i-01"
+			"instance_id": "i-01",
+			"instance_record_id": "01972f7e-8a13-72a1-bbb0-0874ed4e8e67"
 		}`))
 	}))
 	defer srv.Close()
 
 	verifier := auth.NewCloudPATVerifier(auth.CloudPATVerifierConfig{FleetBaseURL: srv.URL})
 
-	var gotUser, gotPath, gotActorSource string
+	var gotUser, gotPath, gotActorSource, gotInstanceID, gotInstanceRecordID string
 	mw := DaemonAuth(nil, nil, nil, verifier)
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUser = r.Header.Get("X-User-ID")
 		gotPath = DaemonAuthPathFromContext(r.Context())
 		gotActorSource = r.Header.Get("X-Actor-Source")
+		gotInstanceID = CloudInstanceIDFromContext(r.Context())
+		gotInstanceRecordID = CloudInstanceRecordIDFromContext(r.Context())
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -230,6 +233,12 @@ func TestDaemonAuth_MCN_ValidTokenSetsUserID(t *testing.T) {
 	// into thinking an mcn_ caller is human.
 	if gotActorSource != "cloud_pat" {
 		t.Errorf("expected X-Actor-Source=cloud_pat, got %q", gotActorSource)
+	}
+	if gotInstanceID != "i-01" {
+		t.Errorf("expected instance_id retained, got %q", gotInstanceID)
+	}
+	if gotInstanceRecordID != "01972f7e-8a13-72a1-bbb0-0874ed4e8e67" {
+		t.Errorf("expected instance_record_id retained, got %q", gotInstanceRecordID)
 	}
 }
 
@@ -285,7 +294,6 @@ func TestDaemonAuth_MCN_FleetUnreachable(t *testing.T) {
 	}
 }
 
-
 // TestDaemonAuth_MCN_OwnerNotInLocalDB pins the new owner-existence
 // guard end-to-end through the middleware. Cloud verifies the token
 // successfully and returns an owner_id that does not exist in our
@@ -302,7 +310,8 @@ func TestDaemonAuth_MCN_OwnerNotInLocalDB(t *testing.T) {
 		_, _ = w.Write([]byte(`{
 			"valid": true,
 			"owner_id": "00000000-0000-0000-0000-0000000feed1",
-			"instance_id": "i-99"
+			"instance_id": "i-99",
+			"instance_record_id": "01972f7e-8a13-72a1-bbb0-0874ed4e8e67"
 		}`))
 	}))
 	defer srv.Close()

@@ -1,6 +1,7 @@
 export {
   ApiClient,
   ApiError,
+  CommittedResponseUnreadableError,
   dispatchReasonCode,
   PreviewTooLargeError,
   PreviewUnsupportedError,
@@ -10,7 +11,11 @@ export type {
   ClientRuntimeSnapshot,
   ClientUsageRequest,
 } from "./client";
-export { parseWithFallback, setSchemaLogger } from "./schema";
+export {
+  parseWithFallback,
+  SecretResponseUnreadableError,
+  setSchemaLogger,
+} from "./schema";
 export type { ParseOptions } from "./schema";
 export { DuplicateIssueErrorBodySchema } from "./schemas";
 export type { DuplicateIssueErrorBody } from "./schemas";

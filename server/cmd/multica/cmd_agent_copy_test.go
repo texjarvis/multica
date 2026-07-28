@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -61,7 +62,11 @@ func copyMockServer(t *testing.T, source map[string]any, gotBody *map[string]any
 			if err := json.NewDecoder(r.Body).Decode(gotBody); err != nil {
 				t.Errorf("decode create body: %v", err)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": "agent-new", "name": "Src (copy)"})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":         "agent-new",
+				"name":       (*gotBody)["name"],
+				"runtime_id": (*gotBody)["runtime_id"],
+			})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -112,8 +117,8 @@ func TestAgentCopySameRuntimeCopiesPortableFields(t *testing.T) {
 	if gotBody["avatar_url"] != "https://img.example/a.png" {
 		t.Errorf("avatar_url = %v", gotBody["avatar_url"])
 	}
-	if !reflect.DeepEqual(gotBody["custom_args"], []any{"--foo", "--bar"}) {
-		t.Errorf("custom_args = %v", gotBody["custom_args"])
+	if _, present := gotBody["custom_args"]; present {
+		t.Errorf("redacted source custom_args must not be copied, got %v", gotBody["custom_args"])
 	}
 	if gotBody["max_concurrent_tasks"] != float64(9) {
 		t.Errorf("max_concurrent_tasks = %v, want 9", gotBody["max_concurrent_tasks"])
@@ -140,10 +145,54 @@ func TestAgentCopySameRuntimeCopiesPortableFields(t *testing.T) {
 		t.Errorf("skill_ids = %v, want [skill-1 skill-2]", gotBody["skill_ids"])
 	}
 	// Secrets / machine-local config must never be copied.
-	for _, k := range []string{"custom_env", "mcp_config", "runtime_config", "has_custom_env"} {
+	for _, k := range []string{"custom_env", "custom_args", "mcp_config", "runtime_config", "has_custom_env"} {
 		if _, ok := gotBody[k]; ok {
 			t.Errorf("body must not contain %q, got %v", k, gotBody[k])
 		}
+	}
+}
+
+func TestAgentCopyRejectsEmptyOrSourceIdentityWithoutRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		responseID string
+	}{
+		{"empty id", ""},
+		{"source id returned for copy", "agent-src"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			postRequests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(fullSourceAgent())
+				case r.Method == http.MethodPost:
+					postRequests++
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"id":         tc.responseID,
+						"name":       "Src (copy)",
+						"runtime_id": "runtime-1",
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			setCopyTestEnv(t, srv.URL)
+
+			err := runAgentCopy(newAgentCopyTestCmd(), []string{"agent-src"})
+			var committedErr *committedCreateResponseUnreadableError
+			if !errors.As(err, &committedErr) {
+				t.Fatalf("error=%v, want committedCreateResponseUnreadableError", err)
+			}
+			if !strings.Contains(err.Error(), "may have committed") ||
+				!strings.Contains(err.Error(), "multica agent list") {
+				t.Fatalf("error lacks inspect-before-retry guidance: %v", err)
+			}
+			if postRequests != 1 {
+				t.Fatalf("POST count=%d, want exactly one", postRequests)
+			}
+		})
 	}
 }
 
@@ -296,8 +345,10 @@ func TestAgentCopyAcceptsExplicitCustomEnv(t *testing.T) {
 // scripts can keep secrets off the command line.
 func TestAgentCopyExposesSecretSafeFlags(t *testing.T) {
 	for _, name := range []string{
+		"custom-args-stdin", "custom-args-file",
 		"custom-env-stdin", "custom-env-file",
 		"mcp-config-stdin", "mcp-config-file",
+		"runtime-config-stdin", "runtime-config-file",
 	} {
 		if agentCopyCmd.Flag(name) == nil {
 			t.Errorf("agent copy is missing the %q flag", name)

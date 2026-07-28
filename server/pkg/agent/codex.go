@@ -332,14 +332,10 @@ func filterCodexConfigOverrides(args []string, managedKeyRe *regexp.Regexp, name
 			}
 			if managedKeyRe.MatchString(value) {
 				if logger != nil {
-					// Log the key only, never the value. Managed config values
-					// may contain secrets and must stay out of logs/argv.
-					key := value
-					if eqIdx := strings.Index(value, "="); eqIdx >= 0 {
-						key = value[:eqIdx]
-					}
+					// Even the config key is caller-controlled and may encode a
+					// secret. Log only the fixed namespace and flag category.
 					logger.Warn("custom_args: blocked managed Codex config override",
-						"namespace", namespace, "flag", flag, "key", strings.TrimSpace(key))
+						"namespace", namespace, "flag", flag)
 				}
 				if !hasInlineValue && i+1 < len(args) {
 					i++ // skip the value arg
@@ -497,14 +493,14 @@ func renderCodexMcpServersBlock(raw json.RawMessage) (string, bool, error) {
 	sb.WriteString("\n")
 	for i, name := range names {
 		if !isCodexBareTomlKey(name) {
-			return "", false, fmt.Errorf("mcp server name %q must be ASCII alphanumeric / _ / - to fit Codex's bare-key requirement", name)
+			return "", false, fmt.Errorf("mcp_config contains a server name that is not a valid Codex key")
 		}
 		var serverVal map[string]any
 		if err := json.Unmarshal(parsed.McpServers[name], &serverVal); err != nil {
-			return "", false, fmt.Errorf("mcp_servers.%s: %w", name, err)
+			return "", false, fmt.Errorf("mcp_config server entry is invalid JSON: %w", err)
 		}
 		if serverVal == nil {
-			return "", false, fmt.Errorf("mcp_servers.%s must be a JSON object", name)
+			return "", false, fmt.Errorf("mcp_config server entry must be a JSON object")
 		}
 		serverVal = normalizeCodexMcpServerConfig(serverVal)
 		if i > 0 {
@@ -521,7 +517,7 @@ func renderCodexMcpServersBlock(raw json.RawMessage) (string, bool, error) {
 		for _, k := range keys {
 			tomlValue, err := jsonValueToCodexTOMLInline(serverVal[k])
 			if err != nil {
-				return "", false, fmt.Errorf("mcp_servers.%s.%s: %w", name, k, err)
+				return "", false, fmt.Errorf("mcp_config server field value is unsupported: %w", err)
 			}
 			sb.WriteString(codexTOMLKey(k))
 			sb.WriteString(" = ")
@@ -804,7 +800,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				// prepends the continuity notice about the lost context.
 				if attemptOpts.ResumeSessionID != "" {
 					b.cfg.Logger.Warn("codex retry dropping resume pointer after model catalog refresh failure",
-						"prior_thread_id", attemptOpts.ResumeSessionID,
+						"has_prior_thread_id", true,
 					)
 					attemptOpts.ResumeSessionID = ""
 					attemptOpts.ResumeExpected = true
@@ -908,7 +904,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// open pipe held by a grandchild) can't hang cmd.Wait() forever. Matches
 	// the other long-lived backends (claude, copilot, cursor, …).
 	cmd.WaitDelay = codexProcessWaitDelay()
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", codexArgs)
+	logAgentCommand(b.cfg.Logger, execPath, codexArgs)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -946,7 +942,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		codexVersion = "unknown"
 	}
 
-	b.cfg.Logger.Info("codex lifecycle", "phase", "spawn", "task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "pid", cmd.Process.Pid, "process_group", cmd.Process.Pid, "cwd", opts.Cwd, "attempt", attempt, "active_launches", activeLaunches, "codex_version", codexVersion, "daemon_version", b.cfg.DaemonVersion)
+	b.cfg.Logger.Info("codex lifecycle", "phase", "spawn", "task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "pid", cmd.Process.Pid, "process_group", cmd.Process.Pid, "has_cwd", opts.Cwd != "", "attempt", attempt, "active_launches", activeLaunches, "codex_version", codexVersion, "daemon_version", b.cfg.DaemonVersion)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -993,7 +989,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		},
 		onSemanticActivity: func(description string) {
 			semanticObserved.Store(true)
-			b.cfg.Logger.Debug("codex semantic activity observed", "activity", description)
+			b.cfg.Logger.Debug("codex semantic activity observed", "has_activity", description != "")
 			trySendString(semanticActivityCh, description)
 		},
 		onTurnDone: func(aborted bool) {
@@ -1270,9 +1266,9 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 		c.threadID = threadID
 		if resumed {
-			b.cfg.Logger.Info("codex thread resumed", "thread_id", threadID)
+			b.cfg.Logger.Info("codex thread resumed", "has_thread_id", threadID != "")
 		} else {
-			b.cfg.Logger.Info("codex thread started", "thread_id", threadID)
+			b.cfg.Logger.Info("codex thread started", "has_thread_id", threadID != "")
 		}
 
 		// 3. Send turn and wait for completion. When a resume was expected but we
@@ -1386,10 +1382,10 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				}
 				b.cfg.Logger.Warn(CodexFirstTurnNoProgressMarker,
 					"pid", cmd.Process.Pid,
-					"thread_id", threadID,
-					"turn_id", c.turnID,
+					"has_thread_id", threadID != "",
+					"has_turn_id", c.turnID != "",
 					"timeout", firstTurnNoProgressTimeout.String(),
-					"last_activity", lastSemanticActivityDescription,
+					"has_last_activity", lastSemanticActivityDescription != "",
 				)
 			case <-semanticTimer.C:
 				waitingForTurn = false
@@ -1404,10 +1400,10 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				}
 				b.cfg.Logger.Warn(CodexSemanticInactivityMarker,
 					"pid", cmd.Process.Pid,
-					"thread_id", threadID,
-					"turn_id", c.turnID,
+					"has_thread_id", threadID != "",
+					"has_turn_id", c.turnID != "",
 					"timeout", semanticInactivityTimeout.String(),
-					"last_activity", lastSemanticActivityDescription,
+					"has_last_activity", lastSemanticActivityDescription != "",
 					"idle_for", time.Since(lastSemanticActivity).Round(time.Millisecond).String(),
 				)
 			case <-runCtx.Done():
@@ -1465,7 +1461,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		if startupRefreshRetrySafe {
 			b.cfg.Logger.Warn("codex startup model catalog refresh failure is retry safe",
 				"pid", cmd.Process.Pid,
-				"thread_id", threadID,
+				"has_thread_id", threadID != "",
 				"attempt", attempt,
 			)
 		}
@@ -1568,13 +1564,13 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 			if threadID := extractThreadID(resumeResult); threadID != "" {
 				return threadID, true, nil
 			}
-			logger.Warn("codex thread/resume returned no thread ID; falling back to thread/start", "prior_thread_id", priorThreadID)
+			logger.Warn("codex thread/resume returned no thread ID; falling back to thread/start", "has_prior_thread_id", priorThreadID != "")
 		} else {
 			if isCodexTransportError(err) {
-				logger.Warn("codex thread/resume failed due to transport error; not falling back to thread/start", "prior_thread_id", priorThreadID, "error", err)
+				logger.Warn("codex thread/resume failed due to transport error; not falling back to thread/start", "has_prior_thread_id", priorThreadID != "", "has_error", true)
 				return "", false, fmt.Errorf("codex thread/resume failed: %w", err)
 			}
-			logger.Warn("codex thread/resume failed; falling back to thread/start", "prior_thread_id", priorThreadID, "error", err)
+			logger.Warn("codex thread/resume failed; falling back to thread/start", "has_prior_thread_id", priorThreadID != "", "has_error", true)
 		}
 	}
 
@@ -1636,7 +1632,7 @@ func (c *codexClient) trySetThreadName(ctx context.Context, threadID, name strin
 	}
 	if err := c.setThreadName(ctx, threadID, name); err != nil {
 		logger.Warn("codex thread/name/set failed; continuing without provider-native thread title",
-			"thread_id", threadID, "error", err)
+			"has_thread_id", threadID != "", "has_error", true)
 	}
 }
 
@@ -1791,7 +1787,7 @@ func detectCodexVersionForDiagnostics(ctx context.Context, execPath string, env 
 	data, err := cmd.Output()
 	if err != nil {
 		if logger != nil {
-			logger.Debug("codex version diagnostic failed", "error", err)
+			logger.Debug("codex version diagnostic failed", "has_error", true)
 		}
 		return "unknown"
 	}
@@ -1815,15 +1811,15 @@ func logCodexAgentMessage(logger *slog.Logger, msg Message) {
 	}
 	attrs := []any{
 		"type", string(msg.Type),
-		"tool", msg.Tool,
-		"call_id", msg.CallID,
+		"has_tool", msg.Tool != "",
+		"has_call_id", msg.CallID != "",
 		"status", msg.Status,
 		"content_len", len(msg.Content),
 		"output_len", len(msg.Output),
 	}
 	logger.Info("codex agent message received", attrs...)
 	if msg.Type == MessageToolResult {
-		logger.Info("codex tool_result observed", "tool", msg.Tool, "call_id", msg.CallID, "output_len", len(msg.Output))
+		logger.Info("codex tool_result observed", "has_tool", msg.Tool != "", "has_call_id", msg.CallID != "", "output_len", len(msg.Output))
 	}
 }
 
@@ -2058,7 +2054,7 @@ func (c *codexClient) request(ctx context.Context, method string, params any) (j
 		if paramMap, ok := params.(map[string]any); ok {
 			threadID, _ = paramMap["threadId"].(string)
 		}
-		c.cfg.Logger.Info("codex turn/start sent", "request_id", id, "thread_id", threadID)
+		c.cfg.Logger.Info("codex turn/start sent", "request_id", id, "has_thread_id", threadID != "")
 	}
 
 	select {
@@ -2248,7 +2244,7 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 		c.respond(id, map[string]any{"action": "accept", "content": nil, "_meta": nil})
 	default:
 		msg := fmt.Sprintf("unsupported codex app-server request: %s", method)
-		c.cfg.Logger.Warn("codex: unhandled server request", "method", method, "id", id)
+		c.cfg.Logger.Warn("codex: unhandled server request", "has_method", method != "", "id", id)
 		c.setTurnError(msg)
 		c.respondError(id, -32601, msg)
 	}
@@ -2269,7 +2265,7 @@ func codexPermissionsApprovalResponse(params json.RawMessage, logger *slog.Logge
 		Permissions map[string]any `json:"permissions"`
 	}
 	if err := json.Unmarshal(params, &payload); err != nil && logger != nil {
-		logger.Warn("codex: failed to parse permission approval request; granting empty turn-scoped profile", "error", err)
+		logger.Warn("codex: failed to parse permission approval request; granting empty turn-scoped profile", "has_error", true)
 	}
 
 	granted := map[string]any{}
@@ -2286,7 +2282,7 @@ func codexPermissionsApprovalResponse(params json.RawMessage, logger *slog.Logge
 	}
 	if len(dropped) > 0 && logger != nil {
 		sort.Strings(dropped)
-		logger.Warn("codex: dropping unrecognized permission keys from approval request; add explicit handling if the app-server protocol expanded", "keys", dropped)
+		logger.Warn("codex: dropping unrecognized permission keys from approval request; add explicit handling if the app-server protocol expanded", "key_count", len(dropped))
 	}
 
 	return map[string]any{
@@ -2441,7 +2437,7 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		turnID := extractNestedString(params, "turn", "id")
 		status := extractNestedString(params, "turn", "status")
 		threadID, _ := params["threadId"].(string)
-		c.cfg.Logger.Info("codex turn/completed received", "thread_id", threadID, "turn_id", turnID, "status", status)
+		c.cfg.Logger.Info("codex turn/completed received", "has_thread_id", threadID != "", "has_turn_id", turnID != "", "status", status)
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"
 
@@ -2484,7 +2480,7 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 			errMsg = extractNestedString(params, "message")
 		}
 		if errMsg != "" {
-			c.cfg.Logger.Warn("codex error notification", "message", errMsg, "will_retry", willRetry)
+			c.cfg.Logger.Warn("codex error notification", "has_message", true, "will_retry", willRetry)
 			if c.onSemanticActivity != nil {
 				if willRetry {
 					c.onSemanticActivity("error:retry")

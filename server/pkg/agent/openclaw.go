@@ -76,7 +76,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	logAgentCommand(b.cfg.Logger, execPath, args)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -99,7 +99,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		return nil, fmt.Errorf("start openclaw: %w", err)
 	}
 
-	b.cfg.Logger.Info("openclaw started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "openclaw", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -390,7 +390,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				})
 			case "error":
 				errMsg := event.errorMessage()
-				b.cfg.Logger.Warn("openclaw error event", "error", errMsg)
+				b.cfg.Logger.Warn("openclaw error event", "has_error", errMsg != "")
 				trySend(ch, Message{Type: MessageError, Content: errMsg})
 				finalStatus = "failed"
 				finalError = errMsg
@@ -398,7 +398,12 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				phase := event.Phase
 				if phase == "error" || phase == "failed" || phase == "cancelled" {
 					errMsg := event.errorMessage()
-					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "error", errMsg)
+					b.cfg.Logger.Warn("openclaw lifecycle failure",
+						"phase_is_error", phase == "error",
+						"phase_is_failed", phase == "failed",
+						"phase_is_cancelled", phase == "cancelled",
+						"has_error", errMsg != "",
+					)
 					trySend(ch, Message{Type: MessageError, Content: errMsg})
 					finalStatus = "failed"
 					finalError = errMsg
@@ -436,7 +441,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 		}
 
 		// Not JSON — treat as log line.
-		b.cfg.Logger.Debug("[openclaw:stdout] " + line)
+		logProviderUnparsedOutput(b.cfg.Logger, "stdout", line)
 		rawLines = append(rawLines, line)
 	}
 

@@ -5,7 +5,10 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Loader2, Lock, Plug } from "lucide-react";
 import { toast } from "sonner";
 import type { Agent, ComposioToolkit } from "@multica/core/types";
-import { useUpdateAgentAllowlist } from "@multica/core/agents";
+import {
+  agentComposioToolkitAllowlistOptions,
+  useUpdateAgentAllowlist,
+} from "@multica/core/agents";
 import { useFeatureEnabled } from "@multica/core/config";
 import {
   composioConnectionsOptions,
@@ -20,9 +23,10 @@ import { useT } from "../../../i18n";
 
 /**
  * Creator-only MCP tab on the agent detail page (MUL-3870). Lets the agent
- * owner pick which of *their own* active Composio connections this agent may
- * mount as MCP servers — the selection is written to
- * `agent.composio_toolkit_allowlist`. At dispatch the overlay is mounted for
+ * owner pick which active Composio connections this agent may mount as MCP
+ * servers. Generic Agent resources expose only count/redacted metadata; this
+ * tab explicitly loads the raw selection from the audited human-only endpoint.
+ * At dispatch the overlay is mounted for
  * ANY run that passes the agent's invocation permission and always uses the
  * agent OWNER's Composio connection (MUL-3963) — it is no longer gated on the
  * run originator being the owner. That is why sharing the agent (public_to)
@@ -31,10 +35,9 @@ import { useT } from "../../../i18n";
  *
  * Visibility is enforced by the parent (the tab entry isn't rendered unless
  * `agent.owner_id === viewer.id`), so this component assumes the owner. It
- * still renders a defensive "hidden" state if the server redacted the
- * allowlist, and reads the checked state straight from the agent prop so the
- * optimistic cache write in `useUpdateAgentAllowlist` flips each box
- * instantly.
+ * still renders a defensive locked state if the privileged reveal fails.
+ * `useUpdateAgentAllowlist` optimistically updates only the dedicated raw
+ * query cache, so generic Agent caches remain value-free.
  */
 export function AgentMcpTab({ agent }: { agent: Agent }) {
   const { t } = useT("agents");
@@ -48,6 +51,10 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
   });
   const toolkitsQuery = useQuery({
     ...composioToolkitsOptions(),
+    enabled: composioEnabled,
+  });
+  const allowlistQuery = useQuery({
+    ...agentComposioToolkitAllowlistOptions(agent.id),
     enabled: composioEnabled,
   });
 
@@ -75,10 +82,7 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
     return out;
   }, [connectionsQuery.data]);
 
-  const allowlist = useMemo(
-    () => agent.composio_toolkit_allowlist ?? [],
-    [agent.composio_toolkit_allowlist],
-  );
+  const allowlist = allowlistQuery.data?.toolkit_slugs ?? [];
 
   const settingsHref = `${paths.settings()}?tab=integrations`;
 
@@ -110,11 +114,9 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
     });
   };
 
-  // Defensive: the tab is owner-gated, so a redacted allowlist should never
-  // reach here. If it somehow does (stale cache, future fan-out), show the
-  // same "configured but hidden" affordance as the MCP config tab rather than
-  // an empty editor that a Save could clobber.
-  if (agent.composio_toolkit_allowlist_redacted === true) {
+  // A failed privileged reveal must never degrade into an empty editor: that
+  // would turn a subsequent Save into an accidental clear of hidden slugs.
+  if (allowlistQuery.isError) {
     return (
       <div className="space-y-3">
         <p className="flex items-center gap-2 text-sm font-medium">
@@ -148,7 +150,7 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
         </div>
       )}
 
-      {connectionsQuery.isLoading ? (
+      {connectionsQuery.isLoading || allowlistQuery.isLoading ? (
         <p className="text-sm text-muted-foreground">
           {t(($) => $.tab_body.composio_mcp.loading)}
         </p>

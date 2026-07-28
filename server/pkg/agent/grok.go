@@ -146,7 +146,7 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 
 	cmd := exec.CommandContext(runCtx, execPath, grokArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", grokArgs)
+	logAgentCommand(b.cfg.Logger, execPath, grokArgs)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -185,7 +185,7 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("grok acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	logProviderStarted(b.cfg.Logger, "grok", cmd.Process.Pid, opts)
 
 	msgStream := newGrokMessageStream(256)
 	resCh := make(chan Result, 1)
@@ -312,7 +312,7 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 			return
 		}
-		b.cfg.Logger.Info("grok authenticated", "method", methodID)
+		b.cfg.Logger.Info("grok authenticated", "has_method", methodID != "")
 
 		// Drop MCP entries whose remote transport the runtime didn't advertise.
 		// See hermes.go for why sending an unsupported transport tanks session/new.
@@ -340,8 +340,8 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "grok",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_present", opts.ResumeSessionID != "",
+					"actual_present", sessionID != "",
 				)
 			}
 			if effectiveModel == "" {
@@ -373,20 +373,20 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		c.sessionID = sessionID
 		// Early session pin so a cancelled run still preserves resume pointer.
 		msgStream.send(Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
-		b.cfg.Logger.Info("grok session created", "session_id", sessionID)
+		b.cfg.Logger.Info("grok session created", "has_session_id", sessionID != "")
 
 		if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("grok set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("grok set_session_model failed", "has_error", true, "has_requested_model", true)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("grok could not switch to model %q: %v", opts.Model, err)
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "grok",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -400,7 +400,7 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				}
 				return
 			}
-			b.cfg.Logger.Info("grok session model set", "model", opts.Model)
+			b.cfg.Logger.Info("grok session model set", "has_requested_model", true)
 		}
 
 		userText := prompt
@@ -430,7 +430,7 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "grok",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true

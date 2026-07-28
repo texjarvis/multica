@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -88,7 +89,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	// only after the tree has been signalled. Returning nil keeps os/exec from
 	// racing us with its own kill; WaitDelay remains the hard backstop.
 	cmd.Cancel = func() error { return nil }
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	logAgentCommand(b.cfg.Logger, execPath, args)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -125,7 +126,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
 
-	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "claude", cmd.Process.Pid, opts)
 
 	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
@@ -471,12 +472,12 @@ func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interfa
 
 	data, err := json.Marshal(response)
 	if err != nil {
-		b.cfg.Logger.Warn("claude: failed to marshal control response", "error", err)
+		b.cfg.Logger.Warn("claude: failed to marshal control response", "has_error", true)
 		return
 	}
 	data = append(data, '\n')
 	if _, err := stdin.Write(data); err != nil {
-		b.cfg.Logger.Warn("claude: failed to write control response", "error", err)
+		b.cfg.Logger.Warn("claude: failed to write control response", "has_error", true)
 	}
 }
 
@@ -956,7 +957,7 @@ func filterCustomArgs(args []string, blocked map[string]blockedArgMode, logger *
 		}
 		mode, isBlocked := blocked[flag]
 		if isBlocked {
-			logger.Warn("custom_args: blocked protocol-critical flag, skipping", "flag", flag)
+			logger.Warn("custom_args: blocked protocol-critical flag, skipping", "has_flag", flag != "")
 			if mode == blockedWithValue && !hasInlineValue {
 				// The next arg is the value for this flag — skip it too.
 				i++
@@ -1099,7 +1100,10 @@ func extractVersionLine(raw string) string {
 	return strings.TrimSpace(raw)
 }
 
-// logWriter adapts a *slog.Logger to an io.Writer for capturing stderr.
+// logWriter adapts a *slog.Logger to an io.Writer for recording content-free
+// stderr activity. Provider stderr can echo prompts, argv, MCP config, or env
+// values; raw bytes are retained separately only in bounded in-memory tails
+// when a backend needs them for the user-facing task result.
 type logWriter struct {
 	logger *slog.Logger
 	prefix string
@@ -1110,9 +1114,8 @@ func newLogWriter(logger *slog.Logger, prefix string) *logWriter {
 }
 
 func (w *logWriter) Write(p []byte) (int, error) {
-	text := strings.TrimSpace(string(p))
-	if text != "" {
-		w.logger.Debug(w.prefix + text)
+	if len(bytes.TrimSpace(p)) > 0 {
+		w.logger.Debug(strings.TrimSpace(w.prefix), "chunk_byte_count", len(p))
 	}
 	return len(p), nil
 }

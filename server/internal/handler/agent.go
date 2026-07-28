@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -35,17 +36,29 @@ import (
 const maxAgentDescriptionLength = 255
 
 type AgentResponse struct {
-	ID            string          `json:"id"`
-	WorkspaceID   string          `json:"workspace_id"`
-	RuntimeID     string          `json:"runtime_id"`
-	Name          string          `json:"name"`
-	Description   string          `json:"description"`
-	Instructions  string          `json:"instructions"`
-	AvatarURL     *string         `json:"avatar_url"`
-	RuntimeMode   string          `json:"runtime_mode"`
-	RuntimeConfig any             `json:"runtime_config"`
-	CustomArgs    []string        `json:"custom_args"`
-	McpConfig     json.RawMessage `json:"mcp_config"`
+	ID           string  `json:"id"`
+	WorkspaceID  string  `json:"workspace_id"`
+	RuntimeID    string  `json:"runtime_id"`
+	Name         string  `json:"name"`
+	Description  string  `json:"description"`
+	Instructions string  `json:"instructions"`
+	AvatarURL    *string `json:"avatar_url"`
+	RuntimeMode  string  `json:"runtime_mode"`
+	// RuntimeConfig is a server-owned public projection, never the persisted
+	// free-form JSON. Known non-secret OpenClaw routing metadata may remain;
+	// arbitrary strings and unknown/nested fields are suppressed or masked.
+	RuntimeConfig         any  `json:"runtime_config"`
+	HasRuntimeConfig      bool `json:"has_runtime_config"`
+	RuntimeConfigKeyCount int  `json:"runtime_config_key_count"`
+	RuntimeConfigRedacted bool `json:"runtime_config_redacted"`
+	// CustomArgs is intentionally always empty on generic agent resources.
+	// Arbitrary CLI arguments can contain split/equal-form credentials,
+	// authorization headers, or provider-specific secrets that cannot be
+	// classified reliably. Count + redacted metadata preserve useful state.
+	CustomArgs         []string        `json:"custom_args"`
+	CustomArgsCount    int             `json:"custom_args_count"`
+	CustomArgsRedacted bool            `json:"custom_args_redacted"`
+	McpConfig          json.RawMessage `json:"mcp_config"`
 	// custom_env is intentionally NOT serialized on agent resources. The
 	// agent_list/get/create/update/archive/restore responses and WS events
 	// only expose coarse metadata (has_custom_env, custom_env_key_count) so
@@ -76,18 +89,12 @@ type AgentResponse struct {
 	// ServiceTier is the runtime-native Codex execution tier persisted for
 	// this agent (empty = inherit local Codex configuration).
 	ServiceTier string `json:"service_tier"`
-	// ComposioToolkitAllowlist is the subset of Composio toolkit slugs this
-	// agent is allowed to mount as MCP at task dispatch — for ANY run that
-	// passes the agent's invocation permission, using the agent OWNER's
-	// Composio connection (MUL-3963; no longer gated on originator == owner).
-	// NULL or empty = no overlay. Like mcp_config, this is
-	// owner-only data: the slugs themselves are not secret, but the
-	// "this is what {agent owner} is willing to surface" view is — surfacing
-	// it cross-account is privacy-confusing UX and would let workspace
-	// members infer another member's integration footprint. Redacted to
-	// `nil` + `composio_toolkit_allowlist_redacted=true` for non-owners,
-	// mirroring the existing mcp_config redaction contract.
+	// Raw Composio toolkit slugs never cross generic AgentResponse surfaces,
+	// including to the agent owner. A future raw-read capability must be a
+	// separate, audited privileged endpoint. Generic clients receive only
+	// count + redacted metadata.
 	ComposioToolkitAllowlist         []string               `json:"composio_toolkit_allowlist,omitempty"`
+	ComposioToolkitAllowlistCount    int                    `json:"composio_toolkit_allowlist_count"`
 	ComposioToolkitAllowlistRedacted bool                   `json:"composio_toolkit_allowlist_redacted,omitempty"`
 	OwnerID                          *string                `json:"owner_id"`
 	Skills                           []AgentSkillSummary    `json:"skills"`
@@ -98,24 +105,78 @@ type AgentResponse struct {
 	ArchivedBy                       *string                `json:"archived_by"`
 }
 
-// runtimeConfigGatewayTokenMask is the placeholder the API substitutes for
-// any non-empty `runtime_config.gateway.token` (openclaw gateway mode, issue
-// #3260). The token is a bearer credential; surfacing the real value through
-// GET responses would let anyone with read access to the agent dump the
-// gateway secret. The mask is a sentinel — when the UI later PATCHes the
-// agent and submits the same mask verbatim under that field, the update
-// handler restores the persisted token instead of overwriting it.
-const runtimeConfigGatewayTokenMask = "***"
+// runtimeConfigRedactionMarker makes a projected runtime_config
+// non-authoritative on the wire. The marker uses the same reserved sentinel
+// as env/MCP responses so update handlers can identify and preserve a blind
+// response round-trip instead of persisting placeholders or deleting hidden
+// fields. Fresh explicit replacement input must not contain this marker.
+const runtimeConfigRedactionMarker = "_redacted"
+
+// runtimeConfigLegacyGatewayTokenMask was emitted before the whole-field
+// projection existed. Accept it only at the legacy gateway.token writeback
+// path so older UIs can preserve a stored token during a rolling upgrade.
+const runtimeConfigLegacyGatewayTokenMask = "***"
+
+const (
+	hiddenMutationIntentReplace = "replace"
+	hiddenMutationIntentClear   = "clear"
+)
+
+// decodeHiddenMutationIntent distinguishes an omitted intent from explicit
+// replace/clear. Hidden public response fields are non-authoritative, so every
+// new-client destructive write must carry one of these closed values.
+func decodeHiddenMutationIntent(rawFields map[string]json.RawMessage, field string) (string, bool, error) {
+	raw, exists := rawFields[field]
+	if !exists {
+		return "", false, nil
+	}
+	var intent string
+	if err := json.Unmarshal(raw, &intent); err != nil {
+		return "", true, errors.New(field + " must be \"replace\" or \"clear\"")
+	}
+	if intent != hiddenMutationIntentReplace && intent != hiddenMutationIntentClear {
+		return "", true, errors.New(field + " must be \"replace\" or \"clear\"")
+	}
+	return intent, true, nil
+}
+
+// storedJSONArrayHasValues fails closed for malformed persisted JSON. A
+// malformed hidden field is still authoritative data: only explicit
+// replace/clear intent may overwrite it.
+func storedJSONArrayHasValues(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("[]")) {
+		return false
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(trimmed, &values); err != nil {
+		return true
+	}
+	return len(values) > 0
+}
+
+func storedMcpConfigHasValues(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return false
+	}
+	var value any
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return true
+	}
+	if object, ok := value.(map[string]any); ok {
+		return len(object) > 0
+	}
+	return true
+}
+
+func storedRuntimeConfigHasValues(raw []byte) bool {
+	return storedMcpConfigHasValues(raw)
+}
 
 func agentToResponse(a db.Agent) AgentResponse {
-	var rc any
-	if a.RuntimeConfig != nil {
-		json.Unmarshal(a.RuntimeConfig, &rc)
-	}
-	if rc == nil {
-		rc = map[string]any{}
-	}
-	maskGatewayToken(rc)
+	runtimeConfig, hasRuntimeConfig, runtimeConfigRedacted, runtimeConfigKeyCount :=
+		sanitizeRuntimeConfigForAgentResponse(a.RuntimeConfig)
 
 	// Compute env metadata WITHOUT exposing the values. We unmarshal here
 	// only to count keys; the map never reaches the response. A coarse
@@ -131,89 +192,565 @@ func agentToResponse(a db.Agent) AgentResponse {
 		envKeyCount = len(customEnv)
 	}
 
-	var customArgs []string
+	customArgsCount := 0
+	customArgsRedacted := false
 	if a.CustomArgs != nil {
+		var customArgs []string
 		if err := json.Unmarshal(a.CustomArgs, &customArgs); err != nil {
 			slog.Warn("failed to unmarshal agent custom_args", "agent_id", uuidToString(a.ID), "error", err)
+			customArgsRedacted = true
+		} else {
+			customArgsCount = len(customArgs)
+			customArgsRedacted = customArgsCount > 0
 		}
-	}
-	if customArgs == nil {
-		customArgs = []string{}
 	}
 
 	var mcpConfig json.RawMessage
+	mcpConfigRedacted := false
 	if a.McpConfig != nil {
-		mcpConfig = json.RawMessage(a.McpConfig)
+		mcpConfig, mcpConfigRedacted = sanitizeMcpConfigForAgentResponse(a.McpConfig)
 	}
 
-	// composio_toolkit_allowlist: the column is stored as TEXT[] and arrives
-	// here as a []string (sqlc). NULL and `{}` both serialize as nil through
-	// the postgres driver — both correctly mean "no toolkits", but the API
-	// surface keeps them distinguishable from "owner has not opened the
-	// integration yet" only via the trio (slice nil / slice empty / slice
-	// non-empty). We hand the slice through verbatim so the redaction +
-	// owner-only gate below can decide.
-	composioAllowlist := a.ComposioToolkitAllowlist
+	composioAllowlistCount := len(a.ComposioToolkitAllowlist)
 
 	return AgentResponse{
-		ID:                       uuidToString(a.ID),
-		WorkspaceID:              uuidToString(a.WorkspaceID),
-		RuntimeID:                uuidToString(a.RuntimeID),
-		Name:                     a.Name,
-		Description:              a.Description,
-		Instructions:             a.Instructions,
-		AvatarURL:                textToPtr(a.AvatarUrl),
-		RuntimeMode:              a.RuntimeMode,
-		RuntimeConfig:            rc,
-		CustomArgs:               customArgs,
-		McpConfig:                mcpConfig,
-		HasCustomEnv:             envKeyCount > 0,
-		CustomEnvKeyCount:        envKeyCount,
-		Visibility:               a.Visibility,
-		PermissionMode:           a.PermissionMode,
-		InvocationTargets:        []AgentInvocationTargetDTO{},
-		Status:                   a.Status,
-		MaxConcurrentTasks:       a.MaxConcurrentTasks,
-		Model:                    a.Model.String,
-		ThinkingLevel:            a.ThinkingLevel.String,
-		ServiceTier:              a.ServiceTier.String,
-		ComposioToolkitAllowlist: composioAllowlist,
-		OwnerID:                  uuidToPtr(a.OwnerID),
-		Skills:                   []AgentSkillSummary{},
-		DisabledRuntimeSkills:    decodeDisabledRuntimeSkills(a.DisabledRuntimeSkills),
-		CreatedAt:                timestampToString(a.CreatedAt),
-		UpdatedAt:                timestampToString(a.UpdatedAt),
-		ArchivedAt:               timestampToPtr(a.ArchivedAt),
-		ArchivedBy:               uuidToPtr(a.ArchivedBy),
+		ID:                               uuidToString(a.ID),
+		WorkspaceID:                      uuidToString(a.WorkspaceID),
+		RuntimeID:                        uuidToString(a.RuntimeID),
+		Name:                             a.Name,
+		Description:                      a.Description,
+		Instructions:                     a.Instructions,
+		AvatarURL:                        textToPtr(a.AvatarUrl),
+		RuntimeMode:                      a.RuntimeMode,
+		RuntimeConfig:                    runtimeConfig,
+		HasRuntimeConfig:                 hasRuntimeConfig,
+		RuntimeConfigKeyCount:            runtimeConfigKeyCount,
+		RuntimeConfigRedacted:            runtimeConfigRedacted,
+		CustomArgs:                       []string{},
+		CustomArgsCount:                  customArgsCount,
+		CustomArgsRedacted:               customArgsRedacted,
+		McpConfig:                        mcpConfig,
+		McpConfigRedacted:                mcpConfigRedacted,
+		HasCustomEnv:                     envKeyCount > 0,
+		CustomEnvKeyCount:                envKeyCount,
+		Visibility:                       a.Visibility,
+		PermissionMode:                   a.PermissionMode,
+		InvocationTargets:                []AgentInvocationTargetDTO{},
+		Status:                           a.Status,
+		MaxConcurrentTasks:               a.MaxConcurrentTasks,
+		Model:                            a.Model.String,
+		ThinkingLevel:                    a.ThinkingLevel.String,
+		ServiceTier:                      a.ServiceTier.String,
+		ComposioToolkitAllowlistCount:    composioAllowlistCount,
+		ComposioToolkitAllowlistRedacted: composioAllowlistCount > 0,
+		OwnerID:                          uuidToPtr(a.OwnerID),
+		Skills:                           []AgentSkillSummary{},
+		DisabledRuntimeSkills:            decodeDisabledRuntimeSkills(a.DisabledRuntimeSkills),
+		CreatedAt:                        timestampToString(a.CreatedAt),
+		UpdatedAt:                        timestampToString(a.UpdatedAt),
+		ArchivedAt:                       timestampToPtr(a.ArchivedAt),
+		ArchivedBy:                       uuidToPtr(a.ArchivedBy),
 	}
 }
 
-// maskGatewayToken replaces runtime_config.gateway.token with the public
-// mask sentinel when a non-empty value is present. No-op for any other
-// shape so non-openclaw / non-gateway agents pass through untouched.
-func maskGatewayToken(rc any) {
-	root, ok := rc.(map[string]any)
-	if !ok {
-		return
+// sanitizeRuntimeConfigForAgentResponse builds the only runtime_config shape
+// allowed to cross generic agent APIs. The persisted column is intentionally
+// free-form and may be extended by providers, so recursively trying to guess
+// which names are secret is unsafe. We instead allowlist the small OpenClaw
+// routing projection whose primitive semantics are known:
+//
+//   - mode: the closed local/gateway enum
+//   - gateway.port: a valid TCP port
+//   - gateway.tls: a boolean
+//   - gateway.host/token: presence-preserving masks, never values
+//
+// Every other key/value is suppressed. A response-only marker makes any
+// projected result non-authoritative so the update path can preserve a blind
+// round-trip. Daemon claims continue to consume db.Agent.RuntimeConfig raw.
+func sanitizeRuntimeConfigForAgentResponse(raw []byte) (map[string]any, bool, bool, int) {
+	out := map[string]any{}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		return out, false, false, 0
 	}
-	gw, ok := root["gateway"].(map[string]any)
-	if !ok {
-		return
+
+	if err := validateUniqueJSONKeys(trimmed); err != nil {
+		slog.Warn("invalid agent runtime_config JSON for response; redacting entire config", "error", err)
+		out[runtimeConfigRedactionMarker] = envSentinel
+		return out, true, true, 0
 	}
-	tok, _ := gw["token"].(string)
-	if tok == "" {
-		return
+
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &root); err != nil || root == nil {
+		slog.Warn("agent runtime_config root is not an object; redacting entire config")
+		out[runtimeConfigRedactionMarker] = envSentinel
+		return out, true, true, 0
 	}
-	gw["token"] = runtimeConfigGatewayTokenMask
+
+	keyCount := len(root)
+	redacted := false
+	for key, value := range root {
+		switch key {
+		case "mode":
+			var mode string
+			if err := json.Unmarshal(value, &mode); err != nil || (mode != "local" && mode != "gateway") {
+				redacted = true
+				continue
+			}
+			out["mode"] = mode
+		case "gateway":
+			gateway, gatewayRedacted, ok := sanitizeRuntimeGatewayForAgentResponse(value)
+			if !ok {
+				redacted = true
+				continue
+			}
+			out["gateway"] = gateway
+			redacted = redacted || gatewayRedacted
+		default:
+			// Unknown root keys are never copied, including their names. A key
+			// itself can contain a credential in free-form JSON.
+			redacted = true
+		}
+	}
+	if redacted {
+		out[runtimeConfigRedactionMarker] = envSentinel
+	}
+	return out, keyCount > 0, redacted, keyCount
 }
 
-// preserveMaskedGatewayToken substitutes the previously persisted gateway
-// token back into an incoming runtime_config when the request submitted the
-// public mask sentinel under `gateway.token`. Without this the next PATCH
-// after a GET would round-trip the masked sentinel into the database and
-// silently destroy the real secret. The previous value is taken from the
-// agent row the handler has just loaded for ownership / scoping checks.
-func preserveMaskedGatewayToken(incoming any, persistedRuntimeConfig []byte) {
+func sanitizeRuntimeGatewayForAgentResponse(raw json.RawMessage) (map[string]any, bool, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return nil, true, false
+	}
+
+	out := make(map[string]any, len(fields))
+	redacted := false
+	for key, value := range fields {
+		switch key {
+		case "host", "token":
+			var text string
+			if err := json.Unmarshal(value, &text); err != nil {
+				redacted = true
+				continue
+			}
+			// Even a host can be an internal URL, credential-bearing socket,
+			// or attacker-controlled secret. Preserve only configured state.
+			if text != "" {
+				out[key] = envSentinel
+			}
+			redacted = true
+		case "port":
+			var port int
+			if err := json.Unmarshal(value, &port); err != nil || port < 1 || port > 65535 {
+				redacted = true
+				continue
+			}
+			out["port"] = port
+		case "tls":
+			var tls bool
+			if err := json.Unmarshal(value, &tls); err != nil {
+				redacted = true
+				continue
+			}
+			out["tls"] = tls
+		default:
+			redacted = true
+		}
+	}
+	return out, redacted, true
+}
+
+// sanitizeMcpConfigForAgentResponse is the server-owned outbound boundary for
+// persisted MCP configuration. Generic agent resources are used by HTTP,
+// CLI/UI, WebSocket, archive/restore, template, onboarding, and runtime
+// management paths, so authorization alone is not a sufficient secret
+// boundary: even owners and admins receive only a validated, masked shape.
+//
+// Daemon claim paths intentionally consume the raw db.Agent instead. This
+// sanitizer accepts the minimum common MCP shape: one mcpServers/mcp_servers
+// map whose entries are either stdio (command, optional args/env/type) or
+// remote (url, optional headers/type/transport). Unknown, ambiguous, malformed,
+// or wrong-shaped data fails closed by suppressing the whole config.
+func sanitizeMcpConfigForAgentResponse(raw []byte) (json.RawMessage, bool) {
+	if err := validateUniqueJSONKeys(raw); err != nil {
+		slog.Warn("invalid agent mcp_config JSON for response; redacting entire config", "error", err)
+		return nil, true
+	}
+
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &config); err != nil || config == nil {
+		slog.Warn("agent mcp_config root is not an object; redacting entire config")
+		return nil, true
+	}
+	if len(config) == 0 {
+		return append(json.RawMessage(nil), raw...), false
+	}
+	if len(config) != 1 {
+		slog.Warn("agent mcp_config has an unsupported root shape; redacting entire config")
+		return nil, true
+	}
+
+	var serversKey string
+	var rawServers json.RawMessage
+	for key, value := range config {
+		if key != "mcpServers" && key != "mcp_servers" {
+			slog.Warn("agent mcp_config has an unsupported root field; redacting entire config")
+			return nil, true
+		}
+		serversKey = key
+		rawServers = value
+	}
+
+	var servers map[string]json.RawMessage
+	if err := json.Unmarshal(rawServers, &servers); err != nil || servers == nil {
+		slog.Warn("agent mcp_config server container is not an object; redacting entire config")
+		return nil, true
+	}
+
+	serverNames := make([]string, 0, len(servers))
+	for name := range servers {
+		serverNames = append(serverNames, name)
+	}
+	sort.Strings(serverNames)
+
+	maskedServers := make(map[string]any, len(servers))
+	redacted := false
+	for i, name := range serverNames {
+		if name == "" {
+			slog.Warn("agent mcp_config contains an empty server name; redacting entire config")
+			return nil, true
+		}
+		maskedServer, serverRedacted, ok := sanitizeMcpServerForAgentResponse(servers[name])
+		if !ok {
+			slog.Warn("agent mcp_config contains an unsupported server definition; redacting entire config")
+			return nil, true
+		}
+		// Server names are free-form JSON keys and can accidentally contain a
+		// credential. Stable aliases preserve count/order without returning
+		// attacker-controlled identifiers.
+		maskedServers[fmt.Sprintf("server_%d", i+1)] = maskedServer
+		redacted = redacted || serverRedacted
+	}
+
+	if !redacted {
+		return append(json.RawMessage(nil), raw...), false
+	}
+	masked, err := json.Marshal(map[string]any{serversKey: maskedServers})
+	if err != nil {
+		slog.Warn("failed to marshal redacted agent mcp_config; redacting entire config", "error", err)
+		return nil, true
+	}
+	return json.RawMessage(masked), true
+}
+
+// sanitizeMcpServerForAgentResponse validates one common MCP server entry and
+// rebuilds it from supported primitives. Rebuilding prevents an overlooked
+// nested value from hitching a ride when another field causes masking.
+func sanitizeMcpServerForAgentResponse(raw json.RawMessage) (map[string]any, bool, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil || len(fields) == 0 {
+		return nil, false, false
+	}
+
+	allowed := map[string]struct{}{
+		"command":   {},
+		"args":      {},
+		"env":       {},
+		"url":       {},
+		"headers":   {},
+		"type":      {},
+		"transport": {},
+	}
+	for field := range fields {
+		if _, ok := allowed[field]; !ok {
+			return nil, false, false
+		}
+	}
+
+	rawCommand, hasCommand := fields["command"]
+	rawURL, hasURL := fields["url"]
+	if hasCommand == hasURL {
+		return nil, false, false
+	}
+
+	out := make(map[string]any, len(fields))
+	redacted := false
+	if hasCommand {
+		if _, ok := decodeNonEmptyMcpString(rawCommand); !ok {
+			return nil, false, false
+		}
+		out["command"] = envSentinel
+		redacted = true
+		if _, invalid := fields["headers"]; invalid {
+			return nil, false, false
+		}
+		if _, invalid := fields["transport"]; invalid {
+			return nil, false, false
+		}
+
+		if rawArgs, exists := fields["args"]; exists {
+			var args []string
+			if err := json.Unmarshal(rawArgs, &args); err != nil || args == nil {
+				return nil, false, false
+			}
+			maskedArgs := make([]string, len(args))
+			for i := range maskedArgs {
+				maskedArgs[i] = envSentinel
+			}
+			out["args"] = maskedArgs
+			redacted = redacted || len(maskedArgs) > 0
+		}
+		if rawEnv, exists := fields["env"]; exists {
+			maskedEnv, hasValues, ok := maskMcpStringMap(rawEnv, "env")
+			if !ok {
+				return nil, false, false
+			}
+			out["env"] = maskedEnv
+			redacted = redacted || hasValues
+		}
+	} else {
+		if _, ok := decodeNonEmptyMcpString(rawURL); !ok {
+			return nil, false, false
+		}
+		out["url"] = envSentinel
+		redacted = true
+		if _, invalid := fields["args"]; invalid {
+			return nil, false, false
+		}
+		if _, invalid := fields["env"]; invalid {
+			return nil, false, false
+		}
+		if _, hasType := fields["type"]; hasType {
+			if _, hasTransport := fields["transport"]; hasTransport {
+				return nil, false, false
+			}
+		}
+		if rawHeaders, exists := fields["headers"]; exists {
+			maskedHeaders, hasValues, ok := maskMcpStringMap(rawHeaders, "header")
+			if !ok {
+				return nil, false, false
+			}
+			out["headers"] = maskedHeaders
+			redacted = redacted || hasValues
+		}
+	}
+
+	for _, field := range []string{"type", "transport"} {
+		if rawValue, exists := fields[field]; exists {
+			value, ok := decodeMcpString(rawValue)
+			if !ok || !isSupportedMcpTransport(value) {
+				return nil, false, false
+			}
+			out[field] = value
+		}
+	}
+
+	return out, redacted, true
+}
+
+func isSupportedMcpTransport(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "stdio", "sse", "http", "streamable-http", "http_streamable":
+		return true
+	default:
+		return false
+	}
+}
+
+// mcpJSONContainsRedactionSentinel reserves the response placeholder at the
+// write boundary so a generic client cannot replace raw runtime credentials
+// with a masked response.
+func mcpJSONContainsRedactionSentinel(raw json.RawMessage) bool {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false
+	}
+	return jsonValueContainsRedactionSentinel(value)
+}
+
+func jsonValueContainsRedactionSentinel(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed == envSentinel
+	case []any:
+		for _, child := range typed {
+			if jsonValueContainsRedactionSentinel(child) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, child := range typed {
+			if jsonValueContainsRedactionSentinel(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func decodeNonEmptyMcpString(raw json.RawMessage) (string, bool) {
+	value, ok := decodeMcpString(raw)
+	return value, ok && strings.TrimSpace(value) != ""
+}
+
+func decodeMcpString(raw json.RawMessage) (string, bool) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func maskMcpStringMap(raw json.RawMessage, aliasPrefix string) (map[string]string, bool, bool) {
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil || values == nil {
+		return nil, false, false
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	masked := make(map[string]string, len(values))
+	for i, key := range keys {
+		if key == "" {
+			return nil, false, false
+		}
+		if _, ok := decodeMcpString(values[key]); !ok {
+			return nil, false, false
+		}
+		masked[fmt.Sprintf("%s_%d", aliasPrefix, i+1)] = envSentinel
+	}
+	return masked, len(masked) > 0, true
+}
+
+// validateUniqueJSONKeys rejects duplicate object keys at every depth. The
+// standard json package otherwise keeps the last value, making a security
+// decision depend on parser-specific overwrite semantics.
+func validateUniqueJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := scanUniqueJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func scanUniqueJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("JSON object key is not a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return errors.New("duplicate JSON object key")
+			}
+			seen[key] = struct{}{}
+			if err := scanUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return errors.New("invalid JSON object terminator")
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return errors.New("invalid JSON array terminator")
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	return nil
+}
+
+// runtimeConfigContainsPublicProjection returns true for the response-only
+// marker or any current `"****"` placeholder. When present on update, the
+// entire runtime_config field is treated as a blind public-response
+// round-trip and left unchanged. This is deliberately conservative: the
+// projection may have omitted unknown stored keys, so recursively merging it
+// could still delete provider data. The management UI uses explicit
+// replacement/clear mode and never submits a projection.
+func runtimeConfigContainsPublicProjection(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed == envSentinel
+	case []any:
+		for _, child := range typed {
+			if runtimeConfigContainsPublicProjection(child) {
+				return true
+			}
+		}
+	case map[string]any:
+		if marker, ok := typed[runtimeConfigRedactionMarker].(string); ok && marker == envSentinel {
+			return true
+		}
+		for _, child := range typed {
+			if runtimeConfigContainsPublicProjection(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func runtimeConfigContainsLegacyGatewayMask(value any) bool {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	gateway, ok := root["gateway"].(map[string]any)
+	if !ok {
+		return false
+	}
+	token, _ := gateway["token"].(string)
+	return token == runtimeConfigLegacyGatewayTokenMask
+}
+
+// preserveLegacyMaskedGatewayToken is the rolling-upgrade bridge for the
+// previous gateway-only `"***"` projection. It substitutes the persisted
+// token into that exact path; current `"****"` projections are handled
+// wholesale by runtimeConfigContainsPublicProjection above.
+func preserveLegacyMaskedGatewayToken(incoming any, persistedRuntimeConfig []byte) {
 	root, ok := incoming.(map[string]any)
 	if !ok {
 		return
@@ -223,7 +760,7 @@ func preserveMaskedGatewayToken(incoming any, persistedRuntimeConfig []byte) {
 		return
 	}
 	tok, _ := gw["token"].(string)
-	if tok != runtimeConfigGatewayTokenMask {
+	if tok != runtimeConfigLegacyGatewayTokenMask {
 		return
 	}
 	// The incoming token is the mask — fish the real one out of the row.
@@ -807,11 +1344,10 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// mcp_config still uses the workspace-level always-redact setting and
-	// the per-row owner/admin gate — secrets in MCP server configs follow
-	// the same exposure rules as custom_env used to. custom_env itself is
-	// never serialized on agent resources anymore (MUL-2600); see the
-	// AgentResponse comment.
+	// agentToResponse has already removed raw MCP values for every caller.
+	// The workspace-level setting and per-row gate below decide whether this
+	// caller may see even the sanitized structural summary. custom_env itself
+	// is never serialized on agent resources (MUL-2600).
 	ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(workspaceID))
 	if err != nil {
 		slog.Warn("GetWorkspace failed for redact check", "workspace_id", workspaceID, "error", err)
@@ -844,12 +1380,10 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		if skills, ok := skillMap[resp.ID]; ok {
 			resp.Skills = skills
 		}
-		// Agent actors NEVER see mcp_config secrets, even when their host's
-		// PAT would normally satisfy the owner/admin role gate. Otherwise an
-		// agent running under an owner's daemon could read other agents'
-		// MCP configs (which routinely embed third-party API tokens) — the
-		// same lateral-movement vector MUL-2600 closed for custom_env.
-		if actorType == "agent" || alwaysRedact || !canViewAgentSecrets(a, userID, member.Role) {
+		// Agent actors never receive even the masked MCP structure. The raw
+		// values were already removed centrally, before this role-specific
+		// suppression is applied.
+		if actorType == "agent" || alwaysRedact || !canViewAgentMcpStructure(a, userID, member.Role) {
 			redactMcpConfig(&resp)
 		}
 		// composio_toolkit_allowlist is owner-only — not because the slugs
@@ -901,8 +1435,8 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// mcp_config redaction (custom_env was removed from this response shape
-	// in MUL-2600; secrets are now fetched via GET /api/agents/{id}/env).
+	// Raw mcp_config values were already sanitized in agentToResponse. Apply
+	// the narrower visibility policy to the remaining masked structure.
 	userID := requestUserID(r)
 	ws, err := h.Queries.GetWorkspace(r.Context(), agent.WorkspaceID)
 	if err != nil {
@@ -915,7 +1449,7 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 	if actorType == "agent" || alwaysRedact {
 		redactMcpConfig(&resp)
 	} else if member, ok := ctxMember(r.Context()); ok {
-		if !canViewAgentSecrets(agent, userID, member.Role) {
+		if !canViewAgentMcpStructure(agent, userID, member.Role) {
 			redactMcpConfig(&resp)
 		}
 	}
@@ -991,7 +1525,43 @@ func decodeJSONBodyWithRawFields(body io.Reader, dst any) (map[string]json.RawMe
 	return raw, nil
 }
 
+func isMachineActorRequest(r *http.Request) bool {
+	switch r.Header.Get("X-Actor-Source") {
+	case "task_token", "cloud_pat":
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectMachineAgentCreation(w http.ResponseWriter, r *http.Request) bool {
+	if !isMachineActorRequest(r) {
+		return false
+	}
+	writeError(w, http.StatusForbidden, "machine actors may not create persistent agents")
+	return true
+}
+
+func rejectMachineAgentUpdate(w http.ResponseWriter, r *http.Request, rawFields map[string]json.RawMessage) bool {
+	if !isMachineActorRequest(r) {
+		return false
+	}
+	for field := range rawFields {
+		switch field {
+		case "name", "description", "avatar_url":
+			continue
+		default:
+			writeError(w, http.StatusForbidden, "machine actors may only update agent name, description, or avatar")
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineAgentCreation(w, r) {
+		return
+	}
 	workspaceID := h.resolveWorkspaceID(r)
 
 	var req CreateAgentRequest
@@ -1000,7 +1570,6 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	ownerID, ok := requireUserID(w, r)
 	if !ok {
 		return
@@ -1086,10 +1655,14 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		isFirstAgent = len(existing) == 0
 	}
 
-	// A create has no prior token to restore, so if the caller submitted the
-	// public mask sentinel as gateway.token (e.g. replayed a masked GET body)
-	// drop it rather than persisting a literal "***" as a real bearer token.
-	preserveMaskedGatewayToken(req.RuntimeConfig, nil)
+	// A create has no persisted config to preserve. Reject both current public
+	// projections and the legacy gateway-token mask rather than storing a
+	// response placeholder as executable runtime data.
+	if runtimeConfigContainsPublicProjection(req.RuntimeConfig) ||
+		runtimeConfigContainsLegacyGatewayMask(req.RuntimeConfig) {
+		writeError(w, http.StatusBadRequest, "runtime_config contains masked response placeholders; submit a complete replacement config or omit it")
+		return
+	}
 	rc, _ := json.Marshal(req.RuntimeConfig)
 	if req.RuntimeConfig == nil {
 		rc = []byte("{}")
@@ -1107,6 +1680,10 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 
 	var mc []byte
 	if rawMcpConfig, ok := rawFields["mcp_config"]; ok && !bytes.Equal(bytes.TrimSpace(rawMcpConfig), []byte("null")) {
+		if mcpJSONContainsRedactionSentinel(rawMcpConfig) {
+			writeError(w, http.StatusBadRequest, "mcp_config contains masked placeholders; submit a complete replacement config or null to clear it")
+			return
+		}
 		mc = append([]byte(nil), rawMcpConfig...)
 	}
 
@@ -1224,10 +1801,7 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		isFirstAgent,
 	))
 
-	redactAgentResponseForActor(&resp, actorType)
-	if !h.composioMCPAppsEnabled(r.Context()) {
-		suppressComposioToolkitAllowlist(&resp)
-	}
+	h.projectAgentMutationResponse(r.Context(), &resp, actorType, ownerID, uuidToString(created.OwnerID))
 	writeJSON(w, http.StatusCreated, resp)
 }
 
@@ -1287,6 +1861,10 @@ type UpdateAgentRequest struct {
 	AvatarURL     *string `json:"avatar_url"`
 	RuntimeID     *string `json:"runtime_id"`
 	RuntimeConfig any     `json:"runtime_config"`
+	// RuntimeConfigIntent makes the hidden free-form config a closed mutation
+	// contract: replace requires a complete non-empty object; clear requires
+	// an empty object. Omission preserves the stored value.
+	RuntimeConfigIntent string `json:"runtime_config_intent"`
 	// custom_env is intentionally NOT updatable through this endpoint.
 	// Use `PUT /api/agents/{id}/env` for env changes — that path is
 	// owner/admin-only, denies agent actors, and writes a persisted
@@ -1296,9 +1874,11 @@ type UpdateAgentRequest struct {
 	// actually unchanged, and so a client that round-tripped a
 	// previously-returned masked map cannot silently overwrite real
 	// secret values with literal `****`. See MUL-2600.
-	CustomArgs *[]string        `json:"custom_args"`
-	McpConfig  *json.RawMessage `json:"mcp_config"`
-	Visibility *string          `json:"visibility"`
+	CustomArgs       *[]string        `json:"custom_args"`
+	CustomArgsIntent string           `json:"custom_args_intent"`
+	McpConfig        *json.RawMessage `json:"mcp_config"`
+	McpConfigIntent  string           `json:"mcp_config_intent"`
+	Visibility       *string          `json:"visibility"`
 	// PermissionMode + InvocationTargets are the invocation-permission inputs
 	// (MUL-3963). Owner-only writes (like composio_toolkit_allowlist): a
 	// non-owner admin passing them is silently ignored, because the invoke
@@ -1320,28 +1900,23 @@ type UpdateAgentRequest struct {
 	// ServiceTier follows the same tri-state contract as ThinkingLevel:
 	// omitted preserves, empty clears, and non-empty sets a Codex catalog ID.
 	ServiceTier *string `json:"service_tier"`
-	// ComposioToolkitAllowlist is a tri-state, same pattern as
-	// thinking_level, mcp_config:
-	//   - field omitted → no change (column preserved as-is)
-	//   - field present with null → explicit clear (ClearAgent... query)
-	//   - field present with [] → store empty TEXT[] (configured, no toolkits)
-	//   - field present with non-empty → store deduped lowercase slugs
-	// The decode-time raw fields map disambiguates "omitted" from "explicit
-	// null" (a *[]string can't, because a nil pointer is the same wire
-	// representation as both). MUL-3869.
-	ComposioToolkitAllowlist *[]string `json:"composio_toolkit_allowlist"`
+	// ComposioToolkitAllowlist is hidden on generic Agent responses. Every
+	// update therefore requires a closed replace/clear intent so a legacy
+	// client replaying an empty/default list cannot erase authoritative
+	// slugs. The dedicated human-only endpoint is the preferred editor.
+	ComposioToolkitAllowlist       *[]string `json:"composio_toolkit_allowlist"`
+	ComposioToolkitAllowlistIntent string    `json:"composio_toolkit_allowlist_intent"`
 }
 
-// workspaceAlwaysRedactSecrets reports whether the workspace has opted
-// into unconditional redaction of secret-bearing fields (currently
-// `mcp_config`) on read responses, regardless of the caller's role.
+// workspaceAlwaysRedactSecrets reports whether the workspace has opted into
+// suppressing even the sanitized `mcp_config` structure on read responses,
+// regardless of the caller's role.
 //
 // The legacy JSON key is still `always_redact_env` for backwards-
 // compatibility with workspaces that flipped the setting before MUL-2600
-// shipped. The setting no longer affects `custom_env` because that field
-// is never serialized on agent resources anymore — secrets there are
-// fetched exclusively through `GET /api/agents/{id}/env` with audit
-// logging — so the flag now only governs `mcp_config` exposure.
+// shipped. The setting no longer affects `custom_env` because that field is
+// never serialized on agent resources — secrets there are fetched exclusively
+// through `GET /api/agents/{id}/env` with audit logging.
 func workspaceAlwaysRedactSecrets(settings []byte) bool {
 	if len(settings) == 0 {
 		return false
@@ -1355,28 +1930,21 @@ func workspaceAlwaysRedactSecrets(settings []byte) bool {
 	return s.AlwaysRedactEnv
 }
 
-// canViewAgentSecrets checks whether the requesting user is allowed to
-// see the agent's secret-bearing fields (currently `mcp_config`). Only
-// the agent owner or workspace owner/admin qualify; for everyone else
-// the response is redacted. `custom_env` is no longer part of an agent
-// resource response (see MUL-2600), so this predicate is shared only by
-// the remaining mcp_config redaction path.
-func canViewAgentSecrets(agent db.Agent, userID string, memberRole string) bool {
+// canViewAgentMcpStructure checks whether a member may see the useful masked
+// MCP shape produced by agentToResponse. It never authorizes plaintext: raw
+// values have already been removed at the generic response boundary.
+func canViewAgentMcpStructure(agent db.Agent, userID string, memberRole string) bool {
 	if roleAllowed(memberRole, "owner", "admin") {
 		return true
 	}
 	return uuidToString(agent.OwnerID) == userID
 }
 
-// broadcastAgentResponse strips secret-bearing fields from an
-// AgentResponse before it goes onto the WebSocket bus. Mutation
-// handlers call this when fanning out create/update/archive/restore
-// events: subscribers (which include agent processes that have
-// authenticated with their own task tokens) must not learn another
-// agent's mcp_config via a WS push that bypassed the read-path
-// redaction in ListAgents / GetAgent. The caller still receives the
-// canonical form in the HTTP response; only the broadcast copy is
-// redacted.
+// broadcastAgentResponse suppresses even sanitized sensitive structure before
+// an AgentResponse goes onto the WebSocket bus. Mutation handlers call it when
+// fanning out create/update/archive/restore events because every workspace
+// subscriber sees the payload. The HTTP caller may receive the masked MCP
+// structure; the broadcast copy receives none.
 //
 // composio_toolkit_allowlist follows the same fan-out rule: every
 // workspace member subscribes to agent:created/updated/archived, so
@@ -1386,21 +1954,44 @@ func canViewAgentSecrets(agent db.Agent, userID string, memberRole string) bool 
 // broadcast copy.
 func broadcastAgentResponse(resp AgentResponse) AgentResponse {
 	out := resp
+	suppressCustomArgs(&out)
 	redactMcpConfig(&out)
 	redactComposioToolkitAllowlist(&out)
-	// Belt-and-suspenders: agentToResponse already masks gateway.token on
-	// every read, so by the time a response reaches this broadcast helper
-	// the field is already "***". Re-mask anyway so a future refactor that
-	// bypasses agentToResponse (e.g. constructing AgentResponse from raw
-	// db.Agent in a new handler) cannot silently leak the token to every
-	// WebSocket subscriber on the workspace, agent processes included.
-	maskGatewayToken(out.RuntimeConfig)
+	// Belt-and-suspenders: broadcasts are workspace-wide. Suppress the public
+	// runtime-config projection too, and fail closed even if a future caller
+	// constructs AgentResponse directly from raw data instead of using
+	// agentToResponse.
+	suppressRuntimeConfig(&out)
 	return out
 }
 
-// redactMcpConfig removes the mcp_config value from the response when the caller is not
-// authorised to view it. The field is set to null; McpConfigRedacted is set to true so
-// callers know a config exists without seeing its contents (which may contain secrets).
+func suppressCustomArgs(resp *AgentResponse) {
+	if count := len(resp.CustomArgs); count > 0 {
+		if count > resp.CustomArgsCount {
+			resp.CustomArgsCount = count
+		}
+		resp.CustomArgsRedacted = true
+	}
+	resp.CustomArgs = []string{}
+}
+
+func suppressRuntimeConfig(resp *AgentResponse) {
+	raw, err := json.Marshal(resp.RuntimeConfig)
+	hasValue := err == nil &&
+		len(bytes.TrimSpace(raw)) > 0 &&
+		!bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) &&
+		!bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+	if resp.HasRuntimeConfig || hasValue {
+		resp.RuntimeConfig = map[string]any{runtimeConfigRedactionMarker: envSentinel}
+		resp.HasRuntimeConfig = true
+		resp.RuntimeConfigRedacted = true
+		return
+	}
+	resp.RuntimeConfig = map[string]any{}
+}
+
+// redactMcpConfig removes even the already-sanitized structural summary when a
+// caller or broadcast surface is not authorized to see it.
 func redactMcpConfig(resp *AgentResponse) {
 	if resp.McpConfig != nil {
 		resp.McpConfig = nil
@@ -1412,20 +2003,21 @@ func redactMcpConfig(resp *AgentResponse) {
 // value from the response when the caller is not the agent owner. The slug
 // list itself is not secret, but the "what {agent owner} has opted into"
 // view leaks the owner's integration footprint across the workspace, which
-// is the same privacy concern that gates mcp_config visibility behind
-// owner-only canViewAgentSecrets. We surface a coarse `_redacted` flag so
+// is the same privacy concern that gates the masked mcp_config structure. We surface a coarse `_redacted` flag so
 // the front-end can render "Configured" without the contents (parity with
 // mcp_config_redacted). The clearing matters: the JSON `omitempty` only
 // drops nil slices, so reset to nil rather than `[]string{}`.
 func redactComposioToolkitAllowlist(resp *AgentResponse) {
-	if resp.ComposioToolkitAllowlist != nil {
-		resp.ComposioToolkitAllowlist = nil
-		resp.ComposioToolkitAllowlistRedacted = true
+	if count := len(resp.ComposioToolkitAllowlist); count > resp.ComposioToolkitAllowlistCount {
+		resp.ComposioToolkitAllowlistCount = count
 	}
+	resp.ComposioToolkitAllowlist = nil
+	resp.ComposioToolkitAllowlistRedacted = resp.ComposioToolkitAllowlistCount > 0
 }
 
 func suppressComposioToolkitAllowlist(resp *AgentResponse) {
 	resp.ComposioToolkitAllowlist = nil
+	resp.ComposioToolkitAllowlistCount = 0
 	resp.ComposioToolkitAllowlistRedacted = false
 }
 
@@ -1486,6 +2078,19 @@ func redactAgentResponseForActor(resp *AgentResponse, actorType string) {
 	}
 }
 
+// projectAgentMutationResponse applies the viewer-specific HTTP projection
+// shared by create/update/archive/restore/template mutation responses. The
+// workspace-wide broadcast projection is intentionally stricter and remains
+// broadcastAgentResponse.
+func (h *Handler) projectAgentMutationResponse(ctx context.Context, resp *AgentResponse, actorType, viewerID, ownerID string) {
+	redactAgentResponseForActor(resp, actorType)
+	if !h.composioMCPAppsEnabled(ctx) {
+		suppressComposioToolkitAllowlist(resp)
+	} else if actorType == "agent" || ownerID != viewerID {
+		redactComposioToolkitAllowlist(resp)
+	}
+}
+
 // canManageAgent checks whether the current user can update or archive an agent.
 // Only the agent owner or workspace owner/admin can manage any agent,
 // regardless of whether it is public or private.
@@ -1505,19 +2110,22 @@ func (h *Handler) canManageAgent(w http.ResponseWriter, r *http.Request, agent d
 }
 
 func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
+	var req UpdateAgentRequest
+	rawFields, err := decodeJSONBodyWithRawFields(r.Body, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if rejectMachineAgentUpdate(w, r, rawFields) {
+		return
+	}
+
 	id := chi.URLParam(r, "id")
 	existing, ok := h.loadAgentForUser(w, r, id)
 	if !ok {
 		return
 	}
 	if !h.canManageAgent(w, r, existing) {
-		return
-	}
-
-	var req UpdateAgentRequest
-	rawFields, err := decodeJSONBodyWithRawFields(r.Body, &req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -1530,6 +2138,26 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// agent actors, and writes a queryable audit row.
 	if _, ok := rawFields["custom_env"]; ok {
 		writeError(w, http.StatusBadRequest, "custom_env is no longer accepted on this endpoint; use PUT /api/agents/{id}/env (or `multica agent env set`)")
+		return
+	}
+	customArgsIntent, hasCustomArgsIntent, err := decodeHiddenMutationIntent(rawFields, "custom_args_intent")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	runtimeConfigIntent, hasRuntimeConfigIntent, err := decodeHiddenMutationIntent(rawFields, "runtime_config_intent")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mcpConfigIntent, hasMcpConfigIntent, err := decodeHiddenMutationIntent(rawFields, "mcp_config_intent")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	composioAllowlistIntent, hasComposioAllowlistIntent, err := decodeHiddenMutationIntent(rawFields, "composio_toolkit_allowlist_intent")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1552,23 +2180,153 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.AvatarURL != nil {
 		params.AvatarUrl = pgtype.Text{String: *req.AvatarURL, Valid: true}
 	}
-	if req.RuntimeConfig != nil {
-		// Restore the persisted gateway token when the request submitted the
-		// public mask sentinel. Without this, a UI that GETs the agent and
-		// PATCHes the same payload back round-trips "***" into the database
-		// and silently destroys the real secret (issue #3260).
-		preserveMaskedGatewayToken(req.RuntimeConfig, existing.RuntimeConfig)
-		rc, _ := json.Marshal(req.RuntimeConfig)
-		params.RuntimeConfig = rc
+	rawRuntimeConfig, hasRuntimeConfig := rawFields["runtime_config"]
+	if hasRuntimeConfigIntent && !hasRuntimeConfig {
+		writeError(w, http.StatusBadRequest, "runtime_config_intent requires runtime_config")
+		return
+	}
+	runtimeConfigIsNull := hasRuntimeConfig &&
+		bytes.Equal(bytes.TrimSpace(rawRuntimeConfig), []byte("null"))
+	runtimeConfigObject, runtimeConfigIsObject := req.RuntimeConfig.(map[string]any)
+	runtimeConfigIsEmpty := runtimeConfigIsObject && len(runtimeConfigObject) == 0
+	if hasRuntimeConfig {
+		switch runtimeConfigIntent {
+		case hiddenMutationIntentReplace:
+			if runtimeConfigIsNull || !runtimeConfigIsObject || runtimeConfigIsEmpty {
+				writeError(w, http.StatusBadRequest, "runtime_config replace intent requires a complete non-empty configuration object")
+				return
+			}
+			if runtimeConfigContainsPublicProjection(req.RuntimeConfig) ||
+				runtimeConfigContainsLegacyGatewayMask(req.RuntimeConfig) {
+				writeError(w, http.StatusBadRequest, "runtime_config contains masked response placeholders; submit a complete replacement config")
+				return
+			}
+			params.RuntimeConfig = append([]byte(nil), rawRuntimeConfig...)
+		case hiddenMutationIntentClear:
+			if !runtimeConfigIsEmpty {
+				writeError(w, http.StatusBadRequest, "runtime_config clear intent requires runtime_config={}")
+				return
+			}
+			params.RuntimeConfig = []byte("{}")
+		default:
+			if storedRuntimeConfigHasValues(existing.RuntimeConfig) {
+				responseReplay := false
+				if rawRedacted, ok := rawFields["runtime_config_redacted"]; ok {
+					_ = json.Unmarshal(rawRedacted, &responseReplay)
+				}
+				if responseReplay ||
+					runtimeConfigIsNull ||
+					runtimeConfigIsEmpty ||
+					runtimeConfigContainsPublicProjection(req.RuntimeConfig) ||
+					runtimeConfigContainsLegacyGatewayMask(req.RuntimeConfig) {
+					// A public projection, empty placeholder, or legacy null
+					// carries no authority to replace hidden provider data.
+					break
+				}
+				writeError(w, http.StatusConflict, "runtime_config is hidden; retry with runtime_config_intent=\"replace\" or \"clear\"")
+				return
+			}
+			// Rolling compatibility for an agent with no hidden config yet.
+			// Once data exists, every replacement/clear must be explicit.
+			if !runtimeConfigIsNull && !runtimeConfigIsEmpty {
+				if !runtimeConfigIsObject ||
+					runtimeConfigContainsPublicProjection(req.RuntimeConfig) ||
+					runtimeConfigContainsLegacyGatewayMask(req.RuntimeConfig) {
+					writeError(w, http.StatusBadRequest, "runtime_config must be a complete configuration object without masked placeholders")
+					return
+				}
+				params.RuntimeConfig = append([]byte(nil), rawRuntimeConfig...)
+			}
+		}
+	}
+	hasStoredCustomArgs := storedJSONArrayHasValues(existing.CustomArgs)
+	if hasCustomArgsIntent && req.CustomArgs == nil {
+		writeError(w, http.StatusBadRequest, "custom_args_intent requires custom_args")
+		return
 	}
 	if req.CustomArgs != nil {
-		ca, _ := json.Marshal(*req.CustomArgs)
-		params.CustomArgs = ca
+		switch customArgsIntent {
+		case hiddenMutationIntentReplace:
+			if len(*req.CustomArgs) == 0 {
+				writeError(w, http.StatusBadRequest, "custom_args replace intent requires a non-empty replacement; use clear intent to remove hidden arguments")
+				return
+			}
+			ca, _ := json.Marshal(*req.CustomArgs)
+			params.CustomArgs = ca
+		case hiddenMutationIntentClear:
+			if len(*req.CustomArgs) != 0 {
+				writeError(w, http.StatusBadRequest, "custom_args clear intent requires an empty custom_args list")
+				return
+			}
+			params.CustomArgs = []byte("[]")
+		default:
+			// Rolling compatibility: an empty public placeholder must never
+			// delete hidden stored args. A legacy non-empty replacement is
+			// accepted only when there is no hidden authoritative list yet;
+			// otherwise reject it and require explicit fresh intent.
+			if hasStoredCustomArgs {
+				if len(*req.CustomArgs) > 0 {
+					writeError(w, http.StatusConflict, "custom_args are hidden; retry with custom_args_intent=\"replace\" or \"clear\"")
+					return
+				}
+			} else {
+				ca, _ := json.Marshal(*req.CustomArgs)
+				params.CustomArgs = ca
+			}
+		}
 	}
 	rawMcpConfig, hasMcpConfig := rawFields["mcp_config"]
-	shouldClearMcpConfig := hasMcpConfig && bytes.Equal(bytes.TrimSpace(rawMcpConfig), []byte("null"))
-	if hasMcpConfig && !shouldClearMcpConfig {
-		params.McpConfig = append([]byte(nil), rawMcpConfig...)
+	if hasMcpConfigIntent && !hasMcpConfig {
+		writeError(w, http.StatusBadRequest, "mcp_config_intent requires mcp_config")
+		return
+	}
+	mcpConfigIsNull := hasMcpConfig && bytes.Equal(bytes.TrimSpace(rawMcpConfig), []byte("null"))
+	shouldClearMcpConfig := false
+	if hasMcpConfig {
+		switch mcpConfigIntent {
+		case hiddenMutationIntentReplace:
+			if mcpConfigIsNull {
+				writeError(w, http.StatusBadRequest, "mcp_config replace intent requires a complete configuration object")
+				return
+			}
+			if mcpJSONContainsRedactionSentinel(rawMcpConfig) {
+				writeError(w, http.StatusBadRequest, "mcp_config contains masked placeholders; submit a complete replacement config")
+				return
+			}
+			params.McpConfig = append([]byte(nil), rawMcpConfig...)
+		case hiddenMutationIntentClear:
+			if !mcpConfigIsNull {
+				writeError(w, http.StatusBadRequest, "mcp_config clear intent requires mcp_config=null")
+				return
+			}
+			shouldClearMcpConfig = true
+		default:
+			if storedMcpConfigHasValues(existing.McpConfig) {
+				responseReplay := false
+				if rawRedacted, ok := rawFields["mcp_config_redacted"]; ok {
+					_ = json.Unmarshal(rawRedacted, &responseReplay)
+				}
+				if responseReplay || mcpConfigIsNull {
+					// Preserve a full public response replay and ambiguous
+					// legacy null. Neither carries enough authority to erase
+					// a hidden configuration.
+					break
+				}
+				writeError(w, http.StatusConflict, "mcp_config is hidden; retry with mcp_config_intent=\"replace\" or \"clear\"")
+				return
+			}
+			// With no stored hidden value, retain legacy create-via-update
+			// compatibility while still reserving public placeholders.
+			if mcpConfigIsNull {
+				shouldClearMcpConfig = true
+			} else {
+				if mcpJSONContainsRedactionSentinel(rawMcpConfig) {
+					writeError(w, http.StatusBadRequest, "mcp_config contains masked placeholders; submit a complete replacement config")
+					return
+				}
+				params.McpConfig = append([]byte(nil), rawMcpConfig...)
+			}
+		}
 	}
 
 	// Resolve the runtime that will be in force after this update so the
@@ -1767,40 +2525,53 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// composio_toolkit_allowlist handling (MUL-3869). Tri-state semantics
-	// mirror thinking_level (see above): omitted → no change, null →
-	// ClearAgentComposioToolkitAllowlist, slice → wholesale replace.
-	//
-	// Owner-only WRITE. The caller is already past canManageAgent, which lets
-	// workspace owner/admins through alongside the agent owner — but the
-	// Composio overlay uses the agent OWNER's connection (MUL-3963), so an
-	// admin editing someone else's allowlist would silently reshape what the
-	// OWNER exposes through their own connected apps, confusing the owner
-	// about what their agent surfaces. Keep it owner-only.
-	// Drop the field with a debug log instead of erroring so an over-eager
-	// UI that sends the whole agent payload back on every save (PATCH-as-PUT)
-	// keeps working — same "silent ignore" stance the issue calls out, and
-	// the same one mcp_config takes for the broader admin pattern.
+	// composio_toolkit_allowlist is authoritative but hidden on every generic
+	// Agent response. A raw field without explicit replace/clear intent is
+	// therefore never allowed to mutate it: old/full response replay must
+	// fail closed instead of turning a public empty/default list into a clear.
+	// The dedicated human-only endpoint is the normal owner/admin editing path;
+	// this compatibility path remains owner-only because generic UpdateAgent
+	// historically tied Composio writes to the agent owner.
 	shouldClearComposioAllowlist := false
-	if _, hasAllowlist := rawFields["composio_toolkit_allowlist"]; hasAllowlist {
-		isAgentOwner := uuidToString(existing.OwnerID) == requestUserID(r)
+	rawComposioAllowlist, hasComposioAllowlist := rawFields["composio_toolkit_allowlist"]
+	if hasComposioAllowlistIntent && !hasComposioAllowlist {
+		writeError(w, http.StatusBadRequest, "composio_toolkit_allowlist_intent requires composio_toolkit_allowlist")
+		return
+	}
+	if hasComposioAllowlist {
+		if !hasComposioAllowlistIntent {
+			writeError(w, http.StatusConflict, "composio_toolkit_allowlist is hidden; retry with composio_toolkit_allowlist_intent=\"replace\" or \"clear\"")
+			return
+		}
 		if !h.composioMCPAppsEnabled(r.Context()) {
-			slog.Debug("update agent: composio_toolkit_allowlist write dropped because feature flag is disabled",
-				append(logger.RequestAttrs(r), "agent_id", id)...)
-		} else if !isAgentOwner {
-			slog.Debug("update agent: composio_toolkit_allowlist write by non-owner silently dropped",
-				append(logger.RequestAttrs(r), "agent_id", id)...)
-		} else if req.ComposioToolkitAllowlist == nil {
-			// JSON null → explicit clear via the dedicated query.
+			writeError(w, http.StatusNotFound, "Composio MCP apps are not enabled")
+			return
+		}
+		isAgentOwner := uuidToString(existing.OwnerID) == requestUserID(r)
+		if !isAgentOwner {
+			writeError(w, http.StatusForbidden, "only the agent owner can change composio_toolkit_allowlist through the generic agent endpoint")
+			return
+		}
+		composioAllowlistIsNull := bytes.Equal(bytes.TrimSpace(rawComposioAllowlist), []byte("null"))
+		switch composioAllowlistIntent {
+		case hiddenMutationIntentReplace:
+			if composioAllowlistIsNull || req.ComposioToolkitAllowlist == nil {
+				writeError(w, http.StatusBadRequest, "composio_toolkit_allowlist replace intent requires a non-empty toolkit list")
+				return
+			}
+			normalized := normaliseComposioToolkitAllowlist(*req.ComposioToolkitAllowlist)
+			if len(normalized) == 0 {
+				writeError(w, http.StatusBadRequest, "composio_toolkit_allowlist replace intent requires a non-empty toolkit list; use clear intent to remove all toolkits")
+				return
+			}
+			params.ComposioToolkitAllowlist = normalized
+		case hiddenMutationIntentClear:
+			if !composioAllowlistIsNull &&
+				(req.ComposioToolkitAllowlist == nil || len(*req.ComposioToolkitAllowlist) != 0) {
+				writeError(w, http.StatusBadRequest, "composio_toolkit_allowlist clear intent requires null or an empty toolkit list")
+				return
+			}
 			shouldClearComposioAllowlist = true
-		} else {
-			// Normalise (trim/lowercase/dedupe). Empty slice is preserved as
-			// an empty TEXT[] so the persisted value distinguishes "owner
-			// cleared every toolkit" from "owner has never opened the
-			// integration" (the dispatch path treats both as "no overlay"
-			// either way, but the column tells UX whether to show a primed
-			// vs empty picker).
-			params.ComposioToolkitAllowlist = normaliseComposioToolkitAllowlist(*req.ComposioToolkitAllowlist)
 		}
 	}
 
@@ -1893,16 +2664,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	userID := requestUserID(r)
 	actorType, actorID := h.resolveActor(r, userID, uuidToString(updated.WorkspaceID))
 	h.publish(protocol.EventAgentStatus, uuidToString(updated.WorkspaceID), actorType, actorID, map[string]any{"agent": broadcastAgentResponse(resp)})
-	redactAgentResponseForActor(&resp, actorType)
-	// Workspace admins / non-owner members pass canManageAgent for legitimate
-	// admin actions (e.g. bulk reassigning agents off a leaving member's
-	// runtime), but they must not learn the agent owner's composio allowlist
-	// from the mutation response. See ListAgents/GetAgent for the same gate.
-	if !h.composioMCPAppsEnabled(r.Context()) {
-		suppressComposioToolkitAllowlist(&resp)
-	} else if uuidToString(updated.OwnerID) != userID {
-		redactComposioToolkitAllowlist(&resp)
-	}
+	h.projectAgentMutationResponse(r.Context(), &resp, actorType, userID, uuidToString(updated.OwnerID))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1991,7 +2753,7 @@ func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	actorType, actorID := h.resolveActor(r, userID, wsID)
 	h.publish(protocol.EventAgentArchived, wsID, actorType, actorID, map[string]any{"agent": broadcastAgentResponse(resp)})
-	redactAgentResponseForActor(&resp, actorType)
+	h.projectAgentMutationResponse(r.Context(), &resp, actorType, userID, uuidToString(archived.OwnerID))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -2027,7 +2789,7 @@ func (h *Handler) RestoreAgent(w http.ResponseWriter, r *http.Request) {
 	userID := requestUserID(r)
 	actorType, actorID := h.resolveActor(r, userID, wsID)
 	h.publish(protocol.EventAgentRestored, wsID, actorType, actorID, map[string]any{"agent": broadcastAgentResponse(resp)})
-	redactAgentResponseForActor(&resp, actorType)
+	h.projectAgentMutationResponse(r.Context(), &resp, actorType, userID, uuidToString(restored.OwnerID))
 	writeJSON(w, http.StatusOK, resp)
 }
 

@@ -88,11 +88,8 @@ var (
 // only the fields the auth path actually needs:
 //
 //   - OwnerID is the user whose request this is (mapped to X-User-ID).
-//   - InstanceID / InstanceRecordID are recorded so downstream code can
-//     correlate the request with a specific cloud node; they are not
-//     used for authorization today, but stashing them now keeps the
-//     wire shape stable for callers that later want to assert a
-//     particular instance binding.
+//   - InstanceID / InstanceRecordID bind daemon raw-secret routes to the
+//     specific cloud runtime row stamped at registration.
 //
 // We deliberately drop token_last4, status, issued_at, etc. — those
 // are diagnostic fields that don't belong in cached auth state.
@@ -102,11 +99,9 @@ type CloudPATIdentity struct {
 	InstanceRecordID string `json:"r"`
 }
 
-// CloudPATInvalidError carries the Fleet-reported reason for a
-// valid=false response. The middleware uses this to log why an mcn_
-// token was rejected without exposing the reason in the 401 body —
-// per the Cloud doc, callers shouldn't differentiate token_not_found
-// vs token_revoked for security decisions.
+// CloudPATInvalidError carries only verifier-owned reason codes. Fleet's
+// free-form reason is deliberately discarded: upstream text must never cross
+// the trust boundary into our errors or logs.
 //
 // The "owner_unknown" reason is also produced locally by Verify when
 // Cloud accepted the token but the returned owner_id does not map to
@@ -350,13 +345,9 @@ func (v *CloudPATVerifier) fetch(ctx context.Context, token string) (CloudPATIde
 		// Per the Cloud doc, 400 means our request was malformed and
 		// 500 means Fleet itself is broken. Either way the right move
 		// upstream is "treat the token as un-verifiable right now,
-		// return 503". Read a small chunk of the body for log
-		// context only.
-		var snippet string
-		if buf, _ := io.ReadAll(io.LimitReader(resp.Body, 512)); len(buf) > 0 {
-			snippet = strings.TrimSpace(string(buf))
-		}
-		slog.Warn("cloud_pat: verify returned non-200", "status", resp.StatusCode, "body", snippet)
+		// return 503". Never log the response body: Fleet and intermediary
+		// error pages are outside our log-safety contract.
+		slog.Warn("cloud_pat: verify returned non-200", "status", resp.StatusCode)
 		return CloudPATIdentity{}, ErrCloudPATUnavailable
 	}
 
@@ -377,17 +368,17 @@ func (v *CloudPATVerifier) fetch(ctx context.Context, token string) (CloudPATIde
 	}
 
 	if !parsed.Valid {
-		// Surface the reason in the error so the middleware can log
-		// "why" while still returning a generic 401 to the client.
-		return CloudPATIdentity{}, &CloudPATInvalidError{Reason: parsed.Reason}
+		return CloudPATIdentity{}, &CloudPATInvalidError{}
 	}
 
-	if parsed.OwnerID == "" {
-		// Defense against a Fleet response that claims valid:true
-		// but omits owner_id — without owner_id we have nothing to
-		// put in X-User-ID, so it's effectively unusable. Fail
-		// closed rather than passing an empty user id downstream.
-		slog.Warn("cloud_pat: verify returned valid=true with empty owner_id")
+	parsed.OwnerID = strings.TrimSpace(parsed.OwnerID)
+	parsed.InstanceID = strings.TrimSpace(parsed.InstanceID)
+	parsed.InstanceRecordID = strings.TrimSpace(parsed.InstanceRecordID)
+	if parsed.OwnerID == "" || parsed.InstanceID == "" || parsed.InstanceRecordID == "" {
+		// All three values form the verified machine binding. Accepting a
+		// partial identity would let a cloud credential create an unstamped
+		// runtime row that a different node could later adopt.
+		slog.Warn("cloud_pat: verify returned valid=true with incomplete identity")
 		return CloudPATIdentity{}, ErrCloudPATUnavailable
 	}
 
@@ -416,7 +407,9 @@ func (v *CloudPATVerifier) cacheGet(ctx context.Context, hash string) (CloudPATI
 		slog.Warn("cloud_pat: cache entry malformed; falling back to fleet", "error", err)
 		return CloudPATIdentity{}, false
 	}
-	if id.OwnerID == "" {
+	if strings.TrimSpace(id.OwnerID) == "" ||
+		strings.TrimSpace(id.InstanceID) == "" ||
+		strings.TrimSpace(id.InstanceRecordID) == "" {
 		// Safety net: a malformed cache entry (e.g. left over from a
 		// prior schema) without an owner_id must not be treated as a
 		// hit, otherwise the middleware would set X-User-ID to "".

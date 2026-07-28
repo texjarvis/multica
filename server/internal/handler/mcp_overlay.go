@@ -153,7 +153,10 @@ func unmarshalServerMap(raw json.RawMessage) (map[string]json.RawMessage, error)
 		}
 		trimmed := bytes.TrimSpace(server)
 		if len(trimmed) == 0 || trimmed[0] != '{' {
-			return nil, fmt.Errorf("mcpServers.%s must be a JSON object", name)
+			// Server names are caller-controlled configuration and may contain
+			// credentials or other sensitive material. Keep validation errors
+			// category-only because callers can legitimately log this error.
+			return nil, errors.New("mcp server entry must be a JSON object")
 		}
 	}
 	return m, nil

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -188,9 +189,12 @@ func TestMergeMCPOverlayBadAgentReturnsBytesAndError(t *testing.T) {
 // parseCursorManagedMcpServers.
 func TestMergeMCPOverlayRejectsNonObjectServer(t *testing.T) {
 	agent := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
-	overlay := json.RawMessage(`{"mcpServers":{"composio":"not-an-object"}}`)
+	const sentinel = "mcp-server-name-secret-sentinel"
+	overlay := json.RawMessage(`{"mcpServers":{"` + sentinel + `":"not-an-object"}}`)
 
 	if _, err := mergeMCPOverlay(agent, overlay); err == nil {
 		t.Fatalf("expected error for non-object server, got nil")
+	} else if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("validation error exposed caller-controlled server name: %v", err)
 	}
 }

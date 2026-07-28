@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Agent, RuntimeDevice } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
+import { toast } from "sonner";
 import enCommon from "../../../locales/en/common.json";
 import enAgents from "../../../locales/en/agents.json";
 
@@ -48,21 +49,49 @@ const runtimeDevice = {
   launch_header: "codex app-server",
 } as RuntimeDevice;
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function renderTab(
   overrides: Partial<Agent> = {},
   onSave = vi.fn().mockResolvedValue(undefined),
+  canManage = false,
 ) {
+  const initialAgent = { ...baseAgent, ...overrides };
   const result = render(
     <I18nProvider locale="en" resources={TEST_RESOURCES}>
       <CustomArgsTab
-        agent={{ ...baseAgent, ...overrides }}
+        agent={initialAgent}
         runtimeDevice={runtimeDevice}
         onSave={onSave}
+        canManage={canManage}
       />
     </I18nProvider>,
   );
 
-  return { ...result, onSave };
+  return {
+    ...result,
+    rerenderAgent(nextAgent: Agent) {
+      result.rerender(
+        <I18nProvider locale="en" resources={TEST_RESOURCES}>
+          <CustomArgsTab
+            agent={nextAgent}
+            runtimeDevice={runtimeDevice}
+            onSave={onSave}
+            canManage={canManage}
+          />
+        </I18nProvider>,
+      );
+    },
+    onSave,
+  };
 }
 
 describe("CustomArgsTab", () => {
@@ -119,6 +148,144 @@ describe("CustomArgsTab", () => {
     await user.click(screen.getByRole("button", { name: /^add$/i }));
     await user.click(screen.getByRole("button", { name: /^save$/i }));
 
-    expect(onSave).toHaveBeenCalledWith({ custom_args: ["value with spaces"] });
+    expect(onSave).toHaveBeenCalledWith({
+      custom_args: ["value with spaces"],
+      custom_args_intent: "replace",
+    });
+  });
+
+  it("sends clear intent when the last visible legacy argument is removed", async () => {
+    const user = userEvent.setup();
+    const { onSave } = renderTab({ custom_args: ["--legacy-token"] });
+
+    await user.click(screen.getByRole("button", { name: /remove argument 1/i }));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      custom_args: [],
+      custom_args_intent: "clear",
+    });
+  });
+
+  it("replaces redacted arguments from an empty authoritative list", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    renderTab(
+      {
+        custom_args: [],
+        custom_args_redacted: true,
+      },
+      onSave,
+      true,
+    );
+
+    expect(screen.getByText(/arguments configured/i)).toBeInTheDocument();
+    expect(screen.queryByText(/mcp_servers/i)).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: /replace arguments/i }),
+    );
+    await user.click(screen.getByRole("button", { name: /add argument/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /new argument/i }),
+      "--profile",
+    );
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      custom_args: ["--profile"],
+      custom_args_intent: "replace",
+    });
+  });
+
+  it("clears redacted arguments only after explicit confirmation", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    renderTab(
+      { custom_args: [], custom_args_redacted: true },
+      onSave,
+      true,
+    );
+
+    await user.click(screen.getByRole("button", { name: /clear arguments/i }));
+    expect(
+      screen.getByText(/removes the complete stored argument list/i),
+    ).toBeInTheDocument();
+    const clearButtons = screen.getAllByRole("button", {
+      name: /clear arguments/i,
+    });
+    await user.click(clearButtons[clearButtons.length - 1]!);
+
+    expect(onSave).toHaveBeenCalledWith({
+      custom_args: [],
+      custom_args_intent: "clear",
+    });
+  });
+
+  it("does not apply an agent A save completion after switching to agent B", async () => {
+    const user = userEvent.setup();
+    const pendingSave = deferred<void>();
+    const onSave = vi
+      .fn()
+      .mockImplementationOnce(() => pendingSave.promise)
+      .mockResolvedValueOnce(undefined);
+    const view = renderTab(
+      { custom_args: [], custom_args_redacted: true },
+      onSave,
+      true,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /replace arguments/i }),
+    );
+    await user.click(screen.getByRole("button", { name: /add argument/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /new argument/i }),
+      "agent-a-private-argument",
+    );
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      custom_args: ["agent-a-private-argument"],
+      custom_args_intent: "replace",
+    });
+
+    view.rerenderAgent({
+      ...baseAgent,
+      id: "agent-2",
+      name: "Agent 2",
+      custom_args: [],
+      custom_args_redacted: true,
+    });
+    expect(document.body.textContent).not.toContain("agent-a-private-argument");
+
+    await act(async () => {
+      pendingSave.resolve();
+      await pendingSave.promise;
+    });
+
+    expect(document.body.textContent).not.toContain("agent-a-private-argument");
+    expect(toast.success).not.toHaveBeenCalled();
+
+    await user.click(
+      screen.getByRole("button", { name: /replace arguments/i }),
+    );
+    await user.click(screen.getByRole("button", { name: /add argument/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /new argument/i }),
+      "agent-b-private-argument",
+    );
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(onSave).toHaveBeenLastCalledWith({
+      custom_args: ["agent-b-private-argument"],
+      custom_args_intent: "replace",
+    });
+    expect(JSON.stringify(onSave.mock.calls[1])).not.toContain(
+      "agent-a-private-argument",
+    );
   });
 });

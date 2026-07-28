@@ -485,7 +485,17 @@
       "edit_aria": "Edit argument {{index}}",
       "remove_aria": "Remove argument {{index}}",
       "saved_toast": "Custom arguments saved",
-      "save_failed_toast": "Failed to save custom arguments"
+      "save_failed_toast": "Failed to save custom arguments",
+      "redacted_title": "Arguments configured — values hidden",
+      "redacted_hint": "Custom arguments may contain credentials, so generic agent responses never return their values. Replace the entire list with fresh values or clear it.",
+      "replace_action": "Replace arguments",
+      "clear_action": "Clear arguments",
+      "replace_hint": "Build a complete replacement list below. Saving it overwrites the hidden arguments; they cannot be merged.",
+      "cleared_toast": "Custom arguments cleared",
+      "clear_failed_toast": "Failed to clear custom arguments",
+      "clear_dialog_title": "Clear hidden arguments?",
+      "clear_dialog_description": "This removes the complete stored argument list, including every hidden value.",
+      "clear_confirm_action": "Clear arguments"
     },
     "mcp_config": {
       "intro": "Manage the MCP servers available to this agent. Servers managed by Multica are merged with servers inherited from the local runtime.",
@@ -551,8 +561,16 @@
       "delete_action": "Delete Server",
       "invalid_json": "Invalid JSON: {{error}}",
       "save_failed_toast": "Failed to save MCP config",
-      "redacted_title": "Configured — hidden from your view",
-      "redacted_hint": "Only the agent owner or a workspace admin can read this config."
+      "redacted_title": "Configured — secret values hidden",
+      "redacted_hint": "Generic agent responses never return stored MCP values. Replace the complete configuration with fresh values or clear it.",
+      "replace_action": "Replace config",
+      "clear_action": "Clear config",
+      "replace_hint": "Add every server the replacement should contain. Saving the first server overwrites the hidden configuration; it cannot be merged.",
+      "cleared_toast": "MCP config cleared",
+      "clear_failed_toast": "Failed to clear MCP config",
+      "clear_dialog_title": "Clear hidden MCP config?",
+      "clear_dialog_description": "This removes the complete stored MCP configuration. Runtime-inherited servers are not affected.",
+      "clear_confirm_action": "Clear config"
     },
     "composio_mcp": {
       "subtitle": "Check a toolkit to let this agent mount it as an MCP server — but only when you (its creator) are the one who triggered the run, directly or down a sub-agent chain.",
@@ -572,6 +590,16 @@
     },
     "runtime_config": {
       "intro": "Choose how the OpenClaw runtime executes this agent's turns. Local mode runs the agent inside the daemon process. Gateway mode forwards each turn to an OpenClaw Gateway — useful when the daemon host is a lightweight coordinator and the agent should run on a more powerful machine.",
+      "redacted_title": "Routing configuration is hidden",
+      "redacted_hint": "Stored routing values may contain credentials, so they are never returned here. Replace the complete configuration or clear it explicitly.",
+      "configured_count": "{{count}} top-level fields configured",
+      "replace_action": "Replace routing config",
+      "replace_hint": "Start from a blank configuration. Saving replaces the complete stored routing config.",
+      "clear_action": "Clear routing config",
+      "clear_dialog_title": "Clear routing configuration?",
+      "clear_dialog_description": "This removes the complete stored routing configuration. This action cannot be undone.",
+      "clear_confirm_action": "Clear routing config",
+      "cancel_action": "Cancel",
       "mode_label": "Routing mode",
       "mode_local": "Local",
       "mode_gateway": "Gateway",
@@ -588,7 +616,9 @@
       "tls_label": "Use TLS",
       "tls_hint": "Dial https:// instead of http://",
       "saved_toast": "Routing config saved",
-      "save_failed_toast": "Failed to save routing config"
+      "save_failed_toast": "Failed to save routing config",
+      "cleared_toast": "Routing config cleared",
+      "clear_failed_toast": "Failed to clear routing config"
     },
     "skills": {
       "intro": "This is the agent's effective skill set. Workspace skills are managed here; inherited Codex and Claude Code skills can also be turned off per agent.",

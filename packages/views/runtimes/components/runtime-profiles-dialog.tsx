@@ -7,6 +7,7 @@ import {
   ChevronLeft,
   ExternalLink,
   Loader2,
+  Lock,
   Pencil,
   Plus,
   Server,
@@ -15,10 +16,14 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useQuery } from "@tanstack/react-query";
-import { ApiError } from "@multica/core/api";
+import {
+  ApiError,
+  CommittedResponseUnreadableError,
+} from "@multica/core/api";
 import type {
   RuntimeProfile,
   RuntimeProtocolFamily,
+  UpdateRuntimeProfileRequest,
 } from "@multica/core/types";
 import {
   runtimeProfileListOptions,
@@ -529,10 +534,10 @@ function DetailPanel({
   }
 
   const profile = entry.profile;
-  const commandLine = formatCommandLine(
-    profile.command_name,
-    profile.fixed_args,
-  );
+  const fixedArgsHidden = profile.fixed_args_redacted === true;
+  const commandLine = fixedArgsHidden
+    ? profile.command_name
+    : formatCommandLine(profile.command_name, profile.fixed_args);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -561,7 +566,16 @@ function DetailPanel({
             <span className="capitalize">{profile.protocol_family}</span>
           </DetailRow>
           <DetailRow label={t(($) => $.profiles.detail.command)}>
-            <span className="font-mono text-xs">{commandLine}</span>
+            <div>
+              <span className="font-mono text-xs">{commandLine}</span>
+              {fixedArgsHidden ? (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t(($) => $.profiles.detail.fixed_args_hidden, {
+                    count: profile.fixed_args_count ?? 0,
+                  })}
+                </p>
+              ) : null}
+            </div>
           </DetailRow>
           <DetailRow label={t(($) => $.profiles.detail.description)}>
             {profile.description ? (
@@ -747,21 +761,30 @@ function ProfileDetailsForm({
   const idPrefix = `runtime-profile-${useId().replace(/:/g, "")}`;
   const createProfile = useCreateRuntimeProfile(wsId);
   const updateProfile = useUpdateRuntimeProfile(wsId);
+  const fixedArgsHidden =
+    mode === "edit" && profile?.fixed_args_redacted === true;
 
   const [values, setValues] = useState<ProfileFormValues>({
     displayName: profile?.display_name ?? "",
     commandLine: profile
-      ? formatCommandLine(profile.command_name, profile.fixed_args)
+      ? fixedArgsHidden
+        ? profile.command_name
+        : formatCommandLine(profile.command_name, profile.fixed_args)
       : "",
     description: profile?.description ?? "",
   });
+  const [fixedArgsMode, setFixedArgsMode] = useState<
+    "preserve" | "replace" | "clear"
+  >(fixedArgsHidden ? "preserve" : "replace");
   const [errors, setErrors] = useState<ProfileFormErrorField[]>([]);
   // Server-side error surfaced under the display-name field (duplicate) or
   // as a generic banner.
   const [duplicateName, setDuplicateName] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [responseUncertain, setResponseUncertain] = useState(false);
 
-  const submitting = createProfile.isPending || updateProfile.isPending;
+  const submitting =
+    createProfile.isPending || updateProfile.isPending || responseUncertain;
   const setField = (key: keyof ProfileFormValues, value: string) => {
     setValues((prev) => ({ ...prev, [key]: value }));
   };
@@ -777,6 +800,24 @@ function ProfileDetailsForm({
     setDuplicateName(false);
     const validationErrors = validateProfileForm(values);
     if (!validationErrors.includes("commandLine") && !parsedCommand.ok) {
+      validationErrors.push("commandLine");
+    }
+    if (
+      fixedArgsHidden &&
+      fixedArgsMode !== "replace" &&
+      parsedCommand.ok &&
+      parsedCommand.fixedArgs.length > 0 &&
+      !validationErrors.includes("commandLine")
+    ) {
+      validationErrors.push("commandLine");
+    }
+    if (
+      fixedArgsHidden &&
+      fixedArgsMode === "replace" &&
+      parsedCommand.ok &&
+      parsedCommand.fixedArgs.length === 0 &&
+      !validationErrors.includes("commandLine")
+    ) {
       validationErrors.push("commandLine");
     }
     setErrors(validationErrors);
@@ -799,19 +840,35 @@ function ProfileDetailsForm({
         toast.success(t(($) => $.profiles.form.toast_created));
         onSaved(created);
       } else if (profile) {
+        const patch: UpdateRuntimeProfileRequest = {
+          display_name: values.displayName.trim(),
+          command_name: commandName,
+          description: description ? description : null,
+        };
+        if (fixedArgsMode === "replace") {
+          patch.fixed_args = fixedArgs;
+          patch.fixed_args_intent =
+            fixedArgs.length === 0 ? "clear" : "replace";
+        } else if (fixedArgsMode === "clear") {
+          patch.fixed_args = [];
+          patch.fixed_args_intent = "clear";
+        }
         const updated = await updateProfile.mutateAsync({
           profileId: profile.id,
-          patch: {
-            display_name: values.displayName.trim(),
-            command_name: commandName,
-            fixed_args: fixedArgs,
-            description: description ? description : null,
-          },
+          patch,
         });
         toast.success(t(($) => $.profiles.form.toast_updated));
         onSaved(updated);
       }
     } catch (err) {
+      if (err instanceof CommittedResponseUnreadableError) {
+        // The mutation may already be committed. Both hooks invalidate their
+        // catalogs on settle; keep this mounted form disabled so an immediate
+        // retry cannot duplicate a profile or replay a hidden-argument write.
+        setResponseUncertain(true);
+        setFormError(err.message);
+        return;
+      }
       // 409 from create/patch means the display name collides.
       if (err instanceof ApiError && err.status === 409) {
         setDuplicateName(true);
@@ -840,9 +897,39 @@ function ProfileDetailsForm({
   const commandError =
     hasError("commandLine") && !values.commandLine.trim()
       ? t(($) => $.profiles.form.error_command_required)
+      : hasError("commandLine") &&
+          fixedArgsHidden &&
+          fixedArgsMode !== "replace" &&
+          parsedCommand.ok &&
+          parsedCommand.fixedArgs.length > 0
+        ? t(($) => $.profiles.form.error_hidden_args_require_replace)
+      : hasError("commandLine") &&
+          fixedArgsHidden &&
+          fixedArgsMode === "replace" &&
+          parsedCommand.ok &&
+          parsedCommand.fixedArgs.length === 0
+        ? t(($) => $.profiles.form.error_hidden_args_replace_empty)
       : hasError("commandLine") && !parsedCommand.ok
         ? (parseErrorMessage ?? t(($) => $.profiles.form.error_command_required))
         : null;
+
+  const preserveHiddenArgs = () => {
+    setFixedArgsMode("preserve");
+    setField(
+      "commandLine",
+      parsedCommand.ok ? parsedCommand.commandName : (profile?.command_name ?? ""),
+    );
+    setErrors((current) => current.filter((field) => field !== "commandLine"));
+  };
+
+  const clearHiddenArgs = () => {
+    setFixedArgsMode("clear");
+    setField(
+      "commandLine",
+      parsedCommand.ok ? parsedCommand.commandName : (profile?.command_name ?? ""),
+    );
+    setErrors((current) => current.filter((field) => field !== "commandLine"));
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -966,6 +1053,65 @@ function ProfileDetailsForm({
               )}
             </div>
           )}
+          {fixedArgsHidden ? (
+            <div className="rounded-md border p-3">
+              {fixedArgsMode === "preserve" ? (
+                <div className="space-y-3">
+                  <div className="flex items-start gap-2">
+                    <Lock
+                      className="mt-0.5 size-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    <div>
+                      <p className="text-xs font-medium">
+                        {t(($) => $.profiles.form.fixed_args_hidden_title, {
+                          count: profile?.fixed_args_count ?? 0,
+                        })}
+                      </p>
+                      <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+                        {t(($) => $.profiles.form.fixed_args_hidden_hint)}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2 pl-6">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setFixedArgsMode("replace")}
+                    >
+                      {t(($) => $.profiles.form.replace_fixed_args)}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="text-destructive"
+                      onClick={clearHiddenArgs}
+                    >
+                      {t(($) => $.profiles.form.clear_fixed_args)}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] leading-5 text-muted-foreground">
+                    {fixedArgsMode === "replace"
+                      ? t(($) => $.profiles.form.replace_fixed_args_hint)
+                      : t(($) => $.profiles.form.clear_fixed_args_hint)}
+                  </p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={preserveHiddenArgs}
+                  >
+                    {t(($) => $.profiles.form.keep_fixed_args)}
+                  </Button>
+                </div>
+              )}
+            </div>
+          ) : null}
         </div>
 
         <div className="space-y-1.5">

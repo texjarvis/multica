@@ -63,6 +63,14 @@ const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_CAP_MS = 30_000;
 const RECONNECT_MAX_EXPONENT = 6; // 1s → 64s ceiling, capped at 30s
 
+function frameLogMetadata(data: unknown): { frame_char_count: number | null } {
+  return {
+    // Never stringify or excerpt malformed/out-of-protocol frames. They have
+    // not passed a committed schema and may carry legacy secret-bearing data.
+    frame_char_count: typeof data === "string" ? data.length : null,
+  };
+}
+
 /**
  * Lifecycle state — drives whether onclose schedules a reconnect:
  *   idle    — never connected, or fully disconnected. No reconnect on close.
@@ -209,25 +217,31 @@ export class WSClient {
       try {
         msg = JSON.parse(event.data as string) as WSMessage;
       } catch {
-        this.logger.warn("[ws] non-JSON frame ignored");
+        this.logger.warn(
+          "[ws] non-JSON frame ignored",
+          frameLogMetadata(event.data),
+        );
         return;
       }
 
-      const type = (msg as { type?: string }).type;
+      const type = (msg as { type?: unknown }).type;
       if (type === "auth_ack") {
         this.onAuthenticated();
         return;
       }
-      if (!type) {
+      if (typeof type !== "string") {
         // Server-side error frames have shape {error: "..."}; log and drop.
         // Reconnect loop is bounded by auth-store's 401 handler eventually
         // tearing this client down via disconnect().
-        this.logger.warn("[ws] frame without type", event.data);
+        this.logger.warn(
+          "[ws] frame without type",
+          frameLogMetadata(event.data),
+        );
         return;
       }
 
       this.logger.debug("[ws] event", type);
-      const set = this.handlers.get(msg.type);
+      const set = this.handlers.get(type as WSEventType);
       if (set) {
         for (const handler of set) handler(msg.payload, msg.actor_id);
       }

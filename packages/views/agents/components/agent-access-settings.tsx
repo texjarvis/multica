@@ -1,6 +1,10 @@
 "use client";
 
-import type { Agent, MemberWithUser } from "@multica/core/types";
+import type {
+  Agent,
+  MemberWithUser,
+  UpdateAgentRequest,
+} from "@multica/core/types";
 import {
   SettingsCard,
   SettingsSection,
@@ -19,7 +23,7 @@ export function AgentAccessSettings({
   members: MemberWithUser[];
   currentUserId: string | null;
   onDirtyChange?: (dirty: boolean) => void;
-  onUpdate: (id: string, data: Record<string, unknown>) => Promise<void>;
+  onUpdate: (id: string, data: UpdateAgentRequest) => Promise<void>;
 }) {
   const { t } = useT("agents");
 
@@ -39,7 +43,7 @@ export function AgentAccessSettings({
             currentUserId !== null && agent.owner_id === currentUserId
           }
           hasComposioAllowlist={
-            (agent.composio_toolkit_allowlist ?? []).length > 0
+            (agent.composio_toolkit_allowlist_count ?? 0) > 0
           }
           onDirtyChange={onDirtyChange}
           onChange={(next) => onUpdate(agent.id, next)}

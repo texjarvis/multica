@@ -762,7 +762,7 @@ func (d *Daemon) pruneWorktree(barePath string) {
 			d.pruneWorktreeLocked(barePath)
 			return nil
 		}); err != nil {
-			d.logger.Warn("gc: repo lock failed", "repo", barePath, "error", err)
+			d.logger.Warn("gc: repo lock failed", "has_repo", barePath != "", "has_error", true)
 			return
 		}
 		return
@@ -774,21 +774,21 @@ func (d *Daemon) pruneWorktree(barePath string) {
 func (d *Daemon) pruneWorktreeLocked(barePath string) {
 	if out, err := runGitGCCommand(barePath, "worktree", "prune"); err != nil {
 		d.logger.Warn("gc: worktree prune failed",
-			"repo", barePath,
-			"output", out,
-			"error", err,
+			"has_repo", barePath != "",
+			"output_char_count", len(out),
+			"has_error", true,
 		)
 	}
 
 	activeBranches, err := agentWorktreeBranches(barePath)
 	if err != nil {
-		d.logger.Warn("gc: worktree branch scan failed", "repo", barePath, "error", err)
+		d.logger.Warn("gc: worktree branch scan failed", "has_repo", barePath != "", "has_error", true)
 		return
 	}
 
 	agentBranches, err := listAgentBranches(barePath)
 	if err != nil {
-		d.logger.Warn("gc: agent branch scan failed", "repo", barePath, "error", err)
+		d.logger.Warn("gc: agent branch scan failed", "has_repo", barePath != "", "has_error", true)
 		return
 	}
 
@@ -799,10 +799,10 @@ func (d *Daemon) pruneWorktreeLocked(barePath string) {
 		}
 		if out, err := runGitGCCommand(barePath, "branch", "-D", "--", branch); err != nil {
 			d.logger.Warn("gc: agent branch delete failed",
-				"repo", barePath,
-				"branch", branch,
-				"output", out,
-				"error", err,
+				"has_repo", barePath != "",
+				"has_branch", branch != "",
+				"output_char_count", len(out),
+				"has_error", true,
 			)
 			continue
 		}
@@ -811,7 +811,7 @@ func (d *Daemon) pruneWorktreeLocked(barePath string) {
 	if deleted == 0 {
 		return
 	}
-	d.logger.Info("gc: deleted stale agent branches", "repo", barePath, "count", deleted)
+	d.logger.Info("gc: deleted stale agent branches", "has_repo", barePath != "", "count", deleted)
 
 	// Heavier maintenance only runs when we actually removed refs, so we don't
 	// turn every GC tick into a full `git gc --prune` on every cached repo. The
@@ -827,10 +827,10 @@ func (d *Daemon) pruneWorktreeLocked(barePath string) {
 	for _, step := range maintenance {
 		if out, err := runGitCommand(barePath, step.timeout, step.args...); err != nil {
 			d.logger.Warn("gc: git maintenance failed",
-				"repo", barePath,
-				"command", strings.Join(step.args, " "),
-				"output", out,
-				"error", err,
+				"has_repo", barePath != "",
+				"arg_count", len(step.args),
+				"output_char_count", len(out),
+				"has_error", true,
 			)
 		}
 	}

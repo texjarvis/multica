@@ -330,7 +330,9 @@ func TestAuth_MCN_ValidTokenSetsUserID(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"valid": true,
-			"owner_id": "01972f7e-7e8d-77ef-a13d-1b0ce3e9c001"
+			"owner_id": "01972f7e-7e8d-77ef-a13d-1b0ce3e9c001",
+			"instance_id": "i-01",
+			"instance_record_id": "01972f7e-8a13-72a1-bbb0-0874ed4e8e67"
 		}`))
 	}))
 	defer srv.Close()

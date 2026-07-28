@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -27,14 +26,14 @@ The source agent is left untouched. By default the copy lands on the same
 runtime as the source; pass --runtime-id to fork it onto a different runtime.
 
 Copied by default, each overridable with the matching flag: name (suffixed
-" (copy)"), description, instructions, avatar, custom_args, max_concurrent_tasks,
+" (copy)"), description, instructions, avatar, max_concurrent_tasks,
 invocation permission (permission_mode + allow-list), assigned workspace skills,
 and — only when the target runtime is unchanged — model, thinking_level and
 service_tier.
 
-Secret and machine-local fields are never copied: custom_env, mcp_config and
-runtime_config. Supply fresh values for the copy with the same secret-safe flags
-as 'agent create' when the target machine needs them.
+Secret-bearing and machine-local fields are never copied: custom_args,
+custom_env, mcp_config and runtime_config. Supply fresh values for the copy
+with the matching explicit flags when the target agent needs them.
 
 Runtime-specific fields do not travel across a runtime change: when --runtime-id
 selects a different runtime, --model is required (pass --model "" to accept the
@@ -59,7 +58,9 @@ func registerAgentCopyFlags(cmd *cobra.Command) {
 	cmd.Flags().String("model", "", "Model identifier for the copy. Required when --runtime-id selects a different runtime (pass \"\" to accept the target runtime default). Empty otherwise = runtime default.")
 	cmd.Flags().String("thinking-level", "", "Override thinking level. Not carried across a runtime change unless set here.")
 	cmd.Flags().String("service-tier", "", "Override Codex service tier. Not carried across a runtime change unless set here.")
-	cmd.Flags().String("custom-args", "", "Override custom CLI arguments as a JSON array.")
+	cmd.Flags().String("custom-args", "", "Set fresh custom CLI arguments from inline JSON (unsafe for credentials; prefer --custom-args-file or --custom-args-stdin).")
+	cmd.Flags().Bool("custom-args-stdin", false, "Read fresh custom CLI arguments from stdin. Mutually exclusive with --custom-args and --custom-args-file.")
+	cmd.Flags().String("custom-args-file", "", "Read fresh custom CLI arguments from a file (suggested mode: 0600). Mutually exclusive with --custom-args and --custom-args-stdin.")
 	cmd.Flags().Int32("max-concurrent-tasks", 6, "Override maximum concurrent tasks")
 	cmd.Flags().String("visibility", "", "Override visibility: private or workspace (legacy; mapped to --permission-mode)")
 	cmd.Flags().String("permission-mode", "", "Override invocation permission mode: private or public_to. Authoritative over --visibility.")
@@ -74,17 +75,22 @@ func registerAgentCopyFlags(cmd *cobra.Command) {
 	cmd.Flags().String("mcp-config", "", "Set mcp_config on the copy as a JSON object (never copied from the source). Prefer --mcp-config-stdin/--mcp-config-file for secrets.")
 	cmd.Flags().Bool("mcp-config-stdin", false, "Read --mcp-config from stdin. Mutually exclusive with --mcp-config and --mcp-config-file.")
 	cmd.Flags().String("mcp-config-file", "", "Read --mcp-config from a file path (suggested mode: 0600). Mutually exclusive with --mcp-config and --mcp-config-stdin.")
-	cmd.Flags().String("runtime-config", "", "Set runtime_config on the copy as a JSON string (never copied from the source).")
+	cmd.Flags().String("runtime-config", "", "Set fresh runtime_config from inline JSON (unsafe for credentials; prefer --runtime-config-file or --runtime-config-stdin).")
+	cmd.Flags().Bool("runtime-config-stdin", false, "Read fresh runtime_config JSON from stdin. Mutually exclusive with --runtime-config and --runtime-config-file.")
+	cmd.Flags().String("runtime-config-file", "", "Read fresh runtime_config JSON from a file (suggested mode: 0600). Mutually exclusive with --runtime-config and --runtime-config-stdin.")
 	cmd.Flags().String("output", "json", "Output format: table or json")
 }
 
 // runAgentCopy reads the source agent and assembles a create request from its
-// portable fields, then POSTs it. custom_env, mcp_config and runtime_config are
-// never read back from the source — GET redacts / masks them anyway — and are
-// set only when supplied explicitly on the command line.
+// portable fields, then POSTs it. custom_args, custom_env, mcp_config and
+// runtime_config are never read back from the source — GET redacts / masks
+// them anyway — and are set only when supplied explicitly on the command line.
 func runAgentCopy(cmd *cobra.Command, args []string) error {
 	client, err := newAPIClient(cmd)
 	if err != nil {
+		return err
+	}
+	if err := validateSingleJSONStdin(cmd, "runtime-config", "custom-args", "custom-env", "mcp-config"); err != nil {
 		return err
 	}
 
@@ -95,6 +101,7 @@ func runAgentCopy(cmd *cobra.Command, args []string) error {
 	if err := client.GetJSON(ctx, "/api/agents/"+args[0], &src); err != nil {
 		return fmt.Errorf("get source agent: %w", err)
 	}
+	src = sanitizeAgentForCLIOutput(src)
 
 	srcRuntimeID := strVal(src, "runtime_id")
 
@@ -146,13 +153,12 @@ func runAgentCopy(cmd *cobra.Command, args []string) error {
 		body["avatar_url"] = av
 	}
 
-	// custom_args: copy when present, override with --custom-args.
-	if ca, ok := src["custom_args"].([]any); ok && len(ca) > 0 {
-		body["custom_args"] = ca
-	}
-	if cmd.Flags().Changed("custom-args") {
-		v, _ := cmd.Flags().GetString("custom-args")
-		ca, err := parseCustomArgs(v)
+	// custom_args are arbitrary secret-capable argv and generic GET never
+	// returns their values. Set them only from fresh explicit input.
+	if raw, ok, err := resolveJSONInput(cmd, "custom-args", "pass '[]' for no custom arguments"); err != nil {
+		return err
+	} else if ok {
+		ca, err := parseCustomArgs(raw)
 		if err != nil {
 			return err
 		}
@@ -254,11 +260,12 @@ func runAgentCopy(cmd *cobra.Command, args []string) error {
 	} else if ok {
 		body["mcp_config"] = mc
 	}
-	if cmd.Flags().Changed("runtime-config") {
-		v, _ := cmd.Flags().GetString("runtime-config")
-		var rc any
-		if err := json.Unmarshal([]byte(v), &rc); err != nil {
-			return fmt.Errorf("--runtime-config must be valid JSON: %w", err)
+	if raw, ok, err := resolveJSONInput(cmd, "runtime-config", "pass '{}' for an empty config"); err != nil {
+		return err
+	} else if ok {
+		rc, err := parseRuntimeConfig(raw)
+		if err != nil {
+			return err
 		}
 		body["runtime_config"] = rc
 	}
@@ -267,6 +274,16 @@ func runAgentCopy(cmd *cobra.Command, args []string) error {
 	if err := client.PostJSON(ctx, "/api/agents", body, &result); err != nil {
 		return fmt.Errorf("copy agent: %w", err)
 	}
+	if err := validateCommittedAgentCreateResponse(
+		result,
+		name,
+		targetRuntimeID,
+		args[0],
+		"copy agent",
+	); err != nil {
+		return err
+	}
+	result = sanitizeAgentForCLIOutput(result)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {

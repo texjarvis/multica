@@ -20,6 +20,8 @@ const (
 	ctxKeyDaemonWorkspaceID daemonContextKey = iota
 	ctxKeyDaemonID
 	ctxKeyDaemonAuthPath
+	ctxKeyCloudInstanceID
+	ctxKeyCloudInstanceRecordID
 )
 
 // Daemon auth path labels exposed via context for slow-log attribution.
@@ -50,12 +52,43 @@ func DaemonAuthPathFromContext(ctx context.Context) string {
 	return p
 }
 
+// CloudInstanceIDFromContext returns the Fleet instance identity carried by a
+// verified mcn_ credential. It is intentionally separate from daemon_id: the
+// latter is a daemon-local persistent UUID, while instance_id is assigned by
+// the cloud provider.
+func CloudInstanceIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyCloudInstanceID).(string)
+	return id
+}
+
+// CloudInstanceRecordIDFromContext returns the Fleet database record identity
+// carried by a verified mcn_ credential.
+func CloudInstanceRecordIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyCloudInstanceRecordID).(string)
+	return id
+}
+
 // WithDaemonContext returns a new context with the daemon workspace ID and daemon ID set.
 // This is used by tests to simulate daemon token authentication.
 func WithDaemonContext(ctx context.Context, workspaceID, daemonID string) context.Context {
 	ctx = context.WithValue(ctx, ctxKeyDaemonWorkspaceID, workspaceID)
 	ctx = context.WithValue(ctx, ctxKeyDaemonID, daemonID)
 	ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, DaemonAuthPathDaemonToken)
+	return ctx
+}
+
+// WithDaemonUserAuthContext restores the already-verified user-token identity
+// captured by a daemon WebSocket connection onto an in-process RPC request.
+// It must only be called with values copied from DaemonAuth context; it does
+// not verify credentials itself.
+func WithDaemonUserAuthContext(ctx context.Context, authPath, cloudInstanceID, cloudInstanceRecordID string) context.Context {
+	ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, authPath)
+	if cloudInstanceID != "" {
+		ctx = context.WithValue(ctx, ctxKeyCloudInstanceID, cloudInstanceID)
+	}
+	if cloudInstanceRecordID != "" {
+		ctx = context.WithValue(ctx, ctxKeyCloudInstanceRecordID, cloudInstanceRecordID)
+	}
 	return ctx
 }
 
@@ -182,6 +215,8 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				// differently depending on which one routed it.
 				r.Header.Set("X-Actor-Source", "cloud_pat")
 				ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathCloudPAT)
+				ctx = context.WithValue(ctx, ctxKeyCloudInstanceID, identity.InstanceID)
+				ctx = context.WithValue(ctx, ctxKeyCloudInstanceRecordID, identity.InstanceRecordID)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}

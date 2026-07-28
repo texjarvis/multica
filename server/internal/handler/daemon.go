@@ -69,7 +69,80 @@ func (h *Handler) requireDaemonWorkspaceAccess(w http.ResponseWriter, r *http.Re
 	return ok
 }
 
-// requireDaemonRuntimeAccess looks up a runtime and verifies the caller owns its workspace.
+// daemonRuntimeAccessAllowed binds a daemon request to the runtime itself, not
+// merely to any membership in the runtime's workspace. This is the raw-secret
+// boundary for claim responses:
+//
+//   - mdt_ credentials must match workspace AND runtime.daemon_id;
+//   - PAT/JWT compatibility credentials must belong to runtime.owner_id;
+//   - mcn_ credentials must belong to runtime.owner_id and retain a concrete
+//     Fleet instance identity.
+//
+// expectedDaemonID is used by machine-level batch operations to additionally
+// bind every selected runtime to the daemon_id in that request.
+func (h *Handler) daemonRuntimeAccessAllowed(r *http.Request, rt db.AgentRuntime, expectedDaemonID string) bool {
+	if !h.verifyDaemonWorkspaceAccess(r, uuidToString(rt.WorkspaceID)) {
+		return false
+	}
+	if expectedDaemonID != "" && (!rt.DaemonID.Valid || rt.DaemonID.String != expectedDaemonID) {
+		return false
+	}
+
+	switch middleware.DaemonAuthPathFromContext(r.Context()) {
+	case middleware.DaemonAuthPathDaemonToken:
+		daemonID := middleware.DaemonIDFromContext(r.Context())
+		return daemonID != "" && rt.DaemonID.Valid && rt.DaemonID.String == daemonID
+	case middleware.DaemonAuthPathPAT, middleware.DaemonAuthPathJWT:
+		userID := requestUserID(r)
+		return userID != "" && rt.OwnerID.Valid && uuidToString(rt.OwnerID) == userID
+	case middleware.DaemonAuthPathCloudPAT:
+		userID := requestUserID(r)
+		return userID != "" &&
+			rt.OwnerID.Valid &&
+			uuidToString(rt.OwnerID) == userID &&
+			cloudRuntimeInstanceMatches(r, rt.Metadata)
+	default:
+		return false
+	}
+}
+
+// cloudRuntimeInstanceMatches requires the complete server-stamped Fleet
+// identity. A partial or unstamped row is never sufficient for raw-secret
+// routes.
+func cloudRuntimeInstanceMatches(r *http.Request, rawMetadata []byte) bool {
+	return cloudRuntimeIdentityMatchesValues(
+		rawMetadata,
+		middleware.CloudInstanceIDFromContext(r.Context()),
+		middleware.CloudInstanceRecordIDFromContext(r.Context()),
+	)
+}
+
+func cloudRuntimeIdentityMatchesValues(rawMetadata []byte, instanceID, instanceRecordID string) bool {
+	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(instanceRecordID) == "" {
+		return false
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(rawMetadata, &metadata); err != nil {
+		return false
+	}
+	storedInstanceID, _ := metadata["cloud_instance_id"].(string)
+	storedInstanceRecordID, _ := metadata["cloud_instance_record_id"].(string)
+	return storedInstanceID != "" &&
+		storedInstanceRecordID != "" &&
+		storedInstanceID == instanceID &&
+		storedInstanceRecordID == instanceRecordID
+}
+
+func writeRuntimeRegistrationError(w http.ResponseWriter, err error) {
+	if isNotFound(err) {
+		writeError(w, http.StatusConflict, "runtime identity is already bound to another owner or cloud instance")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "failed to register runtime")
+}
+
+// requireDaemonRuntimeAccess looks up a runtime and verifies the caller is
+// bound to that runtime.
 //
 // Only pgx.ErrNoRows is treated as a real "runtime gone" 404 — the daemon uses
 // that response to drop the stale runtime from its in-memory map and re-register,
@@ -90,7 +163,8 @@ func (h *Handler) requireDaemonRuntimeAccess(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "failed to load runtime")
 		return db.AgentRuntime{}, false
 	}
-	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(rt.WorkspaceID)) {
+	if !h.daemonRuntimeAccessAllowed(r, rt, "") {
+		writeError(w, http.StatusNotFound, "runtime not found")
 		return db.AgentRuntime{}, false
 	}
 	return rt, true
@@ -134,7 +208,9 @@ func (h *Handler) requireDaemonTaskAccessWithWorkspace(w http.ResponseWriter, r 
 		return db.AgentTaskQueue{}, "", false
 	}
 
-	if !h.requireDaemonWorkspaceAccess(w, r, wsID) {
+	runtime, err := h.Queries.GetAgentRuntime(r.Context(), task.RuntimeID)
+	if err != nil || uuidToString(runtime.WorkspaceID) != wsID || !h.daemonRuntimeAccessAllowed(r, runtime, "") {
+		writeError(w, http.StatusNotFound, "task not found")
 		return db.AgentTaskQueue{}, "", false
 	}
 	return task, wsID, true
@@ -172,9 +248,9 @@ type DaemonRegisterRequest struct {
 	WorkspaceID string `json:"workspace_id"`
 	DaemonID    string `json:"daemon_id"`
 	// LegacyDaemonIDs lists prior hostname-derived daemon_ids this machine
-	// may have registered under before switching to a persistent UUID. The
-	// handler merges any matching runtime rows into the new row so agents
-	// and tasks keep working without manual intervention.
+	// may have registered under before switching to a persistent UUID. It is
+	// only a lookup hint: the handler merges rows after independently proving
+	// the same owner and local/cloud machine identity.
 	LegacyDaemonIDs []string `json:"legacy_daemon_ids"`
 	DeviceName      string   `json:"device_name"`
 	CLIVersion      string   `json:"cli_version"` // multica CLI version
@@ -373,6 +449,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "workspace not found")
 			return
 		}
+		if tokenDaemonID := middleware.DaemonIDFromContext(r.Context()); tokenDaemonID == "" || tokenDaemonID != req.DaemonID {
+			writeError(w, http.StatusForbidden, "daemon_id does not match token")
+			return
+		}
 		// ownerID stays zero — COALESCE keeps the existing owner on upsert.
 	} else {
 		member, ok := h.requireWorkspaceMember(w, r, req.WorkspaceID, "workspace not found")
@@ -385,6 +465,13 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	ws, err := h.Queries.GetWorkspace(r.Context(), wsUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+	requireCloudIdentity := middleware.DaemonAuthPathFromContext(r.Context()) == middleware.DaemonAuthPathCloudPAT
+	cloudInstanceID := middleware.CloudInstanceIDFromContext(r.Context())
+	cloudInstanceRecordID := middleware.CloudInstanceRecordIDFromContext(r.Context())
+	if requireCloudIdentity && (cloudInstanceID == "" || cloudInstanceRecordID == "") {
+		writeError(w, http.StatusUnauthorized, "invalid cloud node identity")
 		return
 	}
 
@@ -411,11 +498,21 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		if runtime.Status == "offline" {
 			status = "offline"
 		}
-		metadata, _ := json.Marshal(map[string]any{
+		metadataValues := map[string]any{
 			"version":     runtime.Version,
 			"cli_version": req.CLIVersion,
 			"launched_by": req.LaunchedBy,
-		})
+		}
+		// Preserve Fleet's node identity on the runtime row. It is deliberately
+		// server-stamped from the verified mcn_ context, never copied from the
+		// request body.
+		if cloudInstanceID != "" {
+			metadataValues["cloud_instance_id"] = cloudInstanceID
+		}
+		if cloudInstanceRecordID != "" {
+			metadataValues["cloud_instance_record_id"] = cloudInstanceRecordID
+		}
+		metadata, _ := json.Marshal(metadataValues)
 
 		var registered db.AgentRuntime
 		var inserted bool
@@ -444,16 +541,17 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			provider = profile.ProtocolFamily
 
 			prow, err := h.Queries.UpsertAgentRuntimeWithProfile(r.Context(), db.UpsertAgentRuntimeWithProfileParams{
-				WorkspaceID: wsUUID,
-				DaemonID:    strToText(req.DaemonID),
-				Name:        name,
-				RuntimeMode: "local",
-				Provider:    provider,
-				Status:      status,
-				DeviceInfo:  deviceInfo,
-				Metadata:    metadata,
-				OwnerID:     ownerID,
-				ProfileID:   profileUUID,
+				WorkspaceID:          wsUUID,
+				DaemonID:             strToText(req.DaemonID),
+				Name:                 name,
+				RuntimeMode:          "local",
+				Provider:             provider,
+				Status:               status,
+				DeviceInfo:           deviceInfo,
+				Metadata:             metadata,
+				OwnerID:              ownerID,
+				ProfileID:            profileUUID,
+				RequireCloudIdentity: requireCloudIdentity,
 			})
 			if err != nil {
 				obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.RuntimeFailed(
@@ -465,7 +563,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 					"db_error",
 					true,
 				))
-				writeError(w, http.StatusInternalServerError, "failed to register runtime: "+err.Error())
+				writeRuntimeRegistrationError(w, err)
 				return
 			}
 			inserted = prow.Inserted
@@ -490,15 +588,16 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			row, err := h.Queries.UpsertAgentRuntime(r.Context(), db.UpsertAgentRuntimeParams{
-				WorkspaceID: wsUUID,
-				DaemonID:    strToText(req.DaemonID),
-				Name:        name,
-				RuntimeMode: "local",
-				Provider:    provider,
-				Status:      status,
-				DeviceInfo:  deviceInfo,
-				Metadata:    metadata,
-				OwnerID:     ownerID,
+				WorkspaceID:          wsUUID,
+				DaemonID:             strToText(req.DaemonID),
+				Name:                 name,
+				RuntimeMode:          "local",
+				Provider:             provider,
+				Status:               status,
+				DeviceInfo:           deviceInfo,
+				Metadata:             metadata,
+				OwnerID:              ownerID,
+				RequireCloudIdentity: requireCloudIdentity,
 			})
 			if err != nil {
 				obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.RuntimeFailed(
@@ -510,7 +609,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 					"db_error",
 					true,
 				))
-				writeError(w, http.StatusInternalServerError, "failed to register runtime: "+err.Error())
+				writeRuntimeRegistrationError(w, err)
 				return
 			}
 			inserted = row.Inserted
@@ -566,9 +665,9 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 
 		// Seamless migration from the previous hostname-derived identity. The
 		// daemon sends every legacy daemon_id it may have registered under
-		// (e.g. "host.local", "host", "host-staging"); for each match we
-		// reassign agents + tasks onto the new UUID-keyed row, then delete
-		// the stale row so there's only ever one runtime per machine.
+		// (e.g. "host.local", "host", "host-staging"). Those values are
+		// untrusted hints: only rows with the same authenticated owner and
+		// local/cloud machine binding are eligible for migration.
 		//
 		// Only built-in runtimes participate: legacy rows predate custom
 		// profiles, so a profile-keyed instance never has a hostname-derived
@@ -610,25 +709,36 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		if commandName == "" {
 			commandName = profile.CommandName
 		}
-		metadata, _ := json.Marshal(map[string]any{
+		failedMetadata := map[string]any{
 			"version":                            "",
 			"cli_version":                        req.CLIVersion,
 			"launched_by":                        req.LaunchedBy,
 			"runtime_profile_registration_error": true,
 			"runtime_profile_failure_reason":     reason,
 			"command_name":                       commandName,
-		})
+		}
+		// Failed-profile rows are still machine identities. Preserve the same
+		// verified Fleet stamps as successful registrations so a failure cannot
+		// strip an existing cloud binding or create an unbound cloud row.
+		if cloudInstanceID != "" {
+			failedMetadata["cloud_instance_id"] = cloudInstanceID
+		}
+		if cloudInstanceRecordID != "" {
+			failedMetadata["cloud_instance_record_id"] = cloudInstanceRecordID
+		}
+		metadata, _ := json.Marshal(failedMetadata)
 		prow, err := h.Queries.UpsertAgentRuntimeWithProfile(r.Context(), db.UpsertAgentRuntimeWithProfileParams{
-			WorkspaceID: wsUUID,
-			DaemonID:    strToText(req.DaemonID),
-			Name:        name,
-			RuntimeMode: "local",
-			Provider:    profile.ProtocolFamily,
-			Status:      "offline",
-			DeviceInfo:  deviceInfo,
-			Metadata:    metadata,
-			OwnerID:     ownerID,
-			ProfileID:   profileUUID,
+			WorkspaceID:          wsUUID,
+			DaemonID:             strToText(req.DaemonID),
+			Name:                 name,
+			RuntimeMode:          "local",
+			Provider:             profile.ProtocolFamily,
+			Status:               "offline",
+			DeviceInfo:           deviceInfo,
+			Metadata:             metadata,
+			OwnerID:              ownerID,
+			ProfileID:            profileUUID,
+			RequireCloudIdentity: requireCloudIdentity,
 		})
 		if err != nil {
 			slog.Warn("failed to record runtime profile registration failure",
@@ -662,21 +772,80 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// mergeLegacyRuntimes folds every runtime row keyed on a prior hostname-derived
-// daemon_id into the newly registered UUID-keyed row. For each legacy id the
-// lookup is case-insensitive and returns *all* matching rows — case-only drift
-// may have already minted duplicates historically (e.g. `Foo.local` AND
-// `foo.local` coexisting), and we need to consolidate every one of them, not
-// just the first. Per match we reassign agents and tasks, record the legacy
-// id on the new row for audit, then delete the stale row.
+type legacyRuntimeMergeBinding struct {
+	authPath              string
+	ownerID               pgtype.UUID
+	cloudInstanceID       string
+	cloudInstanceRecordID string
+}
+
+// legacyRuntimeMergeBindingForRequest derives the non-user-controlled
+// authority that a legacy merge must retain. legacy_daemon_ids is only a hint:
+// it never supplies ownership or machine identity.
+func legacyRuntimeMergeBindingForRequest(r *http.Request, registered db.AgentRuntime) (legacyRuntimeMergeBinding, bool) {
+	if !registered.OwnerID.Valid {
+		// A newly inserted MDT runtime has no owner continuity to prove. It may
+		// register normally, but cannot irreversibly absorb a legacy row.
+		return legacyRuntimeMergeBinding{}, false
+	}
+
+	binding := legacyRuntimeMergeBinding{
+		authPath: middleware.DaemonAuthPathFromContext(r.Context()),
+		ownerID:  registered.OwnerID,
+	}
+	registeredOwnerID := uuidToString(registered.OwnerID)
+
+	switch binding.authPath {
+	case middleware.DaemonAuthPathPAT, middleware.DaemonAuthPathJWT:
+		if requestUserID(r) == "" || requestUserID(r) != registeredOwnerID {
+			return legacyRuntimeMergeBinding{}, false
+		}
+	case middleware.DaemonAuthPathDaemonToken:
+		// An MDT proves only the newly registered daemon_id. It does not prove
+		// that an arbitrary client-supplied legacy_daemon_id belongs to the
+		// same machine, even when both rows have the same human owner.
+		return legacyRuntimeMergeBinding{}, false
+	case middleware.DaemonAuthPathCloudPAT:
+		if requestUserID(r) == "" || requestUserID(r) != registeredOwnerID {
+			return legacyRuntimeMergeBinding{}, false
+		}
+		binding.cloudInstanceID = middleware.CloudInstanceIDFromContext(r.Context())
+		binding.cloudInstanceRecordID = middleware.CloudInstanceRecordIDFromContext(r.Context())
+		// An irreversible merge uses the strongest Fleet binding. Older rows
+		// missing either stamp remain separate until explicitly repaired.
+		if binding.cloudInstanceID == "" || binding.cloudInstanceRecordID == "" {
+			return legacyRuntimeMergeBinding{}, false
+		}
+	default:
+		return legacyRuntimeMergeBinding{}, false
+	}
+	return binding, true
+}
+
+// mergeLegacyRuntimes folds eligible rows keyed on a prior hostname-derived
+// daemon_id into the newly registered UUID-keyed row. Eligibility is enforced
+// by FindMergeableLegacyRuntimesByDaemonID while both target and candidate are
+// locked: same non-null owner, workspace, built-in provider, authenticated
+// target daemon, and either an unstamped local↔local transition or exact
+// server-stamped cloud instance continuity.
 //
-// Scoping by (workspace_id, provider) is sufficient since provider is single-
-// runtime-per-daemon; `unique (workspace_id, daemon_id, provider)` prevents
-// any two *exact* matches but the `LOWER(...)` comparison crosses that bound
-// precisely when case-duplicate rows exist — which is the bug we're fixing.
-// We also dedupe across legacy ids so overlapping candidates (e.g. `foo` and
-// `foo.local` both resolving to the same stored row) don't double-process.
+// The whole merge is one transaction. Reassigning agents without tasks (or
+// deleting the old runtime before recording its trace) would be worse than
+// leaving both rows intact, so any failure rolls every candidate back.
 func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntime, provider string, legacyIDs []string) {
+	binding, ok := legacyRuntimeMergeBindingForRequest(r, registered)
+	if !ok || !registered.DaemonID.Valid || registered.Provider != provider {
+		return
+	}
+
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		slog.Warn("legacy runtime merge: begin transaction failed", "new_runtime_id", uuidToString(registered.ID), "error", err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
 	newID := uuidToString(registered.ID)
 	merged := make(map[string]struct{})
 
@@ -686,14 +855,18 @@ func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntim
 			continue
 		}
 
-		matches, err := h.Queries.FindLegacyRuntimesByDaemonID(r.Context(), db.FindLegacyRuntimesByDaemonIDParams{
-			WorkspaceID: registered.WorkspaceID,
-			Provider:    provider,
-			DaemonID:    legacyID,
+		matches, err := qtx.FindMergeableLegacyRuntimesByDaemonID(r.Context(), db.FindMergeableLegacyRuntimesByDaemonIDParams{
+			NewRuntimeID:          registered.ID,
+			NewDaemonID:           strToText(registered.DaemonID.String),
+			AuthenticatedOwnerID:  binding.ownerID,
+			DaemonID:              legacyID,
+			AuthPath:              binding.authPath,
+			CloudInstanceID:       binding.cloudInstanceID,
+			CloudInstanceRecordID: binding.cloudInstanceRecordID,
 		})
 		if err != nil {
 			slog.Warn("legacy runtime merge: lookup failed", "legacy_daemon_id", legacyID, "error", err)
-			continue
+			return
 		}
 		for _, old := range matches {
 			oldID := uuidToString(old.ID)
@@ -703,34 +876,34 @@ func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntim
 			if _, seen := merged[oldID]; seen {
 				continue
 			}
-			merged[oldID] = struct{}{}
-
-			agents, err := h.Queries.ReassignAgentsToRuntime(r.Context(), db.ReassignAgentsToRuntimeParams{
+			agents, err := qtx.ReassignAgentsToRuntime(r.Context(), db.ReassignAgentsToRuntimeParams{
 				NewRuntimeID: registered.ID,
 				OldRuntimeID: old.ID,
 			})
 			if err != nil {
 				slog.Warn("legacy runtime merge: reassign agents failed", "legacy_daemon_id", legacyID, "old_runtime_id", oldID, "new_runtime_id", newID, "error", err)
-				continue
+				return
 			}
-			tasks, err := h.Queries.ReassignTasksToRuntime(r.Context(), db.ReassignTasksToRuntimeParams{
+			tasks, err := qtx.ReassignTasksToRuntime(r.Context(), db.ReassignTasksToRuntimeParams{
 				NewRuntimeID: registered.ID,
 				OldRuntimeID: old.ID,
 			})
 			if err != nil {
 				slog.Warn("legacy runtime merge: reassign tasks failed", "legacy_daemon_id", legacyID, "old_runtime_id", oldID, "new_runtime_id", newID, "error", err)
-				continue
+				return
 			}
-			if err := h.Queries.RecordRuntimeLegacyDaemonID(r.Context(), db.RecordRuntimeLegacyDaemonIDParams{
+			if err := qtx.RecordRuntimeLegacyDaemonID(r.Context(), db.RecordRuntimeLegacyDaemonIDParams{
 				ID:             registered.ID,
 				LegacyDaemonID: strToText(legacyID),
 			}); err != nil {
 				slog.Warn("legacy runtime merge: record legacy daemon_id failed", "legacy_daemon_id", legacyID, "error", err)
+				return
 			}
-			if err := h.Queries.DeleteAgentRuntime(r.Context(), old.ID); err != nil {
+			if err := qtx.DeleteAgentRuntime(r.Context(), old.ID); err != nil {
 				slog.Warn("legacy runtime merge: delete old runtime failed", "old_runtime_id", oldID, "error", err)
-				continue
+				return
 			}
+			merged[oldID] = struct{}{}
 
 			slog.Info("legacy runtime merged",
 				"legacy_daemon_id", legacyID,
@@ -741,6 +914,9 @@ func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntim
 				"tasks_reassigned", tasks,
 			)
 		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Warn("legacy runtime merge: commit failed", "new_runtime_id", newID, "error", err)
 	}
 }
 
@@ -790,8 +966,8 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 		}
 
 		wsID := uuidToString(rt.WorkspaceID)
-		if !h.verifyDaemonWorkspaceAccess(r, wsID) {
-			slog.Warn("deregister: workspace mismatch", "runtime_id", rid)
+		if !h.daemonRuntimeAccessAllowed(r, rt, "") {
+			slog.Warn("deregister: runtime identity mismatch", "runtime_id", rid)
 			continue
 		}
 
@@ -946,10 +1122,11 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wsCheckStart := time.Now()
-	wsOK := h.requireDaemonWorkspaceAccess(w, r, uuidToString(rt.WorkspaceID))
+	wsOK := h.daemonRuntimeAccessAllowed(r, rt, "")
 	workspaceCheckMs = time.Since(wsCheckStart).Milliseconds()
 	if !wsOK {
-		outcome = "workspace_denied"
+		outcome = "runtime_denied"
+		writeError(w, http.StatusNotFound, "runtime not found")
 		return
 	}
 	authMs = time.Since(start).Milliseconds()
@@ -1009,6 +1186,9 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 // errors still propagate as errors so they keep their existing Warn logging
 // and the daemon does not mistake a hiccup for a deletion.
 func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws.ClientIdentity, runtimeID string, supportsBatchImport bool) (*protocol.DaemonHeartbeatAckPayload, error) {
+	if !identity.AllowsRuntime(runtimeID) {
+		return nil, fmt.Errorf("runtime not in connection scope")
+	}
 	runtimeUUID, err := util.ParseUUID(runtimeID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid runtime_id: %w", err)
@@ -1025,10 +1205,51 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 		return nil, fmt.Errorf("get agent runtime: %w", err)
 	}
 	if !identity.AllowsWorkspace(uuidToString(rt.WorkspaceID)) {
-		return nil, fmt.Errorf("runtime not in connection workspace")
+		return daemonRuntimeGoneHeartbeat(runtimeID), nil
+	}
+
+	workspaceID := uuidToString(rt.WorkspaceID)
+	authorized := false
+	switch identity.AuthPath {
+	case middleware.DaemonAuthPathDaemonToken:
+		authorized = identity.DaemonID != "" &&
+			rt.DaemonID.Valid &&
+			rt.DaemonID.String == identity.DaemonID
+	case middleware.DaemonAuthPathPAT, middleware.DaemonAuthPathJWT:
+		if identity.UserID != "" &&
+			rt.OwnerID.Valid &&
+			uuidToString(rt.OwnerID) == identity.UserID {
+			if _, memberErr := h.getWorkspaceMember(ctx, identity.UserID, workspaceID); memberErr == nil {
+				authorized = true
+			} else if !isNotFound(memberErr) {
+				return nil, fmt.Errorf("revalidate websocket membership: %w", memberErr)
+			}
+		}
+	case middleware.DaemonAuthPathCloudPAT:
+		if identity.UserID != "" &&
+			rt.OwnerID.Valid &&
+			uuidToString(rt.OwnerID) == identity.UserID &&
+			cloudRuntimeIdentityMatchesValues(rt.Metadata, identity.CloudInstanceID, identity.CloudInstanceRecordID) {
+			if _, memberErr := h.getWorkspaceMember(ctx, identity.UserID, workspaceID); memberErr == nil {
+				authorized = true
+			} else if !isNotFound(memberErr) {
+				return nil, fmt.Errorf("revalidate websocket cloud membership: %w", memberErr)
+			}
+		}
+	}
+	if !authorized {
+		return daemonRuntimeGoneHeartbeat(runtimeID), nil
 	}
 	ack, _, err := h.processHeartbeat(ctx, rt, supportsBatchImport)
 	return ack, err
+}
+
+func daemonRuntimeGoneHeartbeat(runtimeID string) *protocol.DaemonHeartbeatAckPayload {
+	return &protocol.DaemonHeartbeatAckPayload{
+		RuntimeID:   runtimeID,
+		Status:      protocol.HeartbeatStatusRuntimeGone,
+		RuntimeGone: true,
+	}
 }
 
 // recordHeartbeat marks the runtime as alive. When LivenessStore is available
@@ -1463,14 +1684,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	runtimeByID := make(map[string]db.AgentRuntime, len(runtimes))
 	authorized := make([]pgtype.UUID, 0, len(runtimes))
 	for _, rt := range runtimes {
-		if !h.verifyDaemonWorkspaceAccess(r, uuidToString(rt.WorkspaceID)) {
-			continue
-		}
-		// Group-ownership check (mirrors the WS path, daemon_ws.go): a runtime
-		// bound to a different daemon must not be claimed by this one. Runtimes
-		// with a NULL daemon_id (e.g. cloud runtimes) are not machine-pinned, so
-		// they stay claimable — same tolerance as the WS handler.
-		if rt.DaemonID.Valid && rt.DaemonID.String != req.DaemonID {
+		if !h.daemonRuntimeAccessAllowed(r, rt, req.DaemonID) {
 			continue
 		}
 		runtimeByID[uuidToString(rt.ID)] = rt
@@ -1579,6 +1793,45 @@ type claimBuildFailure struct {
 	message string
 }
 
+// rawAgentConfigForClaim is the explicit execution-side counterpart to
+// agentToResponse. It reads the persisted secret-bearing fields without
+// applying any public projection because the authenticated daemon needs the
+// exact values to launch the agent. Keeping this path separate makes it
+// testable that response hardening never mutates runtime behavior.
+type rawAgentClaimConfig struct {
+	CustomEnv     map[string]string
+	CustomArgs    []string
+	McpConfig     json.RawMessage
+	RuntimeConfig json.RawMessage
+}
+
+func rawAgentConfigForClaim(agent db.Agent) rawAgentClaimConfig {
+	config := rawAgentClaimConfig{}
+	if agent.CustomEnv != nil {
+		if err := json.Unmarshal(agent.CustomEnv, &config.CustomEnv); err != nil {
+			slog.Warn("failed to unmarshal agent custom_env", "agent_id", uuidToString(agent.ID))
+		}
+	}
+	if agent.CustomArgs != nil {
+		if err := json.Unmarshal(agent.CustomArgs, &config.CustomArgs); err != nil {
+			slog.Warn("failed to unmarshal agent custom_args", "agent_id", uuidToString(agent.ID))
+		}
+	}
+	if agent.McpConfig != nil {
+		config.McpConfig = append(json.RawMessage(nil), agent.McpConfig...)
+	}
+	// runtime_config is stored as JSONB and may legitimately be the empty
+	// object `{}` for agents that have not opted into provider-specific
+	// tuning. Forward only non-empty payloads so daemon decoders treat
+	// absent-or-empty identically.
+	if rc := bytes.TrimSpace(agent.RuntimeConfig); len(rc) > 0 &&
+		!bytes.Equal(rc, []byte("{}")) &&
+		!bytes.Equal(rc, []byte("null")) {
+		config.RuntimeConfig = append(json.RawMessage(nil), agent.RuntimeConfig...)
+	}
+	return config
+}
+
 // buildClaimedTaskResponse assembles the full daemon claim payload for a
 // single already-claimed task and computes the exact comment ids embedded in
 // it (deliveredCommentIDs). Shared by the per-runtime handler
@@ -1601,22 +1854,8 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
 		useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
-		var customEnv map[string]string
-		if agent.CustomEnv != nil {
-			if err := json.Unmarshal(agent.CustomEnv, &customEnv); err != nil {
-				slog.Warn("failed to unmarshal agent custom_env", "agent_id", uuidToString(agent.ID), "error", err)
-			}
-		}
-		var customArgs []string
-		if agent.CustomArgs != nil {
-			if err := json.Unmarshal(agent.CustomArgs, &customArgs); err != nil {
-				slog.Warn("failed to unmarshal agent custom_args", "agent_id", uuidToString(agent.ID), "error", err)
-			}
-		}
-		var mcpConfig json.RawMessage
-		if agent.McpConfig != nil {
-			mcpConfig = json.RawMessage(agent.McpConfig)
-		}
+		rawConfig := rawAgentConfigForClaim(agent)
+		mcpConfig := rawConfig.McpConfig
 		// Layer the per-task overlay (set at enqueue from the initiator
 		// user's active integrations — currently Composio) on top of the
 		// agent's saved mcp_config. Overlay wins on server-name collisions
@@ -1630,25 +1869,17 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				mcpConfig = merged
 			}
 		}
-		// runtime_config is stored as JSONB and may legitimately be the
-		// empty object `{}` for agents that haven't opted into any
-		// provider-specific tuning. Forward only non-empty payloads so the
-		// daemon's per-provider decoders treat absent-or-empty identically.
-		var runtimeConfig json.RawMessage
-		if rc := bytes.TrimSpace(agent.RuntimeConfig); len(rc) > 0 && !bytes.Equal(rc, []byte("{}")) && !bytes.Equal(rc, []byte("null")) {
-			runtimeConfig = json.RawMessage(agent.RuntimeConfig)
-		}
 		resp.Agent = &TaskAgentData{
 			ID:                    uuidToString(agent.ID),
 			Name:                  agent.Name,
 			Instructions:          agent.Instructions,
-			CustomEnv:             customEnv,
-			CustomArgs:            customArgs,
+			CustomEnv:             rawConfig.CustomEnv,
+			CustomArgs:            rawConfig.CustomArgs,
 			McpConfig:             mcpConfig,
 			Model:                 agent.Model.String,
 			ThinkingLevel:         agent.ThinkingLevel.String,
 			ServiceTier:           agent.ServiceTier.String,
-			RuntimeConfig:         runtimeConfig,
+			RuntimeConfig:         rawConfig.RuntimeConfig,
 			DisabledRuntimeSkills: disabledRuntimeSkillsFor(agent.DisabledRuntimeSkills, runtimeID, runtime.Provider),
 		}
 		if useSkillRefs {
@@ -3619,7 +3850,12 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("fail task: failed to revoke task tokens", "task_id", uuidToString(task.ID), "error", err)
 	}
 
-	slog.Info("task failed", "task_id", taskID, "agent_id", uuidToString(task.AgentID), "task_error", req.Error, "failure_reason", req.FailureReason)
+	failureLogAttrs := []any{
+		"task_id", taskID,
+		"agent_id", uuidToString(task.AgentID),
+	}
+	failureLogAttrs = append(failureLogAttrs, redact.FailureLogAttrs(req.Error, req.FailureReason)...)
+	slog.Info("task failed", failureLogAttrs...)
 	writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
 }
 

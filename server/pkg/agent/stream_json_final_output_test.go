@@ -60,13 +60,14 @@ func TestStreamProtocolObservationDoesNotLogContent(t *testing.T) {
 		assistantSecret = "FIRST-TURN PRIVATE NARRATION"
 		resultSecret    = "FINAL PRIVATE RESULT"
 		baseURLSecret   = "https://provider.example/private"
+		modelSecret     = "model-private-sentinel"
 	)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	logStreamProtocolObservation(logger, streamProtocolObservation{
 		provider:                   "claude",
 		cliVersion:                 "2.1.5",
-		model:                      "glm-4.6",
+		model:                      modelSecret,
 		exitCode:                   0,
 		eventCount:                 7,
 		invalidEventCount:          1,
@@ -83,7 +84,7 @@ func TestStreamProtocolObservationDoesNotLogContent(t *testing.T) {
 	for _, required := range []string{
 		"provider=claude",
 		"cli_version=2.1.5",
-		"model=glm-4.6",
+		"has_model=true",
 		"exit_code=0",
 		"event_count=7",
 		"saw_result=true",
@@ -95,7 +96,7 @@ func TestStreamProtocolObservationDoesNotLogContent(t *testing.T) {
 			t.Errorf("observation log %q does not contain %q", got, required)
 		}
 	}
-	for _, forbidden := range []string{assistantSecret, resultSecret, baseURLSecret} {
+	for _, forbidden := range []string{assistantSecret, resultSecret, baseURLSecret, modelSecret} {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("observation log leaked %q: %q", forbidden, got)
 		}

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -31,6 +33,47 @@ import (
 // ---------------------------------------------------------------------------
 
 type RuntimeProfileResponse struct {
+	ID                string   `json:"id"`
+	WorkspaceID       string   `json:"workspace_id"`
+	DisplayName       string   `json:"display_name"`
+	ProtocolFamily    string   `json:"protocol_family"`
+	CommandName       string   `json:"command_name"`
+	Description       *string  `json:"description"`
+	FixedArgs         []string `json:"fixed_args"`
+	FixedArgsCount    int      `json:"fixed_args_count"`
+	FixedArgsRedacted bool     `json:"fixed_args_redacted"`
+	Visibility        string   `json:"visibility"`
+	CreatedBy         *string  `json:"created_by"`
+	Enabled           bool     `json:"enabled"`
+	CreatedAt         string   `json:"created_at"`
+	UpdatedAt         string   `json:"updated_at"`
+}
+
+func runtimeProfileToResponse(p db.RuntimeProfile) RuntimeProfileResponse {
+	args, valid := decodeRuntimeProfileFixedArgs(p.FixedArgs)
+	argCount := len(args)
+	return RuntimeProfileResponse{
+		ID:                uuidToString(p.ID),
+		WorkspaceID:       uuidToString(p.WorkspaceID),
+		DisplayName:       p.DisplayName,
+		ProtocolFamily:    p.ProtocolFamily,
+		CommandName:       p.CommandName,
+		Description:       textToPtr(p.Description),
+		FixedArgs:         []string{},
+		FixedArgsCount:    argCount,
+		FixedArgsRedacted: !valid || argCount > 0,
+		Visibility:        p.Visibility,
+		CreatedBy:         uuidToPtr(p.CreatedBy),
+		Enabled:           p.Enabled,
+		CreatedAt:         timestampToString(p.CreatedAt),
+		UpdatedAt:         timestampToString(p.UpdatedAt),
+	}
+}
+
+// DaemonRuntimeProfileResponse is intentionally separate from the public
+// response. Daemons need the exact fixed argv to launch a profile; generic
+// API/CLI/UI callers receive only count/redacted metadata.
+type DaemonRuntimeProfileResponse struct {
 	ID             string   `json:"id"`
 	WorkspaceID    string   `json:"workspace_id"`
 	DisplayName    string   `json:"display_name"`
@@ -39,21 +82,12 @@ type RuntimeProfileResponse struct {
 	Description    *string  `json:"description"`
 	FixedArgs      []string `json:"fixed_args"`
 	Visibility     string   `json:"visibility"`
-	CreatedBy      *string  `json:"created_by"`
 	Enabled        bool     `json:"enabled"`
-	CreatedAt      string   `json:"created_at"`
-	UpdatedAt      string   `json:"updated_at"`
 }
 
-func runtimeProfileToResponse(p db.RuntimeProfile) RuntimeProfileResponse {
-	args := []string{}
-	if len(p.FixedArgs) > 0 {
-		_ = json.Unmarshal(p.FixedArgs, &args)
-		if args == nil {
-			args = []string{}
-		}
-	}
-	return RuntimeProfileResponse{
+func runtimeProfileToDaemonResponse(p db.RuntimeProfile) DaemonRuntimeProfileResponse {
+	args, _ := decodeRuntimeProfileFixedArgs(p.FixedArgs)
+	return DaemonRuntimeProfileResponse{
 		ID:             uuidToString(p.ID),
 		WorkspaceID:    uuidToString(p.WorkspaceID),
 		DisplayName:    p.DisplayName,
@@ -62,11 +96,19 @@ func runtimeProfileToResponse(p db.RuntimeProfile) RuntimeProfileResponse {
 		Description:    textToPtr(p.Description),
 		FixedArgs:      args,
 		Visibility:     p.Visibility,
-		CreatedBy:      uuidToPtr(p.CreatedBy),
 		Enabled:        p.Enabled,
-		CreatedAt:      timestampToString(p.CreatedAt),
-		UpdatedAt:      timestampToString(p.UpdatedAt),
 	}
+}
+
+func decodeRuntimeProfileFixedArgs(raw []byte) ([]string, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return []string{}, true
+	}
+	var args []string
+	if err := json.Unmarshal(raw, &args); err != nil || args == nil {
+		return []string{}, false
+	}
+	return args, true
 }
 
 // NOTE: runtime_profile.visibility is intentionally NOT user-settable in v1.
@@ -252,11 +294,12 @@ func (h *Handler) GetRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateRuntimeProfileRequest struct {
-	DisplayName *string   `json:"display_name"`
-	CommandName *string   `json:"command_name"`
-	Description *string   `json:"description"`
-	FixedArgs   *[]string `json:"fixed_args"`
-	Enabled     *bool     `json:"enabled"`
+	DisplayName     *string   `json:"display_name"`
+	CommandName     *string   `json:"command_name"`
+	Description     *string   `json:"description"`
+	FixedArgs       *[]string `json:"fixed_args"`
+	FixedArgsIntent string    `json:"fixed_args_intent"`
+	Enabled         *bool     `json:"enabled"`
 }
 
 // UpdateRuntimeProfile applies a partial update. protocol_family is immutable
@@ -278,8 +321,31 @@ func (h *Handler) UpdateRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req updateRuntimeProfileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	rawFields, err := decodeJSONBodyWithRawFields(r.Body, &req)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	fixedArgsIntent, hasFixedArgsIntent, err := decodeHiddenMutationIntent(rawFields, "fixed_args_intent")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if hasFixedArgsIntent && req.FixedArgs == nil {
+		writeError(w, http.StatusBadRequest, "fixed_args_intent requires fixed_args")
+		return
+	}
+
+	existing, err := h.Queries.GetRuntimeProfileForWorkspace(r.Context(), db.GetRuntimeProfileForWorkspaceParams{
+		ID:          profileUUID,
+		WorkspaceID: wsUUID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "runtime profile not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load runtime profile")
 		return
 	}
 
@@ -304,12 +370,41 @@ func (h *Handler) UpdateRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 		params.Description = ptrToText(req.Description)
 	}
 	if req.FixedArgs != nil {
-		fixedArgs, err := marshalFixedArgs(*req.FixedArgs)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
+		switch fixedArgsIntent {
+		case hiddenMutationIntentReplace:
+			if len(*req.FixedArgs) == 0 {
+				writeError(w, http.StatusBadRequest, "fixed_args replace intent requires a non-empty replacement; use clear intent to remove hidden arguments")
+				return
+			}
+			fixedArgs, err := marshalFixedArgs(*req.FixedArgs)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			params.FixedArgs = fixedArgs
+		case hiddenMutationIntentClear:
+			if len(*req.FixedArgs) != 0 {
+				writeError(w, http.StatusBadRequest, "fixed_args clear intent requires an empty fixed_args list")
+				return
+			}
+			params.FixedArgs = []byte("[]")
+		default:
+			if storedJSONArrayHasValues(existing.FixedArgs) {
+				if len(*req.FixedArgs) > 0 {
+					writeError(w, http.StatusConflict, "fixed_args are hidden; retry with fixed_args_intent=\"replace\" or \"clear\"")
+					return
+				}
+				// Preserve an empty public placeholder from a full profile
+				// replay. It is not authority to delete the stored argv.
+			} else {
+				fixedArgs, err := marshalFixedArgs(*req.FixedArgs)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				params.FixedArgs = fixedArgs
+			}
 		}
-		params.FixedArgs = fixedArgs
 	}
 	if req.Enabled != nil {
 		params.Enabled = pgtype.Bool{Bool: *req.Enabled, Valid: true}
@@ -528,7 +623,7 @@ func (h *Handler) DeleteRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 // gated by the router.
 func (h *Handler) DaemonListRuntimeProfiles(w http.ResponseWriter, r *http.Request) {
 	workspaceID := strings.TrimSpace(chi.URLParam(r, "workspaceId"))
-	if !h.requireDaemonWorkspaceAccess(w, r, workspaceID) {
+	if !h.requireDaemonRuntimeProfileAccess(w, r, workspaceID) {
 		return
 	}
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
@@ -541,14 +636,75 @@ func (h *Handler) DaemonListRuntimeProfiles(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "failed to list runtime profiles")
 		return
 	}
-	resp := make([]RuntimeProfileResponse, len(profiles))
+	resp := make([]DaemonRuntimeProfileResponse, len(profiles))
 	for i, p := range profiles {
-		resp[i] = runtimeProfileToResponse(p)
+		resp[i] = runtimeProfileToDaemonResponse(p)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"workspace_id":     workspaceID,
 		"runtime_profiles": resp,
 	})
+}
+
+// requireDaemonRuntimeProfileAccess protects the only workspace-level daemon
+// endpoint that returns raw launch arguments. Workspace membership or a
+// caller-supplied daemon ID is insufficient: PAT/JWT callers must be workspace
+// owner/admin. Machine credentials must prove an exact server-verified binding
+// (mdt_ workspace+daemon, mcn_ owner+daemon+both Fleet stamps).
+func (h *Handler) requireDaemonRuntimeProfileAccess(w http.ResponseWriter, r *http.Request, workspaceID string) bool {
+	if !h.requireDaemonWorkspaceAccess(w, r, workspaceID) {
+		return false
+	}
+	switch middleware.DaemonAuthPathFromContext(r.Context()) {
+	case middleware.DaemonAuthPathDaemonToken:
+		if middleware.DaemonIDFromContext(r.Context()) == "" {
+			writeError(w, http.StatusForbidden, "daemon identity required")
+			return false
+		}
+		return true
+	}
+
+	userID := requestUserID(r)
+	member, err := h.getWorkspaceMember(r.Context(), userID, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not found")
+		return false
+	}
+	authPath := middleware.DaemonAuthPathFromContext(r.Context())
+	if authPath == middleware.DaemonAuthPathPAT || authPath == middleware.DaemonAuthPathJWT {
+		if !roleAllowed(member.Role, "owner", "admin") {
+			writeError(w, http.StatusForbidden, "owner or admin role required")
+			return false
+		}
+		return true
+	}
+	if authPath != middleware.DaemonAuthPathCloudPAT {
+		writeError(w, http.StatusForbidden, "verified daemon identity required")
+		return false
+	}
+
+	daemonID := strings.TrimSpace(r.Header.Get("X-Multica-Daemon-ID"))
+	if daemonID == "" {
+		writeError(w, http.StatusForbidden, "daemon identity required")
+		return false
+	}
+	runtimes, err := h.Queries.ListAgentRuntimesByOwner(r.Context(), db.ListAgentRuntimesByOwnerParams{
+		WorkspaceID: parseUUID(workspaceID),
+		OwnerID:     parseUUID(userID),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to authorize daemon")
+		return false
+	}
+	for _, runtime := range runtimes {
+		if runtime.DaemonID.Valid &&
+			runtime.DaemonID.String == daemonID &&
+			(authPath != middleware.DaemonAuthPathCloudPAT || cloudRuntimeInstanceMatches(r, runtime.Metadata)) {
+			return true
+		}
+	}
+	writeError(w, http.StatusForbidden, "daemon does not own a runtime in this workspace")
+	return false
 }
 
 func (h *Handler) requestDaemonRuntimeProfileRefresh(workspaceID, profileID string) {

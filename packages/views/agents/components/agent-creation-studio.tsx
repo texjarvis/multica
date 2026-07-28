@@ -14,7 +14,11 @@ import {
   Search,
 } from "lucide-react";
 import { toast } from "sonner";
-import { api, ApiError } from "@multica/core/api";
+import {
+  api,
+  ApiError,
+  CommittedResponseUnreadableError,
+} from "@multica/core/api";
 import { useAuthStore } from "@multica/core/auth";
 import {
   agentTemplateDetailOptions,
@@ -183,10 +187,13 @@ export function AgentCreationStudio() {
   const [selectedTemplate, setSelectedTemplate] = useState<AgentTemplateSummary | null>(null);
   const [templateSearch, setTemplateSearch] = useState("");
   const [creating, setCreating] = useState(false);
+  const [creationOutcomeUncertain, setCreationOutcomeUncertain] =
+    useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [builderSessionId, setBuilderSessionId] = useState("");
   const [builderStarting, setBuilderStarting] = useState(false);
+  const [builderOutcomeUncertain, setBuilderOutcomeUncertain] = useState(false);
   const [builderClosing, setBuilderClosing] = useState(false);
   const [builderSwitchingRuntime, setBuilderSwitchingRuntime] = useState(false);
   const [builderError, setBuilderError] = useState<string | null>(null);
@@ -421,7 +428,8 @@ export function AgentCreationStudio() {
     selectedRuntime != null &&
     isRuntimeUsableForUser(selectedRuntime, currentUser?.id ?? null) &&
     !accessInvalid &&
-    !creating;
+    !creating &&
+    !creationOutcomeUncertain;
   const currentModeLabel =
     mode === "choose"
       ? t(($) => $.creation_studio.step_choose)
@@ -513,7 +521,13 @@ export function AgentCreationStudio() {
   };
 
   const startBuilder = async () => {
-    if (!selectedRuntime || selectedRuntime.status !== "online") return;
+    if (
+      !selectedRuntime ||
+      selectedRuntime.status !== "online" ||
+      builderOutcomeUncertain
+    ) {
+      return;
+    }
     setBuilderStarting(true);
     setBuilderError(null);
     try {
@@ -525,6 +539,12 @@ export function AgentCreationStudio() {
       setTransitionDirection(1);
       setBuilderSessionId(session.session_id);
     } catch (error) {
+      if (error instanceof CommittedResponseUnreadableError) {
+        // The hidden builder session may already exist, but the response did
+        // not provide a trustworthy id. Do not offer a retry that could create
+        // another session; the value-free error tells the user to refresh.
+        setBuilderOutcomeUncertain(true);
+      }
       setBuilderError(
         error instanceof Error ? error.message : t(($) => $.creation_studio.builder.start_failed),
       );
@@ -740,6 +760,17 @@ export function AgentCreationStudio() {
       toast.success(t(($) => $.creation_studio.created, { name: agent.name || draft.name.trim() }));
       navigation.push(squadId ? paths.squadDetail(squadId) : paths.agentDetail(agent.id));
     } catch (error) {
+      if (error instanceof CommittedResponseUnreadableError) {
+        // The server returned success, so the row may already exist. Refresh
+        // the catalog and keep this form's submit disabled; enabling an
+        // immediate retry could create a duplicate agent.
+        void qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
+        setNameError(null);
+        setFormError(error.message);
+        setCreating(false);
+        setCreationOutcomeUncertain(true);
+        return;
+      }
       const nextErrors = classifyAgentCreateError(
         error,
         t(($) => $.creation_studio.create_failed),
@@ -896,6 +927,7 @@ export function AgentCreationStudio() {
           currentUserId={currentUser?.id ?? null}
           selectedRuntime={selectedRuntime}
           starting={builderStarting}
+          outcomeUncertain={builderOutcomeUncertain}
           error={builderError}
           onStart={startBuilder}
           onConnectRuntime={() => navigation.push(paths.runtimes())}
@@ -1472,10 +1504,10 @@ function DraftFieldRow({
   );
 }
 
-function BuilderSetup({ draft, onChange, runtimes, runtimesLoading, members, currentUserId, selectedRuntime, starting, error, onStart, onConnectRuntime }: { draft: AgentDraft; onChange: (draft: AgentDraft) => void; runtimes: RuntimeDevice[]; runtimesLoading: boolean; members: MemberWithUser[]; currentUserId: string | null; selectedRuntime: RuntimeDevice | null; starting: boolean; error: string | null; onStart: () => void; onConnectRuntime: () => void; }) {
+function BuilderSetup({ draft, onChange, runtimes, runtimesLoading, members, currentUserId, selectedRuntime, starting, outcomeUncertain, error, onStart, onConnectRuntime }: { draft: AgentDraft; onChange: (draft: AgentDraft) => void; runtimes: RuntimeDevice[]; runtimesLoading: boolean; members: MemberWithUser[]; currentUserId: string | null; selectedRuntime: RuntimeDevice | null; starting: boolean; outcomeUncertain: boolean; error: string | null; onStart: () => void; onConnectRuntime: () => void; }) {
   const { t } = useT("agents");
   const hasOnline = runtimes.some((runtime) => runtime.status === "online" && isRuntimeUsableForUser(runtime, currentUserId));
-  return <main className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-10"><div className="w-full max-w-xl rounded-xl border bg-card p-6 shadow-sm"><span className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary"><MessageSquare className="size-5" /></span><h2 className="mt-5 text-xl font-semibold">{t(($) => $.creation_studio.builder.setup_title)}</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">{t(($) => $.creation_studio.builder.setup_description)}</p><div className="mt-6 space-y-4"><RuntimePicker runtimes={runtimes} runtimesLoading={runtimesLoading} members={members} currentUserId={currentUserId} selectedRuntimeId={draft.runtimeId} onSelect={(runtimeId) => { if (runtimeId !== draft.runtimeId) onChange({ ...draft, runtimeId, model: "" }); }} /><ModelDropdown runtimeId={selectedRuntime?.id ?? null} runtimeOnline={selectedRuntime?.status === "online"} value={draft.model} onChange={(model) => onChange({ ...draft, model })} disabled={!selectedRuntime} /></div>{error && <div role="alert" className="mt-4 text-sm text-destructive">{error}</div>}<div className="mt-6 flex justify-end">{hasOnline ? <Button onClick={onStart} disabled={starting || selectedRuntime?.status !== "online"}>{starting && <Loader2 className="size-4 animate-spin" />}{t(($) => $.creation_studio.builder.start)}</Button> : <Button onClick={onConnectRuntime}>{t(($) => $.creation_studio.builder.connect_runtime)}</Button>}</div></div></main>;
+  return <main className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-10"><div className="w-full max-w-xl rounded-xl border bg-card p-6 shadow-sm"><span className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary"><MessageSquare className="size-5" /></span><h2 className="mt-5 text-xl font-semibold">{t(($) => $.creation_studio.builder.setup_title)}</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">{t(($) => $.creation_studio.builder.setup_description)}</p><div className="mt-6 space-y-4"><RuntimePicker runtimes={runtimes} runtimesLoading={runtimesLoading} members={members} currentUserId={currentUserId} selectedRuntimeId={draft.runtimeId} onSelect={(runtimeId) => { if (runtimeId !== draft.runtimeId) onChange({ ...draft, runtimeId, model: "" }); }} /><ModelDropdown runtimeId={selectedRuntime?.id ?? null} runtimeOnline={selectedRuntime?.status === "online"} value={draft.model} onChange={(model) => onChange({ ...draft, model })} disabled={!selectedRuntime} /></div>{error && <div role="alert" className="mt-4 text-sm text-destructive">{error}</div>}<div className="mt-6 flex justify-end">{hasOnline ? <Button onClick={onStart} disabled={starting || outcomeUncertain || selectedRuntime?.status !== "online"}>{starting && <Loader2 className="size-4 animate-spin" />}{t(($) => $.creation_studio.builder.start)}</Button> : <Button onClick={onConnectRuntime}>{t(($) => $.creation_studio.builder.connect_runtime)}</Button>}</div></div></main>;
 }
 
 function BuilderConversation({

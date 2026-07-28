@@ -43,6 +43,27 @@ type AgentEnvResponse struct {
 	CustomEnv map[string]string `json:"custom_env"`
 }
 
+// AgentEnvUpdateResponse confirms a successful replacement without echoing
+// the submitted values. It is intentionally a different DTO from the
+// plaintext GET response: write acknowledgements commonly flow through CLI
+// output, browser caches, traces, and logs where secret values do not belong.
+// Key names and the deterministic change summary remain available so clients
+// can reconcile their local form without issuing a second audited reveal.
+type AgentEnvUpdateResponse struct {
+	AgentID string `json:"agent_id"`
+	// CustomEnv is a rolling-compatibility bridge for clients that still
+	// reconcile PUT responses from this field. It contains every retained key
+	// but only the public sentinel, never a submitted or persisted value.
+	CustomEnv         map[string]string `json:"custom_env"`
+	HasCustomEnv      bool              `json:"has_custom_env"`
+	CustomEnvKeyCount int               `json:"custom_env_key_count"`
+	CustomEnvKeys     []string          `json:"custom_env_keys"`
+	AddedKeys         []string          `json:"added_keys"`
+	RemovedKeys       []string          `json:"removed_keys"`
+	ChangedKeys       []string          `json:"changed_keys"`
+	PreservedKeys     []string          `json:"preserved_keys"`
+}
+
 // UpdateAgentEnvRequest is the wire shape for `PUT
 // /api/agents/{id}/env`. Only `custom_env` is accepted — fewer
 // surfaces, less to misuse.
@@ -64,6 +85,14 @@ type UpdateAgentEnvRequest struct {
 // Returns the loaded agent and the authenticated member on success.
 // All non-2xx branches write their own response and return ok=false.
 func (h *Handler) authorizeAgentEnv(w http.ResponseWriter, r *http.Request) (db.Agent, db.Member, bool) {
+	switch r.Header.Get("X-Actor-Source") {
+	case "task_token", "cloud_pat":
+		// Check the authoritative machine source before loading the target so
+		// direct/shared handler use retains both the human-only contract and
+		// agent-existence hiding, independent of router wiring.
+		writeError(w, http.StatusForbidden, "machine actors may not access env management endpoints")
+		return db.Agent{}, db.Member{}, false
+	}
 	agentID := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, agentID)
 	if !ok {
@@ -196,14 +225,7 @@ func (h *Handler) UpdateAgentEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditDetails := map[string]any{
-		"agent_id":       uuidToString(agent.ID),
-		"agent_name":     agent.Name,
-		"added_keys":     audit.added,
-		"removed_keys":   audit.removed,
-		"changed_keys":   audit.changed,
-		"preserved_keys": audit.preserved,
-	}
+	auditDetails := newAgentEnvAuditDetails(uuidToString(agent.ID), agent.Name, audit)
 	details, _ := json.Marshal(auditDetails)
 	if _, err := qtx.CreateActivity(r.Context(), db.CreateActivityParams{
 		WorkspaceID: agent.WorkspaceID,
@@ -240,10 +262,37 @@ func (h *Handler) UpdateAgentEnv(w http.ResponseWriter, r *http.Request) {
 	workspaceID := uuidToString(updated.WorkspaceID)
 	h.publish(protocol.EventAgentStatus, workspaceID, "member", uuidToString(member.UserID), map[string]any{"agent": broadcastAgentResponse(resp)})
 
-	writeJSON(w, http.StatusOK, AgentEnvResponse{
-		AgentID:   uuidToString(updated.ID),
-		CustomEnv: merged,
-	})
+	writeJSON(w, http.StatusOK, newAgentEnvUpdateResponse(uuidToString(updated.ID), merged, audit))
+}
+
+func newAgentEnvUpdateResponse(agentID string, merged map[string]string, audit envAudit) AgentEnvUpdateResponse {
+	finalKeys := sortedKeys(merged)
+	maskedEnv := make(map[string]string, len(finalKeys))
+	for _, key := range finalKeys {
+		maskedEnv[key] = envSentinel
+	}
+	return AgentEnvUpdateResponse{
+		AgentID:           agentID,
+		CustomEnv:         maskedEnv,
+		HasCustomEnv:      len(finalKeys) > 0,
+		CustomEnvKeyCount: len(finalKeys),
+		CustomEnvKeys:     finalKeys,
+		AddedKeys:         audit.added,
+		RemovedKeys:       audit.removed,
+		ChangedKeys:       audit.changed,
+		PreservedKeys:     audit.preserved,
+	}
+}
+
+func newAgentEnvAuditDetails(agentID, agentName string, audit envAudit) map[string]any {
+	return map[string]any{
+		"agent_id":       agentID,
+		"agent_name":     agentName,
+		"added_keys":     audit.added,
+		"removed_keys":   audit.removed,
+		"changed_keys":   audit.changed,
+		"preserved_keys": audit.preserved,
+	}
 }
 
 // envAudit summarises the diff between an agent's existing env and the

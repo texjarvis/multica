@@ -6,6 +6,7 @@ import type {
   Agent,
   AgentRuntime,
   MemberWithUser,
+  UpdateAgentRequest,
 } from "@multica/core/types";
 import { providerSupportsMcpConfig } from "@multica/core/agents";
 import { useFeatureEnabled } from "@multica/core/config";
@@ -122,7 +123,7 @@ interface AgentOverviewPaneProps {
   owner: MemberWithUser | null;
   runtimes: AgentRuntime[];
   members: MemberWithUser[];
-  onUpdate: (id: string, data: Record<string, unknown>) => Promise<void>;
+  onUpdate: (id: string, data: UpdateAgentRequest) => Promise<void>;
   currentUserId?: string | null;
   canEdit: boolean;
   navIntent?: DetailTab | null;
@@ -420,6 +421,7 @@ export function AgentOverviewPane({
                       runtime={runtime}
                       onSave={(updates) => onUpdate(agent.id, updates)}
                       onDirtyChange={setActiveDirty}
+                      canManage={canEdit}
                     />
                   )}
                   {effectiveView === "composio_mcp" && (
@@ -457,6 +459,7 @@ export function AgentOverviewPane({
                       runtimeDevice={runtime ?? undefined}
                       onSave={(updates) => onUpdate(agent.id, updates)}
                       onDirtyChange={setActiveDirty}
+                      canManage={canEdit}
                     />
                   )}
                   {effectiveView === "runtime_config" && (
@@ -464,6 +467,7 @@ export function AgentOverviewPane({
                       agent={agent}
                       onSave={(updates) => onUpdate(agent.id, updates)}
                       onDirtyChange={setActiveDirty}
+                      canManage={canEdit}
                     />
                   )}
                 </div>

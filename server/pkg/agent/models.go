@@ -1374,7 +1374,7 @@ func discoverGrokModels(ctx context.Context, executablePath string) ([]Model, er
 	})
 	if err != nil || len(models) == 0 {
 		if err != nil {
-			slog.Debug("grok model discovery fell back to static catalog", "error", err)
+			slog.Debug("grok model discovery fell back to static catalog", "has_error", true)
 		}
 		return grokStaticModels(), nil
 	}

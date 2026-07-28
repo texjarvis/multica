@@ -103,7 +103,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	logAgentCommand(b.cfg.Logger, execPath, args)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -132,7 +132,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		return nil, fmt.Errorf("start codebuddy: %w", err)
 	}
 
-	b.cfg.Logger.Info("codebuddy started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "codebuddy", cmd.Process.Pid, opts)
 
 	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
@@ -412,12 +412,12 @@ func (b *codebuddyBackend) handleControlRequest(msg codebuddySDKMessage, stdin i
 
 	data, err := json.Marshal(response)
 	if err != nil {
-		b.cfg.Logger.Warn("codebuddy: failed to marshal control response", "error", err)
+		b.cfg.Logger.Warn("codebuddy: failed to marshal control response", "has_error", true)
 		return
 	}
 	data = append(data, '\n')
 	if _, err := stdin.Write(data); err != nil {
-		b.cfg.Logger.Warn("codebuddy: failed to write control response", "error", err)
+		b.cfg.Logger.Warn("codebuddy: failed to write control response", "has_error", true)
 	}
 }
 

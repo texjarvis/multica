@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -132,10 +134,9 @@ func TestCloudPATVerifier_VerifyEmptyToken(t *testing.T) {
 	}
 }
 
-// TestCloudPATVerifier_InvalidReasons walks every documented reason
-// for a valid=false response and confirms each maps onto
-// CloudPATInvalidError + matches errors.Is(ErrCloudPATInvalid). The
-// reason string itself is preserved on the typed error for logging.
+// TestCloudPATVerifier_InvalidReasons walks several upstream reasons and
+// confirms each maps onto a generic invalid error. Fleet reason text is
+// untrusted and must not cross into our errors or logs.
 func TestCloudPATVerifier_InvalidReasons(t *testing.T) {
 	reasons := []string{
 		"format_invalid",
@@ -161,10 +162,35 @@ func TestCloudPATVerifier_InvalidReasons(t *testing.T) {
 			if !errors.As(err, &typed) {
 				t.Fatalf("expected *CloudPATInvalidError, got %T", err)
 			}
-			if typed.Reason != reason {
-				t.Errorf("expected Reason=%q, got %q", reason, typed.Reason)
+			if typed.Reason != "" {
+				t.Errorf("Fleet reason crossed trust boundary: %q", typed.Reason)
+			}
+			if strings.Contains(err.Error(), reason) {
+				t.Errorf("error leaked Fleet reason %q: %v", reason, err)
 			}
 		})
+	}
+}
+
+func TestCloudPATVerifier_Non200BodyIsNeverLogged(t *testing.T) {
+	const sentinel = "fleet-secret-error-body"
+	srv := newFleetServer(t, fleetServerOpts{
+		statusCode: http.StatusInternalServerError,
+		body:       sentinel,
+	})
+	defer srv.Close()
+
+	original := slog.Default()
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	v := NewCloudPATVerifier(CloudPATVerifierConfig{FleetBaseURL: srv.URL})
+	if _, err := v.Verify(context.Background(), "mcn_x", nil); !errors.Is(err, ErrCloudPATUnavailable) {
+		t.Fatalf("expected ErrCloudPATUnavailable, got %v", err)
+	}
+	if strings.Contains(logs.String(), sentinel) {
+		t.Fatalf("non-200 response body leaked to logs: %s", logs.String())
 	}
 }
 
@@ -230,6 +256,36 @@ func TestCloudPATVerifier_ValidTrueWithoutOwnerIDFailsClosed(t *testing.T) {
 	_, err := v.Verify(context.Background(), "mcn_x", nil)
 	if !errors.Is(err, ErrCloudPATUnavailable) {
 		t.Fatalf("expected ErrCloudPATUnavailable for valid:true without owner_id, got %v", err)
+	}
+}
+
+func TestCloudPATVerifier_ValidTrueRequiresCompleteMachineIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing instance id",
+			body: `{"valid":true,"owner_id":"01972f7e-7e8d-77ef-a13d-1b0ce3e9c001","instance_record_id":"record-1"}`,
+		},
+		{
+			name: "missing instance record id",
+			body: `{"valid":true,"owner_id":"01972f7e-7e8d-77ef-a13d-1b0ce3e9c001","instance_id":"instance-1"}`,
+		},
+		{
+			name: "whitespace identity",
+			body: `{"valid":true,"owner_id":"01972f7e-7e8d-77ef-a13d-1b0ce3e9c001","instance_id":" ","instance_record_id":"record-1"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFleetServer(t, fleetServerOpts{body: tc.body})
+			defer srv.Close()
+			v := NewCloudPATVerifier(CloudPATVerifierConfig{FleetBaseURL: srv.URL})
+			if _, err := v.Verify(context.Background(), "mcn_x", nil); !errors.Is(err, ErrCloudPATUnavailable) {
+				t.Fatalf("expected ErrCloudPATUnavailable, got %v", err)
+			}
+		})
 	}
 }
 
@@ -344,7 +400,6 @@ func TestCloudPATVerifier_NegativesNotCached(t *testing.T) {
 		t.Fatalf("negative result must not be cached; expected 2 fleet calls, got %d", got)
 	}
 }
-
 
 // TestCloudPATVerifier_LookupRejectsUnknownOwner pins the new
 // owner-existence guard. Cloud says the token is valid, but the

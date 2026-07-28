@@ -302,22 +302,56 @@ func (q *Queries) FailTasksForOfflineRuntimes(ctx context.Context) ([]AgentTaskQ
 	return items, nil
 }
 
-const findLegacyRuntimesByDaemonID = `-- name: FindLegacyRuntimesByDaemonID :many
-SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name FROM agent_runtime
-WHERE workspace_id = $1
-  AND provider = $2
-  AND LOWER(daemon_id) = LOWER($3)
+const findMergeableLegacyRuntimesByDaemonID = `-- name: FindMergeableLegacyRuntimesByDaemonID :many
+SELECT old.id, old.workspace_id, old.daemon_id, old.name, old.runtime_mode, old.provider, old.status, old.device_info, old.metadata, old.last_seen_at, old.created_at, old.updated_at, old.owner_id, old.legacy_daemon_id, old.visibility, old.profile_id, old.custom_name
+FROM agent_runtime AS old
+JOIN agent_runtime AS target ON target.id = $1
+WHERE old.id <> target.id
+  AND old.workspace_id = target.workspace_id
+  AND old.provider = target.provider
+  AND old.profile_id IS NULL
+  AND target.profile_id IS NULL
+  AND target.daemon_id = $2
+  AND target.owner_id = $3
+  AND old.owner_id = target.owner_id
+  AND LOWER(old.daemon_id) = LOWER($4)
+  AND (
+    (
+      $5::text IN ('pat', 'jwt')
+      AND NOT (
+        old.metadata ? 'cloud_instance_id'
+        OR old.metadata ? 'cloud_instance_record_id'
+        OR target.metadata ? 'cloud_instance_id'
+        OR target.metadata ? 'cloud_instance_record_id'
+      )
+    )
+    OR (
+      $5::text = 'cloud_pat'
+      AND $6::text <> ''
+      AND $7::text <> ''
+      AND old.metadata->>'cloud_instance_id' = $6
+      AND old.metadata->>'cloud_instance_record_id' = $7
+      AND target.metadata->>'cloud_instance_id' = $6
+      AND target.metadata->>'cloud_instance_record_id' = $7
+    )
+  )
+FOR UPDATE OF old, target
 `
 
-type FindLegacyRuntimesByDaemonIDParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	Provider    string      `json:"provider"`
-	DaemonID    string      `json:"daemon_id"`
+type FindMergeableLegacyRuntimesByDaemonIDParams struct {
+	NewRuntimeID          pgtype.UUID `json:"new_runtime_id"`
+	NewDaemonID           pgtype.Text `json:"new_daemon_id"`
+	AuthenticatedOwnerID  pgtype.UUID `json:"authenticated_owner_id"`
+	DaemonID              string      `json:"daemon_id"`
+	AuthPath              string      `json:"auth_path"`
+	CloudInstanceID       string      `json:"cloud_instance_id"`
+	CloudInstanceRecordID string      `json:"cloud_instance_record_id"`
 }
 
-// Looks up runtime rows keyed on a prior (hostname-derived) daemon_id. Used
-// at register-time to find rows owned by the same machine under its old
-// identity so agents/tasks can be re-pointed at the new UUID-keyed row.
+// Looks up and locks runtime rows keyed on a prior (hostname-derived)
+// daemon_id, but only when the authenticated registration target proves the
+// same owner and machine class. A client-supplied legacy_daemon_ids value is
+// not authority by itself.
 //
 // Comparison is case-insensitive because os.Hostname() has been observed to
 // return different casings on the same machine (e.g. `Jiayuans-MacBook-Pro`
@@ -329,9 +363,25 @@ type FindLegacyRuntimesByDaemonIDParams struct {
 // duplicate rows historically (e.g. `Foo.local` AND `foo.local` under the
 // same workspace+provider). A single-row lookup would consolidate only one
 // of them and leave the rest orphaned. Callers must merge every returned
-// row into the new UUID-keyed runtime.
-func (q *Queries) FindLegacyRuntimesByDaemonID(ctx context.Context, arg FindLegacyRuntimesByDaemonIDParams) ([]AgentRuntime, error) {
-	rows, err := q.db.Query(ctx, findLegacyRuntimesByDaemonID, arg.WorkspaceID, arg.Provider, arg.DaemonID)
+// row into the new UUID-keyed runtime inside the same transaction.
+//
+// The auth_path branch is deliberately closed:
+//   - PAT/JWT migrations require an unstamped local runtime on both sides.
+//     MDT credentials cannot prove continuity with a different daemon_id.
+//   - Cloud migrations require both server-stamped Fleet identities to match
+//     the verified cloud credential exactly.
+//   - Missing owners, unknown auth paths, cross-provider/profile matches, and
+//     local↔cloud transitions never qualify.
+func (q *Queries) FindMergeableLegacyRuntimesByDaemonID(ctx context.Context, arg FindMergeableLegacyRuntimesByDaemonIDParams) ([]AgentRuntime, error) {
+	rows, err := q.db.Query(ctx, findMergeableLegacyRuntimesByDaemonID,
+		arg.NewRuntimeID,
+		arg.NewDaemonID,
+		arg.AuthenticatedOwnerID,
+		arg.DaemonID,
+		arg.AuthPath,
+		arg.CloudInstanceID,
+		arg.CloudInstanceRecordID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1183,19 +1233,42 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE
+    (EXCLUDED.owner_id IS NULL OR agent_runtime.owner_id = EXCLUDED.owner_id)
+    AND (
+        (
+            NOT $10::bool
+            AND NOT (
+                agent_runtime.metadata ? 'cloud_instance_id'
+                OR agent_runtime.metadata ? 'cloud_instance_record_id'
+            )
+            AND NOT (
+                EXCLUDED.metadata ? 'cloud_instance_id'
+                OR EXCLUDED.metadata ? 'cloud_instance_record_id'
+            )
+        )
+        OR (
+            $10::bool
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_id', '') IS NOT NULL
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_record_id', '') IS NOT NULL
+            AND agent_runtime.metadata->>'cloud_instance_id' = EXCLUDED.metadata->>'cloud_instance_id'
+            AND agent_runtime.metadata->>'cloud_instance_record_id' = EXCLUDED.metadata->>'cloud_instance_record_id'
+        )
+    )
 RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, (xmax = 0) AS inserted
 `
 
 type UpsertAgentRuntimeParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	DaemonID    pgtype.Text `json:"daemon_id"`
-	Name        string      `json:"name"`
-	RuntimeMode string      `json:"runtime_mode"`
-	Provider    string      `json:"provider"`
-	Status      string      `json:"status"`
-	DeviceInfo  string      `json:"device_info"`
-	Metadata    []byte      `json:"metadata"`
-	OwnerID     pgtype.UUID `json:"owner_id"`
+	WorkspaceID          pgtype.UUID `json:"workspace_id"`
+	DaemonID             pgtype.Text `json:"daemon_id"`
+	Name                 string      `json:"name"`
+	RuntimeMode          string      `json:"runtime_mode"`
+	Provider             string      `json:"provider"`
+	Status               string      `json:"status"`
+	DeviceInfo           string      `json:"device_info"`
+	Metadata             []byte      `json:"metadata"`
+	OwnerID              pgtype.UUID `json:"owner_id"`
+	RequireCloudIdentity bool        `json:"require_cloud_identity"`
 }
 
 type UpsertAgentRuntimeRow struct {
@@ -1237,6 +1310,7 @@ func (q *Queries) UpsertAgentRuntime(ctx context.Context, arg UpsertAgentRuntime
 		arg.DeviceInfo,
 		arg.Metadata,
 		arg.OwnerID,
+		arg.RequireCloudIdentity,
 	)
 	var i UpsertAgentRuntimeRow
 	err := row.Scan(
@@ -1287,20 +1361,43 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE
+    (EXCLUDED.owner_id IS NULL OR agent_runtime.owner_id = EXCLUDED.owner_id)
+    AND (
+        (
+            NOT $11::bool
+            AND NOT (
+                agent_runtime.metadata ? 'cloud_instance_id'
+                OR agent_runtime.metadata ? 'cloud_instance_record_id'
+            )
+            AND NOT (
+                EXCLUDED.metadata ? 'cloud_instance_id'
+                OR EXCLUDED.metadata ? 'cloud_instance_record_id'
+            )
+        )
+        OR (
+            $11::bool
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_id', '') IS NOT NULL
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_record_id', '') IS NOT NULL
+            AND agent_runtime.metadata->>'cloud_instance_id' = EXCLUDED.metadata->>'cloud_instance_id'
+            AND agent_runtime.metadata->>'cloud_instance_record_id' = EXCLUDED.metadata->>'cloud_instance_record_id'
+        )
+    )
 RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, (xmax = 0) AS inserted
 `
 
 type UpsertAgentRuntimeWithProfileParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	DaemonID    pgtype.Text `json:"daemon_id"`
-	Name        string      `json:"name"`
-	RuntimeMode string      `json:"runtime_mode"`
-	Provider    string      `json:"provider"`
-	Status      string      `json:"status"`
-	DeviceInfo  string      `json:"device_info"`
-	Metadata    []byte      `json:"metadata"`
-	OwnerID     pgtype.UUID `json:"owner_id"`
-	ProfileID   pgtype.UUID `json:"profile_id"`
+	WorkspaceID          pgtype.UUID `json:"workspace_id"`
+	DaemonID             pgtype.Text `json:"daemon_id"`
+	Name                 string      `json:"name"`
+	RuntimeMode          string      `json:"runtime_mode"`
+	Provider             string      `json:"provider"`
+	Status               string      `json:"status"`
+	DeviceInfo           string      `json:"device_info"`
+	Metadata             []byte      `json:"metadata"`
+	OwnerID              pgtype.UUID `json:"owner_id"`
+	ProfileID            pgtype.UUID `json:"profile_id"`
+	RequireCloudIdentity bool        `json:"require_cloud_identity"`
 }
 
 type UpsertAgentRuntimeWithProfileRow struct {
@@ -1343,6 +1440,7 @@ func (q *Queries) UpsertAgentRuntimeWithProfile(ctx context.Context, arg UpsertA
 		arg.Metadata,
 		arg.OwnerID,
 		arg.ProfileID,
+		arg.RequireCloudIdentity,
 	)
 	var i UpsertAgentRuntimeWithProfileRow
 	err := row.Scan(
