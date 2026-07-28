@@ -569,10 +569,9 @@ const AgentInvocationTargetSchema: z.ZodType<AgentInvocationTarget> = z
   })
   .loose();
 
-// Agent schema is loose on every enum / structural field — the agent table is
-// where new modes/visibilities/statuses get added most often. We need only id,
-// name, avatar_url, and a couple of flags for the assignee picker + chat
-// header; everything else is informational and safe to default.
+// This schema intentionally strips unknown fields. Agent payloads historically
+// carried secret-bearing free-form fields, so mobile must not retain raw
+// legacy values in parsed objects or caches.
 export const AgentSchema: z.ZodType<Agent> = z.object({
   id: z.string(),
   workspace_id: z.string().default(""),
@@ -584,14 +583,23 @@ export const AgentSchema: z.ZodType<Agent> = z.object({
   runtime_mode: z.string().catch("daemon") as unknown as z.ZodType<
     Agent["runtime_mode"]
   >,
-  runtime_config: z.record(z.string(), z.unknown()).default({}),
-  custom_args: z.array(z.string()).default([]),
+  runtime_config: z.unknown().optional().transform(() => ({})),
+  has_runtime_config: z.boolean().optional(),
+  runtime_config_key_count: z.number().int().nonnegative().optional(),
+  runtime_config_redacted: z.boolean().optional(),
+  custom_args: z.unknown().optional().transform(() => []),
+  custom_args_count: z.number().int().nonnegative().optional(),
+  custom_args_redacted: z.boolean().optional(),
   // MUL-2600: agent resource shape no longer carries custom_env or
   // custom_env_redacted. Mobile keeps only the coarse metadata that
   // mirrors web's expectations. Real env values are reachable via the
   // dedicated /env endpoint and we don't expose env editing on mobile.
   has_custom_env: z.boolean().optional(),
   custom_env_key_count: z.number().optional(),
+  mcp_config: z.unknown().optional().transform(() => null),
+  mcp_config_redacted: z.boolean().optional(),
+  composio_toolkit_allowlist_count: z.number().int().nonnegative().optional(),
+  composio_toolkit_allowlist_redacted: z.boolean().optional(),
   visibility: z.string().catch("workspace") as unknown as z.ZodType<
     Agent["visibility"]
   >,
@@ -608,7 +616,7 @@ export const AgentSchema: z.ZodType<Agent> = z.object({
   updated_at: z.string().default(""),
   archived_at: z.string().nullable().default(null),
   archived_by: z.string().nullable().default(null),
-}).loose();
+});
 
 export const AgentListSchema = z.array(AgentSchema).default([]);
 export const EMPTY_AGENT_LIST: Agent[] = [];

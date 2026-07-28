@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,8 +10,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
 )
+
+var errGitWorktreeBranchExists = errors.New("git worktree branch already exists")
 
 // detectGitRepo checks if dir is inside a git repository (regular or bare).
 // Returns the git root path and true if found.
@@ -37,7 +39,7 @@ func fetchOrigin(gitRoot string) error {
 	cmd := exec.Command("git", "-C", gitRoot, "fetch", "origin")
 
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch origin: %s: %w", strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("git fetch origin failed (output bytes: %d): %w", len(out), err)
 	}
 	return nil
 }
@@ -82,7 +84,7 @@ func setupGitWorktree(gitRoot, worktreePath, branchName, baseRef string) error {
 	}
 
 	err := runGitWorktreeAdd(gitRoot, worktreePath, branchName, baseRef)
-	if err != nil && strings.Contains(err.Error(), "already exists") {
+	if errors.Is(err, errGitWorktreeBranchExists) {
 		// Branch name collision: append timestamp and retry once.
 		branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
 		err = runGitWorktreeAdd(gitRoot, worktreePath, branchName, baseRef)
@@ -94,9 +96,20 @@ func runGitWorktreeAdd(gitRoot, worktreePath, branchName, baseRef string) error 
 	cmd := exec.Command("git", "-C", gitRoot, "worktree", "add", "-b", branchName, worktreePath, baseRef)
 
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git worktree add: %s: %w", strings.TrimSpace(string(out)), err)
+		if strings.Contains(string(out), "already exists") {
+			return fmt.Errorf("%w: %v", errGitWorktreeBranchExists, err)
+		}
+		return fmt.Errorf("git worktree add failed (output bytes: %d): %w", len(out), err)
 	}
 	return nil
+}
+
+func logGitCommandFailure(logger *slog.Logger, operation string, output []byte, err error) {
+	logger.Warn("execenv: git command failed",
+		"operation", operation,
+		"output_byte_count", len(output),
+		"has_error", err != nil,
+	)
 }
 
 // removeGitWorktree removes a worktree and its branch. Best-effort: logs errors.
@@ -105,15 +118,15 @@ func removeGitWorktree(gitRoot, worktreePath, branchName string, logger *slog.Lo
 	cmd := exec.Command("git", "-C", gitRoot, "worktree", "remove", "--force", worktreePath)
 
 	if out, err := cmd.CombinedOutput(); err != nil {
-		logger.Warn("execenv: git worktree remove failed", "output", strings.TrimSpace(string(out)), "error", err)
+		logGitCommandFailure(logger, "worktree_remove", out, err)
 	}
 
 	// Delete the branch (best-effort).
 	if branchName != "" {
 		cmd = exec.Command("git", "-C", gitRoot, "branch", "-D", branchName)
-	
+
 		if out, err := cmd.CombinedOutput(); err != nil {
-			logger.Warn("execenv: git branch delete failed", "branch", branchName, "output", strings.TrimSpace(string(out)), "error", err)
+			logGitCommandFailure(logger, "branch_delete", out, err)
 		}
 	}
 }

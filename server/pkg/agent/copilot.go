@@ -210,7 +210,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 
 	cmd := exec.CommandContext(runCtx, argv0, cmdArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", argv0, "args", cmdArgs)
+	logAgentCommand(b.cfg.Logger, argv0, cmdArgs)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -230,7 +230,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		return nil, fmt.Errorf("start copilot: %w", err)
 	}
 
-	b.cfg.Logger.Info("copilot started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "copilot", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -263,7 +263,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 
 			var evt copilotEvent
 			if err := json.Unmarshal([]byte(line), &evt); err != nil {
-				slog.Warn("copilot event parse failed", "err", err, "line", line)
+				logCopilotParseFailure(b.cfg.Logger, line)
 				continue
 			}
 
@@ -272,7 +272,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			slog.Warn("copilot stdout scanner error", "err", err)
+			slog.Warn("copilot stdout scanner error", "has_error", true)
 		}
 
 		exitErr := cmd.Wait()
@@ -305,6 +305,14 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func logCopilotParseFailure(logger *slog.Logger, line string) {
+	// Stdout may echo prompts, tool output, or config/env values. An
+	// unparseable line has not crossed the event schema boundary, so its
+	// contents and parse error (which can quote attacker-controlled keys) are
+	// never safe to log.
+	logger.Warn("copilot event parse failed", "line_char_count", len(line))
 }
 
 // ── Copilot CLI JSONL event types ──

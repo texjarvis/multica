@@ -38,4 +38,28 @@ describe("AgentSchema invocation permissions", () => {
       { target_type: "team", target_id: null },
     ]);
   });
+
+  it("strips legacy secret-bearing and raw Composio fields", () => {
+    const secret = "sentinel-mobile-agent-secret";
+    const parsed = AgentSchema.parse({
+      id: "agent-1",
+      custom_env: { TOKEN: secret },
+      custom_args: ["--token", secret],
+      runtime_config: { api_key: secret },
+      mcp_config: { headers: { Authorization: secret } },
+      composio_toolkit_allowlist: ["notion", secret],
+      composio_toolkit_allowlist_count: 2,
+      composio_toolkit_allowlist_redacted: true,
+      unknown_secret: secret,
+    });
+
+    expect(JSON.stringify(parsed)).not.toContain(secret);
+    expect(parsed.runtime_config).toEqual({});
+    expect(parsed.custom_args).toEqual([]);
+    expect(parsed.mcp_config).toBeNull();
+    expect(parsed).not.toHaveProperty("custom_env");
+    expect(parsed).not.toHaveProperty("composio_toolkit_allowlist");
+    expect(parsed.composio_toolkit_allowlist_count).toBe(2);
+    expect(parsed.composio_toolkit_allowlist_redacted).toBe(true);
+  });
 });

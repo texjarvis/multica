@@ -906,7 +906,12 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 func runtimeHasActiveAgentsResponse(agents []db.Agent) map[string]any {
 	resp := make([]AgentResponse, len(agents))
 	for i, a := range agents {
-		resp[i] = agentToResponse(a)
+		// This 409 body may be returned to a runtime owner/admin who does not
+		// own every blocking agent. It only needs identity/display fields for
+		// the confirmation dialog, so use the same workspace-wide projection
+		// as WebSocket fan-out instead of exposing owner-only MCP/Composio
+		// structure or the runtime-config summary.
+		resp[i] = broadcastAgentResponse(agentToResponse(a))
 	}
 	return map[string]any{
 		"error":         "cannot delete runtime: it has active agents bound to it. Archive or reassign the agents first.",
@@ -1164,7 +1169,7 @@ func (h *Handler) ArchiveAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.R
 	}
 	for _, a := range archivedAgents {
 		h.publish(protocol.EventAgentArchived, wsID, "member", userID, map[string]any{
-			"agent": agentToResponse(a),
+			"agent": broadcastAgentResponse(agentToResponse(a)),
 		})
 	}
 	h.publish(protocol.EventDaemonRegister, wsID, "member", userID, map[string]any{

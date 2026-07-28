@@ -59,6 +59,15 @@ func TestClaimTasksByRuntime_RoutesAcrossRuntimesAndMintsTokens(t *testing.T) {
 
 	rt1 := createClaimReclaimRuntime(t, ctx, "Batch claim rt1")
 	rt2 := createClaimReclaimRuntime(t, ctx, "Batch claim rt2")
+	// A daemon may host one runtime per provider. Keep this two-runtime
+	// machine fixture production-valid under the
+	// (workspace_id, daemon_id, provider) uniqueness contract.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE agent_runtime SET provider = 'handler_test_runtime_2' WHERE id = $1`,
+		rt2,
+	); err != nil {
+		t.Fatalf("set second runtime provider: %v", err)
+	}
 	a1, i1 := createClaimReclaimAgentAndIssue(t, ctx, rt1, "Batch claim a1")
 	a2, i2 := createClaimReclaimAgentAndIssue(t, ctx, rt2, "Batch claim a2")
 	seedQueuedIssueTask(t, ctx, a1, rt1, i1)

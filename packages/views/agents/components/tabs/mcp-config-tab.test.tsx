@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent, AgentRuntime } from "@multica/core/types";
 import { ApiError } from "@multica/core/api";
 import { I18nProvider } from "@multica/core/i18n/react";
+import { toast } from "sonner";
 import enCommon from "../../../locales/en/common.json";
 import enAgents from "../../../locales/en/agents.json";
 import { McpConfigTab } from "./mcp-config-tab";
@@ -76,21 +77,49 @@ function TestShell({ children }: { children: React.ReactNode }) {
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function renderTab(
   overrides: Partial<Agent> = {},
   onSave = vi.fn().mockResolvedValue(undefined),
   runtime: AgentRuntime | null = null,
+  canManage = false,
 ) {
+  const initialAgent = { ...baseAgent, ...overrides };
   const result = render(
     <TestShell>
       <McpConfigTab
-        agent={{ ...baseAgent, ...overrides }}
+        agent={initialAgent}
         runtime={runtime}
         onSave={onSave}
+        canManage={canManage}
       />
     </TestShell>,
   );
-  return { ...result, onSave };
+  return {
+    ...result,
+    rerenderAgent(nextAgent: Agent) {
+      result.rerender(
+        <TestShell>
+          <McpConfigTab
+            agent={nextAgent}
+            runtime={runtime}
+            onSave={onSave}
+            canManage={canManage}
+          />
+        </TestShell>,
+      );
+    },
+    onSave,
+  };
 }
 
 const onlineRuntime: AgentRuntime = {
@@ -117,9 +146,70 @@ describe("McpConfigTab", () => {
   it("renders redacted managed MCP without exposing add or edit controls", () => {
     renderTab({ mcp_config: null, mcp_config_redacted: true });
 
-    expect(screen.getByText(/hidden from your view/i)).toBeInTheDocument();
+    expect(screen.getByText(/secret values hidden/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /add mcp/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("replaces a redacted config from fresh input without round-tripping masks", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    renderTab(
+      {
+        mcp_config_redacted: true,
+        mcp_config: {
+          mcpServers: {
+            server_1: {
+              command: "****",
+              env: { env_1: "****" },
+            },
+          },
+        },
+      },
+      onSave,
+      null,
+      true,
+    );
+
+    await user.click(screen.getByRole("button", { name: /replace config/i }));
+    await user.click(screen.getByRole("button", { name: /add mcp/i }));
+    await user.type(screen.getByLabelText("Name"), "fresh");
+    await user.type(screen.getByLabelText("Command"), "node");
+    await user.click(screen.getByRole("button", { name: /add server/i }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      mcp_config: {
+        mcpServers: {
+          fresh: { command: "node" },
+        },
+      },
+      mcp_config_intent: "replace",
+    });
+    expect(JSON.stringify(onSave.mock.calls)).not.toContain("server_1");
+    expect(JSON.stringify(onSave.mock.calls)).not.toContain("****");
+  });
+
+  it("clears a redacted config only after explicit confirmation", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    renderTab(
+      { mcp_config_redacted: true, mcp_config: null },
+      onSave,
+      null,
+      true,
+    );
+
+    await user.click(screen.getByRole("button", { name: /clear config/i }));
+    expect(screen.getByText(/removes the complete stored MCP/i)).toBeInTheDocument();
+    const clearButtons = screen.getAllByRole("button", {
+      name: /clear config/i,
+    });
+    await user.click(clearButtons[clearButtons.length - 1]!);
+
+    expect(onSave).toHaveBeenCalledWith({
+      mcp_config: null,
+      mcp_config_intent: "clear",
+    });
   });
 
   it("projects historical aggregate config into individually managed rows", () => {
@@ -154,6 +244,7 @@ describe("McpConfigTab", () => {
         version: 1,
         mcpServers: { fetch: { command: "uvx" } },
       },
+      mcp_config_intent: "replace",
     });
   });
 
@@ -183,6 +274,7 @@ describe("McpConfigTab", () => {
           },
         },
       },
+      mcp_config_intent: "replace",
     });
   });
 
@@ -221,6 +313,7 @@ describe("McpConfigTab", () => {
           docs: { url: "https://example.test/mcp" },
         },
       },
+      mcp_config_intent: "replace",
     });
   });
 
@@ -236,7 +329,10 @@ describe("McpConfigTab", () => {
     expect(screen.getByText(/runtime servers are not affected/i)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /delete server/i }));
 
-    expect(onSave).toHaveBeenCalledWith({ mcp_config: null });
+    expect(onSave).toHaveBeenCalledWith({
+      mcp_config: null,
+      mcp_config_intent: "clear",
+    });
   });
 
   it("blocks invalid single-server JSON", async () => {
@@ -296,5 +392,73 @@ describe("McpConfigTab", () => {
         "Couldn't discover runtime MCP servers. Try again.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("does not apply an agent A MCP save completion after switching to agent B", async () => {
+    const user = userEvent.setup();
+    const pendingSave = deferred<void>();
+    const onSave = vi
+      .fn()
+      .mockImplementationOnce(() => pendingSave.promise)
+      .mockResolvedValueOnce(undefined);
+    const view = renderTab(
+      { mcp_config: null, mcp_config_redacted: true },
+      onSave,
+      null,
+      true,
+    );
+
+    await user.click(screen.getByRole("button", { name: /replace config/i }));
+    await user.click(screen.getByRole("button", { name: /add mcp/i }));
+    await user.type(screen.getByLabelText("Name"), "agent_a");
+    await user.click(screen.getByRole("tab", { name: "JSON" }));
+    fireEvent.change(screen.getByLabelText(/MCP server JSON configuration/i), {
+      target: {
+        value: JSON.stringify({
+          command: "node",
+          env: { TOKEN: "agent-a-exact-mcp-token" },
+        }),
+      },
+    });
+    await user.click(screen.getByRole("button", { name: /add server/i }));
+
+    expect(JSON.stringify(onSave.mock.calls[0])).toContain(
+      "agent-a-exact-mcp-token",
+    );
+
+    view.rerenderAgent({
+      ...baseAgent,
+      id: "agent-2",
+      name: "Agent 2",
+      mcp_config: null,
+      mcp_config_redacted: true,
+    });
+    expect(document.body.textContent).not.toContain("agent-a-exact-mcp-token");
+
+    await act(async () => {
+      pendingSave.resolve();
+      await pendingSave.promise;
+    });
+
+    expect(document.body.textContent).not.toContain("agent-a-exact-mcp-token");
+    expect(toast.success).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /replace config/i }));
+    await user.click(screen.getByRole("button", { name: /add mcp/i }));
+    await user.type(screen.getByLabelText("Name"), "agent_b");
+    await user.type(screen.getByLabelText("Command"), "node");
+    await user.click(screen.getByRole("button", { name: /add server/i }));
+
+    expect(onSave).toHaveBeenLastCalledWith({
+      mcp_config: {
+        mcpServers: {
+          agent_b: { command: "node" },
+        },
+      },
+      mcp_config_intent: "replace",
+    });
+    expect(JSON.stringify(onSave.mock.calls[1])).not.toContain(
+      "agent-a-exact-mcp-token",
+    );
   });
 });

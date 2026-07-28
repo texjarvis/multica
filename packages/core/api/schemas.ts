@@ -1,6 +1,10 @@
 import { z } from "zod";
 import type {
   Agent,
+  AgentComposioToolkitAllowlistResponse,
+  AgentComposioToolkitAllowlistUpdateResponse,
+  AgentEnvResponse,
+  AgentEnvUpdateResponse,
   AgentTemplate,
   AgentTemplateSummary,
   AgentBuilderRuntimeSwitch,
@@ -36,6 +40,7 @@ import type {
   ListWebhookDeliveriesResponse,
   NotificationPreferenceResponse,
   ResourceLabelsResponse,
+  RuntimeProfile,
   SearchIssuesResponse,
   SearchProjectsResponse,
   Squad,
@@ -1132,17 +1137,16 @@ export const EMPTY_AGENT_TEMPLATE_DETAIL: AgentTemplate = {
 };
 
 // ---------------------------------------------------------------------------
-// Agent invocation permissions (MUL-3963)
+// Agent response boundary.
 //
-// Full agent request/response payloads are NOT zod-validated today — the API
-// client returns them typed directly (see client.ts `listAgents` /
-// `getAgent` / `createAgent`), so there is no `AgentSchema` /
-// `CreateAgentRequestSchema` / `UpdateAgentRequestSchema` to extend here.
-// These lenient, exported fragments encode the new permission fields so any
-// future agent schema — and the from-template minimal agent below — can reuse
-// them. Per this file's convention the enum stays lenient (a future
-// server-side value degrades to the strict default rather than failing the
-// parse), and the target array defaults to `[]`.
+// Agent records contain several persisted free-form fields that can hold
+// credentials. The server owns the primary projection, but desktop/browser
+// clients also validate and rebuild the response before it enters React Query
+// caches. The default z.object behavior strips unknown keys, including legacy
+// `custom_env` / `env` fields. The transforms below additionally suppress raw
+// custom_args, project runtime_config, and accept only a validated masked MCP
+// summary. Request bodies remain separately typed and are not run through
+// these response-only transforms.
 // ---------------------------------------------------------------------------
 
 export const AgentPermissionModeSchema = z
@@ -1160,40 +1164,596 @@ export const AgentInvocationTargetsSchema = z
   .array(AgentInvocationTargetSchema)
   .default([]);
 
-// `agent` is a full Agent record — schematising every field would duplicate
-// a 50-field interface and bit-rot fast. We keep it loose and require only
-// `id`, the one field the create-from-template flow consumes (used to
-// navigate to the new agent's detail page). Downstream code already
-// optional-chains the rest. The permission fields are parsed leniently when
-// present so the from-template response carries a well-formed access shape.
-const MinimalAgentSchema = z.object({
+const PUBLIC_SECRET_MASK = "****";
+const RUNTIME_CONFIG_REDACTION_MARKER = "_redacted";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sanitizeRuntimeConfigResponse(raw: unknown): {
+  value: Record<string, unknown>;
+  hasValue: boolean;
+  keyCount: number;
+  redacted: boolean;
+} {
+  if (!isRecord(raw) || Object.keys(raw).length === 0) {
+    return {
+      value: {},
+      hasValue: false,
+      keyCount: 0,
+      redacted: raw !== undefined && raw !== null && !isRecord(raw),
+    };
+  }
+
+  const value: Record<string, unknown> = {};
+  const sourceKeys = Object.keys(raw).filter(
+    (key) => key !== RUNTIME_CONFIG_REDACTION_MARKER,
+  );
+  let redacted =
+    raw[RUNTIME_CONFIG_REDACTION_MARKER] === PUBLIC_SECRET_MASK;
+
+  for (const [key, field] of Object.entries(raw)) {
+    if (key === RUNTIME_CONFIG_REDACTION_MARKER) continue;
+    if (key === "mode") {
+      if (field === "local" || field === "gateway") value.mode = field;
+      else redacted = true;
+      continue;
+    }
+    if (key !== "gateway" || !isRecord(field)) {
+      redacted = true;
+      continue;
+    }
+
+    const gateway: Record<string, unknown> = {};
+    for (const [gatewayKey, gatewayValue] of Object.entries(field)) {
+      switch (gatewayKey) {
+        case "host":
+        case "token":
+          if (
+            typeof gatewayValue === "string" &&
+            gatewayValue.length > 0
+          ) {
+            gateway[gatewayKey] = PUBLIC_SECRET_MASK;
+          }
+          redacted = true;
+          break;
+        case "port":
+          if (
+            typeof gatewayValue === "number" &&
+            Number.isInteger(gatewayValue) &&
+            gatewayValue >= 1 &&
+            gatewayValue <= 65535
+          ) {
+            gateway.port = gatewayValue;
+          } else {
+            redacted = true;
+          }
+          break;
+        case "tls":
+          if (typeof gatewayValue === "boolean") {
+            gateway.tls = gatewayValue;
+          } else {
+            redacted = true;
+          }
+          break;
+        default:
+          redacted = true;
+      }
+    }
+    value.gateway = gateway;
+  }
+
+  if (redacted) value[RUNTIME_CONFIG_REDACTION_MARKER] = PUBLIC_SECRET_MASK;
+  return {
+    value,
+    hasValue: sourceKeys.length > 0,
+    keyCount: sourceKeys.length,
+    redacted,
+  };
+}
+
+function isMaskedStringMap(
+  value: unknown,
+  keyPattern: RegExp,
+): value is Record<string, string> {
+  if (!isRecord(value)) return false;
+  return Object.entries(value).every(
+    ([key, field]) =>
+      keyPattern.test(key) && field === PUBLIC_SECRET_MASK,
+  );
+}
+
+function sanitizeMcpConfigResponse(raw: unknown): unknown | null {
+  if (raw === undefined || raw === null) return null;
+  if (!isRecord(raw)) return null;
+  const rootKeys = Object.keys(raw);
+  if (rootKeys.length === 0) return {};
+  if (
+    rootKeys.length !== 1 ||
+    (rootKeys[0] !== "mcpServers" && rootKeys[0] !== "mcp_servers")
+  ) {
+    return null;
+  }
+
+  const rootKey = rootKeys[0]!;
+  const servers = raw[rootKey];
+  if (!isRecord(servers)) return null;
+  const safeServers: Record<string, unknown> = {};
+  for (const [serverName, serverValue] of Object.entries(servers)) {
+    if (!/^server_[1-9]\d*$/.test(serverName) || !isRecord(serverValue)) {
+      return null;
+    }
+    const safeServer: Record<string, unknown> = {};
+    for (const [field, value] of Object.entries(serverValue)) {
+      switch (field) {
+        case "command":
+        case "url":
+          if (value !== PUBLIC_SECRET_MASK) return null;
+          safeServer[field] = PUBLIC_SECRET_MASK;
+          break;
+        case "args":
+          if (
+            !Array.isArray(value) ||
+            !value.every((item) => item === PUBLIC_SECRET_MASK)
+          ) {
+            return null;
+          }
+          safeServer.args = value.map(() => PUBLIC_SECRET_MASK);
+          break;
+        case "env":
+          if (!isMaskedStringMap(value, /^env_[1-9]\d*$/)) return null;
+          safeServer.env = { ...value };
+          break;
+        case "headers":
+          if (!isMaskedStringMap(value, /^header_[1-9]\d*$/)) return null;
+          safeServer.headers = { ...value };
+          break;
+        case "type":
+        case "transport":
+          if (
+            typeof value !== "string" ||
+            ![
+              "stdio",
+              "sse",
+              "http",
+              "streamable-http",
+              "http_streamable",
+            ].includes(value.toLowerCase().trim())
+          ) {
+            return null;
+          }
+          safeServer[field] = value;
+          break;
+        default:
+          return null;
+      }
+    }
+    if (
+      (safeServer.command === undefined) ===
+      (safeServer.url === undefined)
+    ) {
+      return null;
+    }
+    safeServers[serverName] = safeServer;
+  }
+  return { [rootKey]: safeServers };
+}
+
+const NonEmptyIdentitySchema = z.string().trim().min(1);
+
+const AgentSkillSummarySchema = z.object({
+  id: NonEmptyIdentitySchema,
+  name: z.string().default(""),
+  description: z.string().default(""),
+  enabled: z.boolean().optional(),
+});
+
+const DisabledRuntimeSkillSchema = z.object({
+  runtime_id: z.string(),
+  provider: z.string(),
+  root: z.enum(["provider", "universal", "plugin"]),
+  key: z.string(),
+  name: z.string().optional(),
+  plugin: z.string().optional(),
+});
+
+const AgentResponseInputSchema = z.object({
   id: z.string(),
-  permission_mode: AgentPermissionModeSchema.optional(),
-  invocation_targets: AgentInvocationTargetsSchema.optional(),
-}).loose();
+  workspace_id: z.string().default(""),
+  runtime_id: z.string().default(""),
+  name: z.string().default(""),
+  description: z.string().default(""),
+  instructions: z.string().default(""),
+  avatar_url: z.string().nullable().default(null),
+  runtime_mode: z.string().default("local"),
+  runtime_config: z.unknown().optional(),
+  has_runtime_config: z.boolean().optional(),
+  runtime_config_key_count: z.number().int().nonnegative().optional(),
+  runtime_config_redacted: z.boolean().optional(),
+  custom_args: z.array(z.string()).default([]),
+  custom_args_count: z.number().int().nonnegative().optional(),
+  custom_args_redacted: z.boolean().optional(),
+  has_custom_env: z.boolean().optional(),
+  custom_env_key_count: z.number().int().nonnegative().optional(),
+  mcp_config: z.unknown().nullable().optional(),
+  mcp_config_redacted: z.boolean().optional(),
+  // Mixed-version servers may still send the raw allowlist. Accept it only
+  // as untrusted input so the transform can discard it before any client
+  // cache or caller sees the value.
+  composio_toolkit_allowlist: z.unknown().optional(),
+  composio_toolkit_allowlist_count: z.number().int().nonnegative().optional(),
+  composio_toolkit_allowlist_redacted: z.boolean().optional(),
+  visibility: z.string().default("private"),
+  permission_mode: AgentPermissionModeSchema.default("private"),
+  invocation_targets: AgentInvocationTargetsSchema,
+  status: z.string().default("idle"),
+  max_concurrent_tasks: z.number().int().nonnegative().default(0),
+  model: z.string().default(""),
+  thinking_level: z.string().optional(),
+  service_tier: z.string().optional(),
+  owner_id: z.string().nullable().default(null),
+  skills: z.array(AgentSkillSummarySchema).default([]),
+  disabled_runtime_skills: z.array(DisabledRuntimeSkillSchema).optional(),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+  archived_at: z.string().nullable().default(null),
+  archived_by: z.string().nullable().default(null),
+});
+
+export const AgentSchema = AgentResponseInputSchema.transform((input) => {
+  const {
+    composio_toolkit_allowlist: rawComposioAllowlist,
+    ...valueFreeInput
+  } = input;
+  const runtimeConfig = sanitizeRuntimeConfigResponse(input.runtime_config);
+  const rawArgsCount = input.custom_args.length;
+  const mcpConfig = sanitizeMcpConfigResponse(input.mcp_config);
+  const hadUnsafeMcp =
+    input.mcp_config !== undefined &&
+    input.mcp_config !== null &&
+    mcpConfig === null;
+  const legacyComposioCount = Array.isArray(rawComposioAllowlist)
+    ? rawComposioAllowlist.length
+    : 0;
+  const composioCount =
+    input.composio_toolkit_allowlist_count ?? legacyComposioCount;
+  const hadUnsafeComposio =
+    rawComposioAllowlist !== undefined &&
+    (!Array.isArray(rawComposioAllowlist) ||
+      rawComposioAllowlist.length > 0);
+
+  return {
+    ...valueFreeInput,
+    runtime_config: runtimeConfig.value,
+    has_runtime_config:
+      input.has_runtime_config ?? runtimeConfig.hasValue,
+    runtime_config_key_count:
+      input.runtime_config_key_count ?? runtimeConfig.keyCount,
+    runtime_config_redacted:
+      input.runtime_config_redacted === true || runtimeConfig.redacted,
+    custom_args: [],
+    custom_args_count: input.custom_args_count ?? rawArgsCount,
+    custom_args_redacted:
+      input.custom_args_redacted === true || rawArgsCount > 0,
+    mcp_config: mcpConfig,
+    mcp_config_redacted:
+      input.mcp_config_redacted === true || hadUnsafeMcp,
+    composio_toolkit_allowlist_count: composioCount,
+    composio_toolkit_allowlist_redacted:
+      input.composio_toolkit_allowlist_redacted === true ||
+      hadUnsafeComposio ||
+      composioCount > 0,
+  } as Agent;
+});
+
+export const CommittedAgentSchema = AgentSchema.superRefine((agent, ctx) => {
+  for (const field of ["id", "workspace_id", "runtime_id"] as const) {
+    if (agent[field].trim().length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: [field],
+        message: `${field} must be non-empty`,
+      });
+    }
+  }
+});
+
+export const AgentListSchema = z.array(AgentSchema);
+
+export const EMPTY_AGENT: Agent = {
+  id: "",
+  workspace_id: "",
+  runtime_id: "",
+  name: "",
+  description: "",
+  instructions: "",
+  avatar_url: null,
+  runtime_mode: "local",
+  runtime_config: {},
+  has_runtime_config: false,
+  runtime_config_key_count: 0,
+  runtime_config_redacted: false,
+  custom_args: [],
+  custom_args_count: 0,
+  custom_args_redacted: false,
+  has_custom_env: false,
+  custom_env_key_count: 0,
+  mcp_config: null,
+  mcp_config_redacted: false,
+  composio_toolkit_allowlist_count: 0,
+  composio_toolkit_allowlist_redacted: false,
+  visibility: "private",
+  permission_mode: "private",
+  invocation_targets: [],
+  status: "idle",
+  max_concurrent_tasks: 0,
+  model: "",
+  owner_id: null,
+  skills: [],
+  created_at: "",
+  updated_at: "",
+  archived_at: null,
+  archived_by: null,
+};
+
+const RuntimeProfileResponseInputSchema = z.object({
+  id: NonEmptyIdentitySchema,
+  workspace_id: z.string().default(""),
+  display_name: z.string().default(""),
+  protocol_family: z.string().default("codex"),
+  command_name: z.string().default(""),
+  description: z.string().nullable().default(null),
+  fixed_args: z.array(z.string()).default([]),
+  fixed_args_count: z.number().int().nonnegative().optional(),
+  fixed_args_redacted: z.boolean().optional(),
+  visibility: z.string().default("workspace"),
+  created_by: z.string().nullable().default(null),
+  enabled: z.boolean().default(true),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+});
+
+export const RuntimeProfileSchema = RuntimeProfileResponseInputSchema.transform(
+  (input) =>
+    ({
+      ...input,
+      fixed_args: [],
+      fixed_args_count: input.fixed_args_count ?? input.fixed_args.length,
+      fixed_args_redacted:
+        input.fixed_args_redacted === true || input.fixed_args.length > 0,
+    }) as RuntimeProfile,
+);
+
+export const CommittedRuntimeProfileSchema =
+  RuntimeProfileSchema.superRefine((profile, ctx) => {
+    for (const field of ["id", "workspace_id"] as const) {
+      if (profile[field].trim().length === 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} must be non-empty`,
+        });
+      }
+    }
+  });
+
+export const RuntimeProfileListResponseSchema = z
+  .object({
+    runtime_profiles: z.array(RuntimeProfileSchema).default([]),
+  })
+  .transform((value) => value.runtime_profiles);
+
+export const EMPTY_RUNTIME_PROFILE: RuntimeProfile = {
+  id: "",
+  workspace_id: "",
+  display_name: "",
+  protocol_family: "codex",
+  command_name: "",
+  description: null,
+  fixed_args: [],
+  fixed_args_count: 0,
+  fixed_args_redacted: false,
+  visibility: "workspace",
+  created_by: null,
+  enabled: true,
+  created_at: "",
+  updated_at: "",
+};
+
+// Dedicated env-management responses deliberately use two distinct wire
+// shapes. GET is the audited plaintext reveal; PUT is a value-free
+// confirmation. Keep the update schema stripping unknown fields so an older
+// or regressed server cannot smuggle `custom_env` values through a typed
+// mutation response.
+const EnvKeySchema = z.string().min(1);
+const EnvKeyListSchema = z
+  .array(EnvKeySchema)
+  .superRefine((keys, ctx) => {
+    if (new Set(keys).size !== keys.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: "env key lists must not contain duplicates",
+      });
+    }
+  });
+
+export const AgentEnvResponseSchema = z
+  .object({
+    agent_id: NonEmptyIdentitySchema,
+    custom_env: z.record(z.string(), z.string()),
+  })
+  .strict();
+
+export const EMPTY_AGENT_ENV_RESPONSE: AgentEnvResponse = {
+  agent_id: "",
+  custom_env: {},
+};
+
+const ComposioToolkitSlugListSchema = z
+  .array(z.string().min(1))
+  .superRefine((slugs, ctx) => {
+    if (new Set(slugs).size !== slugs.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: "toolkit_slugs must not contain duplicates",
+      });
+    }
+  });
+
+export const AgentComposioToolkitAllowlistResponseSchema = z
+  .object({
+    agent_id: NonEmptyIdentitySchema,
+    toolkit_slugs: ComposioToolkitSlugListSchema,
+  })
+  .strict();
+
+export const EMPTY_AGENT_COMPOSIO_TOOLKIT_ALLOWLIST_RESPONSE: AgentComposioToolkitAllowlistResponse =
+  {
+    agent_id: "",
+    toolkit_slugs: [],
+  };
+
+export const AgentComposioToolkitAllowlistUpdateResponseSchema = z
+  .object({
+    agent_id: NonEmptyIdentitySchema,
+    toolkit_count: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const EMPTY_AGENT_COMPOSIO_TOOLKIT_ALLOWLIST_UPDATE_RESPONSE: AgentComposioToolkitAllowlistUpdateResponse =
+  {
+    agent_id: "",
+    toolkit_count: 0,
+  };
+
+const AgentEnvUpdateConfirmationSchema = z
+  .object({
+    agent_id: NonEmptyIdentitySchema,
+    custom_env: z.record(z.string(), z.literal(PUBLIC_SECRET_MASK)),
+    has_custom_env: z.boolean(),
+    custom_env_key_count: z.number().int().nonnegative(),
+    custom_env_keys: EnvKeyListSchema,
+    added_keys: EnvKeyListSchema,
+    removed_keys: EnvKeyListSchema,
+    changed_keys: EnvKeyListSchema,
+    preserved_keys: EnvKeyListSchema,
+  })
+  .strict()
+  .superRefine((input, ctx) => {
+    const finalKeys = [...input.custom_env_keys].sort();
+    const mapKeys = Object.keys(input.custom_env).sort();
+    if (
+      finalKeys.length !== mapKeys.length ||
+      finalKeys.some((key, index) => key !== mapKeys[index])
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "custom_env keys must exactly match custom_env_keys",
+      });
+    }
+    if (input.custom_env_key_count !== finalKeys.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: "custom_env_key_count must equal custom_env_keys length",
+      });
+    }
+    if (input.has_custom_env !== (finalKeys.length > 0)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "has_custom_env must agree with custom_env_keys",
+      });
+    }
+
+    const finalKeySet = new Set(finalKeys);
+    const finalCategories = [
+      ...input.added_keys,
+      ...input.changed_keys,
+      ...input.preserved_keys,
+    ];
+    if (finalCategories.some((key) => !finalKeySet.has(key))) {
+      ctx.addIssue({
+        code: "custom",
+        message: "retained-key change metadata must reference final keys",
+      });
+    }
+    if (input.removed_keys.some((key) => finalKeySet.has(key))) {
+      ctx.addIssue({
+        code: "custom",
+        message: "removed_keys must not reference final keys",
+      });
+    }
+    if (new Set(finalCategories).size !== finalCategories.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: "retained-key change categories must be disjoint",
+      });
+    }
+  });
+
+// Rolling compatibility for the one historical PUT shape. It is deliberately
+// exact: a response that contains any of the new confirmation fields must pass
+// the full invariant schema above rather than falling back to this branch.
+const LegacyAgentEnvUpdateResponseSchema = z
+  .object({
+    agent_id: NonEmptyIdentitySchema,
+    custom_env: z.record(z.string(), z.string()),
+  })
+  .strict()
+  .transform((input): AgentEnvUpdateResponse => {
+    const keys = Object.keys(input.custom_env).sort();
+    return {
+      agent_id: input.agent_id,
+      custom_env: Object.fromEntries(
+        keys.map((key) => [key, PUBLIC_SECRET_MASK]),
+      ),
+      has_custom_env: keys.length > 0,
+      custom_env_key_count: keys.length,
+      custom_env_keys: keys,
+      added_keys: [],
+      removed_keys: [],
+      changed_keys: [],
+      preserved_keys: [],
+    };
+  });
+
+export const AgentEnvUpdateResponseSchema = z.union([
+  AgentEnvUpdateConfirmationSchema,
+  LegacyAgentEnvUpdateResponseSchema,
+]);
+
+export const EMPTY_AGENT_ENV_UPDATE_RESPONSE: AgentEnvUpdateResponse = {
+  agent_id: "",
+  custom_env: {},
+  has_custom_env: false,
+  custom_env_key_count: 0,
+  custom_env_keys: [],
+  added_keys: [],
+  removed_keys: [],
+  changed_keys: [],
+  preserved_keys: [],
+};
 
 export const CreateAgentFromTemplateResponseSchema = z.object({
-  agent: MinimalAgentSchema,
+  agent: CommittedAgentSchema,
   imported_skill_ids: z.array(z.string()).default([]),
   reused_skill_ids: z.array(z.string()).default([]),
-}).loose();
+});
 
-// Fallback when the success response fails to parse. The agent server-side
-// has likely been created already, so we can't pretend nothing happened —
-// the caller (`create-agent-dialog.tsx`) is responsible for noticing
-// `agent.id === ""` and skipping navigation while keeping the list
-// invalidation, so the user finds their new agent in the list.
+// Kept as a type-compatible sentinel for consumers that construct local
+// state. API mutation parsing no longer returns it: an unreadable successful
+// response is commit-uncertain and throws until the caller refreshes.
 export const EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE: CreateAgentFromTemplateResponse = {
-  agent: { id: "" } as Agent,
+  agent: EMPTY_AGENT,
   imported_skill_ids: [],
   reused_skill_ids: [],
 };
 
 export const AgentBuilderSessionSchema = z.object({
-  session_id: z.string(),
-  builder_agent_id: z.string(),
-  runtime_id: z.string(),
-}).loose();
+  session_id: NonEmptyIdentitySchema,
+  builder_agent_id: NonEmptyIdentitySchema,
+  runtime_id: NonEmptyIdentitySchema,
+});
 
 export const EMPTY_AGENT_BUILDER_SESSION: AgentBuilderSession = {
   session_id: "",
@@ -1202,7 +1762,7 @@ export const EMPTY_AGENT_BUILDER_SESSION: AgentBuilderSession = {
 };
 
 export const AgentBuilderRuntimeSwitchSchema = z.object({
-  runtime_id: z.string(),
+  runtime_id: NonEmptyIdentitySchema,
 }).loose();
 
 // This endpoint returns 2xx only after the carrier has been bound to the

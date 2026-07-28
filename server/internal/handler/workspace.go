@@ -399,6 +399,15 @@ type MemberWithUserResponse struct {
 	AvatarURL   *string `json:"avatar_url"`
 }
 
+// machineMemberLookupResponse is intentionally limited to the two fields the
+// issue/comment CLI resolver consumes. A task or cloud-machine credential
+// must not inherit its owner's access to member email, role, avatar, member
+// record ID, workspace ID, or join timestamp.
+type machineMemberLookupResponse struct {
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+}
+
 func (h *Handler) ListMembersWithUser(w http.ResponseWriter, r *http.Request) {
 	workspaceID := workspaceIDFromURL(r, "id")
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
@@ -409,6 +418,19 @@ func (h *Handler) ListMembersWithUser(w http.ResponseWriter, r *http.Request) {
 	members, err := h.Queries.ListMembersWithUser(r.Context(), wsUUID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list members")
+		return
+	}
+
+	switch r.Header.Get("X-Actor-Source") {
+	case "task_token", "cloud_pat":
+		resp := make([]machineMemberLookupResponse, len(members))
+		for i, m := range members {
+			resp[i] = machineMemberLookupResponse{
+				UserID: uuidToString(m.UserID),
+				Name:   m.UserName,
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 

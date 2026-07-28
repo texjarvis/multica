@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Agent } from "@multica/core/types";
+import type { Agent, UpdateAgentRequest } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
 import enAgents from "../../locales/en/agents.json";
@@ -17,8 +17,29 @@ const TEST_RESOURCES = { en: { common: enCommon, agents: enAgents } };
 // The DM tests exercise the header action wiring plus the real permission
 // rules (via auth + member fixtures); the tabbed body and avatar/presence
 // widgets are irrelevant weight, so they're stubbed.
+const updatePayloadRef = vi.hoisted(() => ({
+  current: null as UpdateAgentRequest | null,
+}));
 vi.mock("./agent-overview-pane", () => ({
-  AgentOverviewPane: () => <div>agent-overview-pane</div>,
+  AgentOverviewPane: ({
+    agent,
+    onUpdate,
+  }: {
+    agent: Agent;
+    onUpdate: (id: string, data: UpdateAgentRequest) => Promise<void>;
+  }) => (
+    <div>
+      agent-overview-pane
+      {updatePayloadRef.current && (
+        <button
+          type="button"
+          onClick={() => void onUpdate(agent.id, updatePayloadRef.current!)}
+        >
+          test-update
+        </button>
+      )}
+    </div>
+  ),
 }));
 vi.mock("../../common/actor-avatar", () => ({
   ActorAvatar: () => <div>actor-avatar</div>,
@@ -37,6 +58,7 @@ const currentUserRef = vi.hoisted(() => ({
 }));
 const mockToastError = vi.hoisted(() => vi.fn());
 const mockModalOpen = vi.hoisted(() => vi.fn());
+const mockUpdateAgent = vi.hoisted(() => vi.fn());
 
 vi.mock("@multica/core/hooks", () => ({
   useWorkspaceId: () => "ws-1",
@@ -94,7 +116,10 @@ vi.mock("@multica/core/api", () => {
     }
   }
   return {
-    api: { getAgent: vi.fn(() => Promise.reject(new ApiError(404, "not found"))) },
+    api: {
+      getAgent: vi.fn(() => Promise.reject(new ApiError(404, "not found"))),
+      updateAgent: mockUpdateAgent,
+    },
     ApiError,
   };
 });
@@ -151,7 +176,7 @@ function renderPage() {
       </NavigationProvider>
     </I18nProvider>,
   );
-  return { push };
+  return { push, queryClient };
 }
 
 beforeEach(() => {
@@ -160,6 +185,8 @@ beforeEach(() => {
   membersRef.current = [{ user_id: "user-1", role: "member" }];
   membersPendingRef.current = false;
   agentsRef.current = [baseAgent];
+  updatePayloadRef.current = null;
+  mockUpdateAgent.mockResolvedValue(baseAgent);
 });
 
 describe("AgentDetailPage DM button", () => {
@@ -207,5 +234,34 @@ describe("AgentDetailPage DM button", () => {
     // The archived banner is the signal the page has settled past loading.
     await screen.findByText(/This agent is archived/);
     expect(screen.queryByRole("button", { name: "DM" })).not.toBeInTheDocument();
+  });
+});
+
+describe("AgentDetailPage update cache boundary", () => {
+  it("never copies secret-bearing request fields into the shared agent cache", async () => {
+    const sentinel = "sentinel-agent-cache-secret";
+    updatePayloadRef.current = {
+      name: "Optimistic safe name",
+      runtime_config: { token: sentinel },
+      runtime_config_intent: "replace",
+      custom_args: ["--token", sentinel],
+      mcp_config: { Authorization: `Bearer ${sentinel}` },
+      custom_args_intent: "replace",
+      mcp_config_intent: "replace",
+    };
+    mockUpdateAgent.mockReturnValueOnce(new Promise(() => {}));
+    const { queryClient } = renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "test-update" }));
+
+    const cached = queryClient.getQueryData<Agent[]>(["agents", "ws-1"]);
+    expect(cached?.[0]?.name).toBe("Optimistic safe name");
+    expect(JSON.stringify(cached)).not.toContain(sentinel);
+    expect(cached?.[0]?.runtime_config).toEqual({});
+    expect(cached?.[0]?.custom_args).toEqual([]);
+    expect(cached?.[0]?.mcp_config).toBeUndefined();
+    expect(cached?.[0]).not.toHaveProperty("custom_args_intent");
+    expect(cached?.[0]).not.toHaveProperty("mcp_config_intent");
+    expect(cached?.[0]).not.toHaveProperty("runtime_config_intent");
   });
 });

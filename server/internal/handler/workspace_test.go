@@ -12,6 +12,66 @@ import (
 	"testing"
 )
 
+func TestListMembersWithUserMachineProjectionIsValueMinimized(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	for _, actorSource := range []string{"task_token", "cloud_pat"} {
+		t.Run(actorSource, func(t *testing.T) {
+			req := newRequest(http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/members", nil)
+			req = withURLParam(req, "id", testWorkspaceID)
+			req.Header.Set("X-Actor-Source", actorSource)
+			w := httptest.NewRecorder()
+			testHandler.ListMembersWithUser(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
+			}
+
+			var members []map[string]json.RawMessage
+			if err := json.NewDecoder(w.Body).Decode(&members); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if len(members) == 0 {
+				t.Fatal("expected at least the seeded workspace owner")
+			}
+			for i, member := range members {
+				if len(member) != 2 {
+					t.Fatalf("member[%d] fields=%v, want only user_id and name", i, member)
+				}
+				if _, ok := member["user_id"]; !ok {
+					t.Fatalf("member[%d] missing user_id", i)
+				}
+				if _, ok := member["name"]; !ok {
+					t.Fatalf("member[%d] missing name", i)
+				}
+			}
+			for _, forbidden := range []string{
+				"id", "workspace_id", "role", "created_at", "email", "avatar_url",
+			} {
+				if _, ok := members[0][forbidden]; ok {
+					t.Fatalf("machine projection exposed %q", forbidden)
+				}
+			}
+		})
+	}
+
+	req := newRequest(http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/members", nil)
+	req = withURLParam(req, "id", testWorkspaceID)
+	w := httptest.NewRecorder()
+	testHandler.ListMembersWithUser(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("human status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	var humans []MemberWithUserResponse
+	if err := json.NewDecoder(w.Body).Decode(&humans); err != nil {
+		t.Fatalf("decode human response: %v", err)
+	}
+	if len(humans) == 0 || humans[0].Email == "" || humans[0].Role == "" {
+		t.Fatalf("human projection unexpectedly minimized: %+v", humans)
+	}
+}
+
 func TestCreateWorkspace_RejectsReservedSlug(t *testing.T) {
 	// Drive the test off the actual reservedSlugs map so the test can never
 	// drift from the source of truth. New entries are covered automatically.

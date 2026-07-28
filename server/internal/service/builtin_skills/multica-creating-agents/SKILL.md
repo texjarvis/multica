@@ -23,9 +23,11 @@ multica agent skills list <agent-id> --output json   # current skill bindings
 multica agent env get <agent-id> --output json  # plaintext env (owner/admin only, agents denied)
 ```
 
-`agent get` returns the persisted agent including `runtime_id`, `model`,
-`thinking_level`, `service_tier`, `custom_args`, `has_custom_env`,
-`custom_env_key_count`, and `skills`. It never returns plaintext `custom_env`.
+`agent get` returns the agent's public management shape including `runtime_id`,
+`model`, `thinking_level`, `service_tier`, value-free `custom_args` metadata,
+`has_custom_env`, `custom_env_key_count`, and `skills`. It never returns
+plaintext `custom_env`, any raw custom-argument value, or raw MCP/runtime config:
+see the secret-field contracts below.
 
 ## Core model
 
@@ -61,6 +63,14 @@ non-empty value, the rest (`runtime-config`, `custom-args`, `model`,
 `thinking-level`, `service-tier`, `visibility`, …) on the flag being `Changed` — so omitted
 flags fall through to server defaults rather than sending empty strings.
 
+`runtime_config` and `custom_args` may carry credentials. Both create and
+update offer mutually exclusive inline, stdin, and file channels:
+`--runtime-config[-stdin|-file]` and `--custom-args[-stdin|-file]`. Prefer a
+0600 file or stdin. Inline JSON is visible in shell history and process
+listings and emits a warning. Empty file/stdin content fails closed; use `{}`
+to clear runtime config or `[]` to clear custom args. A single command may
+select stdin for only one JSON field, so use files for additional fields.
+
 The HTTP body (`CreateAgentRequest`) accepts: `name`, `description`,
 `instructions`, `avatar_url`, `runtime_id`, `runtime_config`, `custom_env`,
 `custom_args`, `model`, `thinking_level`, `service_tier`, `visibility`,
@@ -82,7 +92,7 @@ multica agent copy <source-agent-id> --runtime-id <target> --model <model>  # cr
 ```
 
 - Copied by default, each overridable with the matching flag: `name` (suffixed
-  `" (copy)"`), `description`, `instructions`, avatar, `custom_args`,
+  `" (copy)"`), `description`, `instructions`, avatar,
   `max_concurrent_tasks`, invocation permission (`permission_mode` +
   allow-list), and assigned workspace skills.
 - Runtime-specific fields (`model`, `thinking_level`, `service_tier`) are copied
@@ -90,10 +100,11 @@ multica agent copy <source-agent-id> --runtime-id <target> --model <model>  # cr
   different runtime drops them and REQUIRES `--model` (pass `--model ""` to
   accept the target runtime default), mirroring the web Duplicate clearing model
   on a runtime switch.
-- Never copied: `custom_env`, `mcp_config`, `runtime_config` (secret /
+- Never copied: `custom_env`, `custom_args`, `mcp_config`, `runtime_config` (secret /
   machine-local; redacted or masked on read anyway). Supply fresh values with
-  the same secret-safe flags as `agent create` (`--custom-env*`, `--mcp-config*`,
-  `--runtime-config`), or with `agent env set` after the copy exists.
+  the same explicit flags as `agent create` (`--custom-env*`, `--custom-args*`,
+  `--mcp-config*`, `--runtime-config*`), or with `agent env set` after the copy
+  exists.
 - `--no-skills` skips copying the source's skill bindings.
 
 ## Field contracts
@@ -108,10 +119,10 @@ multica agent copy <source-agent-id> --runtime-id <target> --model <model>  # cr
 | `model` | `agent.model` (nullable) | none beyond runtime support | daemon reads; empty = runtime default |
 | `thinking_level` | `agent.thinking_level` (nullable) | provider-level enum; unknown literal → 400 | daemon; empty = runtime default |
 | `service_tier` | `agent.service_tier` (nullable) | Codex-only safe token; other providers reject; exact model/tier pair checked by daemon | daemon → Codex app-server; empty = local Codex config |
-| `custom_args` | `agent.custom_args` (JSON array) | JSON shape checked CLI-side; server stores as-is | daemon (extra CLI switches); defaults to `[]` |
-| `runtime_config` | `agent.runtime_config` (JSON) | JSON shape checked CLI-side; server stores as-is | runtime-specific config; defaults to `{}` |
+| `custom_args` | `agent.custom_args` (JSON array) | JSON shape checked CLI-side; every non-empty list is value-redacted on generic reads | daemon receives raw extra CLI switches; defaults to `[]` |
+| `runtime_config` | `agent.runtime_config` (JSON) | JSON shape checked CLI-side; public reads are a fail-closed projection and projected writeback preserves the stored row | daemon receives raw runtime-specific config; defaults to `{}` |
 | `custom_env` | `agent.custom_env` (JSON object) | — | daemon (process env); see Env & secrets |
-| `mcp_config` | `agent.mcp_config` (raw JSON) | CLI checks it is a JSON object or `null`; server stores as-is. At create, literal `null` is dropped (no-op); at update, `null` clears the column | daemon → provider (provider-specific MCP handling); redacted on read |
+| `mcp_config` | `agent.mcp_config` (raw JSON) | CLI checks it is a JSON object or `null`; the server rejects `"****"` response placeholders. At create, literal `null` is dropped (no-op); at update, `null` clears the column | daemon → provider (provider-specific MCP handling); values always masked/suppressed on generic reads |
 | `visibility` | `agent.visibility` | — | access control; defaults to `private`; gates who can read/route a private agent (e.g. a private squad leader) — NOT the runtime prompt |
 | `max_concurrent_tasks` | `agent.max_concurrent_tasks` | — | scheduler task cap; defaults to `6` |
 
@@ -155,6 +166,39 @@ explicit model fail closed because the effective config.toml model is unknown.
 documented CLI guidance, not a server-enforced invariant; nothing in the create
 handler inspects `custom_args` for a model flag.
 
+Any argument can carry credentials: split/equal `--api-key` / `--token` flags,
+authorization headers, and provider-specific fields are all common. Generic
+agent responses therefore hide every non-empty list and return `custom_args:
+[]`, `custom_args_count`, and `custom_args_redacted: true`. The daemon claim
+path still receives the raw stored argv. The empty list is non-authoritative:
+management clients must explicitly replace the complete list with fresh values
+or clear it. Current update clients pair a non-empty `custom_args` list with
+`custom_args_intent: "replace"` and an empty list with
+`custom_args_intent: "clear"`. An intent-free empty public-response replay
+preserves hidden stored args for rolling compatibility; an intent-free
+non-empty update is rejected once hidden args exist.
+
+### runtime_config
+
+`runtime_config` is persisted free-form provider JSON, so unknown keys and
+arbitrary nested values are secret-bearing by default. Generic HTTP/WS/CLI/UI
+responses expose only a fail-closed projection: known mode/port/TLS metadata
+may remain, host/token values are masked, and unknown keys are suppressed.
+`has_runtime_config`, `runtime_config_key_count`, and
+`runtime_config_redacted` describe configured state without revealing values.
+Daemon claims receive the raw stored JSON separately.
+
+A projection is display-only. On update, omit the field to preserve the entire
+stored config, submit a complete fresh object to replace it, or `{}` to clear
+it. A current `"****"`/`_redacted` projection round-trip is treated as
+"preserve"; the older exact `gateway.token: "***"` mask is supported only as a
+rolling-upgrade bridge.
+
+Use `--runtime-config-file <0600-json>` or `--runtime-config-stdin` for fresh
+CLI input. Use `--custom-args-file <0600-json>` or `--custom-args-stdin` for
+fresh argument lists. The inline variants remain for compatibility but are
+unsafe for credentials and print a warning.
+
 ## Env & secrets
 
 `custom_env` is secret material. The CLI offers three input channels; two keep
@@ -183,7 +227,13 @@ Read-side facts (these are the wrong assumptions to avoid):
   update handler rejects any `custom_env` field with a 400 ("use PUT
   /api/agents/{id}/env"). Plaintext env writes are handled by
   `PUT /api/agents/{id}/env` (`multica agent env set`), which is owner/admin-only
-  and writes an audit row.
+  and writes an audit row. Its response is a value-free confirmation containing
+  `agent_id`, final key names/count, a rolling-compatibility `custom_env` map
+  whose values are all `"****"`, and added/removed/changed/preserved key lists
+  — it never echoes submitted values. A submitted value of `"****"` keeps the
+  existing value for that key; for a new key it is dropped. New clients also
+  accept a plaintext `custom_env` map from an old server, derive the same
+  metadata, and discard every value before returning or logging the response.
 
 ### mcp_config
 
@@ -209,10 +259,23 @@ Two ways `mcp_config` differs from `custom_env`:
   has no dedicated audited endpoint — the generic `PUT /api/agents/{id}` accepts
   it. Tri-state per the raw request body: field omitted → no change; `null` →
   clear; object → replace.
-- **It is serialized on read, but redacted.** `agent get`/`list` return
-  `mcp_config` only to callers allowed to view agent secrets; otherwise the
-  field is `null` and `mcp_config_redacted` is `true`. Agent actors never see
-  it, and a workspace may force redaction for everyone.
+- **Generic reads never return raw values, regardless of caller role.**
+  `agent get`/`list`, create/update/archive/restore responses, WebSocket events,
+  audit/event payloads, CLI, and UI all cross the same server-owned sanitizer.
+  Supported stdio/remote entries are rebuilt as a useful masked shape:
+  command/args/URL/env/header values become `"****"` and free-form server,
+  env, and header names become stable aliases. Unknown, ambiguous, duplicate-key,
+  or malformed shapes fail closed to `null`; `mcp_config_redacted` is `true`.
+  Daemon claim paths read the raw database row separately, so runtime behavior
+  is unchanged.
+
+Masked shapes are display-only. Never GET then PUT them back: create/update
+reject `"****"` placeholders. To manage a configured value, submit a complete
+replacement assembled from fresh input with `mcp_config_intent: "replace"`,
+omit the field to preserve it, or send `null` with
+`mcp_config_intent: "clear"`. A legacy full-response replay preserves hidden
+config, and an intent-free non-empty replacement is rejected once hidden config
+exists.
 
 Provider support is not uniform: Qwen Code accepts a managed `mcp_config` through a daemon-owned 0600 temporary JSON file passed with `--mcp-config`; it is removed when the run exits. Leave the field unset (`null`) to inherit Qwen Code native settings.
 
@@ -265,6 +328,11 @@ State-changing (require an explicit instruction — do not run speculatively):
   clear; only `custom_env` is gated behind the dedicated env endpoint.
 - "`agent get` shows env values." It shows only `has_custom_env` and
   `custom_env_key_count`.
+- "`agent get` as an owner returns raw MCP config." It does not — all generic
+  callers receive a masked structural summary or fail-closed `null`.
+- "A masked MCP/custom-args/runtime-config response can be edited and saved." It cannot; it is
+  a non-authoritative display shape. Explicitly replace the complete value or
+  clear it.
 - "An invalid `thinking_level`/`model` combo is caught at create." Only an
   unknown provider-level literal is — model-specific gaps fail at run time.
 - "`set` and `add` are interchangeable for skills." `set` replaces all

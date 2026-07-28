@@ -190,7 +190,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	hermesArgs := append([]string{"acp"}, filterCustomArgs(opts.CustomArgs, hermesBlockedArgs, b.cfg.Logger)...)
 	cmd := exec.CommandContext(runCtx, execPath, hermesArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", hermesArgs)
+	logAgentCommand(b.cfg.Logger, execPath, hermesArgs)
 	agentsMDPresent := false
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -198,9 +198,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			agentsMDPresent = true
 		}
 	}
-	b.cfg.Logger.Info("hermes acp starting", "cwd", opts.Cwd, "agents_md_present", agentsMDPresent)
+	b.cfg.Logger.Info("hermes acp starting", "has_cwd", opts.Cwd != "", "agents_md_present", agentsMDPresent)
 	if opts.SystemPrompt != "" {
-		b.cfg.Logger.Debug("hermes ignoring ExecOptions.SystemPrompt; using cwd-scoped context files", "cwd", opts.Cwd)
+		b.cfg.Logger.Debug("hermes ignoring ExecOptions.SystemPrompt; using cwd-scoped context files", "has_cwd", opts.Cwd != "")
 	}
 
 	env := buildEnv(b.cfg.Env)
@@ -254,7 +254,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("hermes acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	logProviderStarted(b.cfg.Logger, "hermes", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -402,8 +402,8 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "hermes",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_present", opts.ResumeSessionID != "",
+					"actual_present", sessionID != "",
 				)
 			}
 			sessionCurrentModel = extractACPCurrentModelID(result)
@@ -432,7 +432,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("hermes session created", "session_id", sessionID)
+		b.cfg.Logger.Info("hermes session created", "has_session_id", sessionID != "")
 
 		// 3. If the caller picked a model (via agent.model from the
 		// UI dropdown), ask hermes to switch the session to it
@@ -454,15 +454,15 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// behaviour. See MUL-5029 / NousResearch/hermes-agent#59089.
 		if opts.Model != "" && effectiveModel == sessionCurrentModel {
 			b.cfg.Logger.Info("hermes session already on requested model; skipping redundant set_model",
-				"model", opts.Model,
-				"session_id", sessionID,
+				"has_requested_model", true,
+				"has_session_id", sessionID != "",
 			)
 		} else if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("hermes set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("hermes set_session_model failed", "has_error", true, "has_requested_model", true)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("hermes could not switch to model %q: %v", opts.Model, err)
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
@@ -472,7 +472,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					// the daemon's resume-failure fallback retries fresh.
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "hermes",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -486,7 +486,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				}
 				return
 			}
-			b.cfg.Logger.Info("hermes session model set", "model", opts.Model)
+			b.cfg.Logger.Info("hermes session model set", "has_requested_model", true)
 		}
 
 		// 4. Send the prompt and wait for PromptResponse.
@@ -531,7 +531,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					// same way.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "hermes",
-						"session_id", sessionID,
+						"has_session_id", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -873,9 +873,9 @@ func (c *hermesClient) handleAgentRequest(raw map[string]json.RawMessage) {
 				},
 			}
 			if grant {
-				c.cfg.Logger.Debug("auto-approved agent permission request", "method", method, "optionId", optionID)
+				c.cfg.Logger.Debug("auto-approved agent permission request", "has_method", method != "", "has_option_id", optionID != "")
 			} else {
-				c.cfg.Logger.Warn("no safe grant offered; selecting offered reject option", "method", method, "optionId", optionID)
+				c.cfg.Logger.Warn("no safe grant offered; selecting offered reject option", "has_method", method != "", "has_option_id", optionID != "")
 			}
 		} else {
 			// The request offered nothing we can safely select: no safe grant
@@ -890,7 +890,7 @@ func (c *hermesClient) handleAgentRequest(raw map[string]json.RawMessage) {
 					"message": "no auto-selectable permission option offered",
 				},
 			}
-			c.cfg.Logger.Warn("no safely selectable permission option offered; returning error", "method", method)
+			c.cfg.Logger.Warn("no safely selectable permission option offered; returning error", "has_method", method != "")
 		}
 	default:
 		// Unknown agent→client method — reply with standard "method
@@ -904,17 +904,17 @@ func (c *hermesClient) handleAgentRequest(raw map[string]json.RawMessage) {
 				"message": "method not found: " + method,
 			},
 		}
-		c.cfg.Logger.Debug("unhandled agent→client request", "method", method)
+		c.cfg.Logger.Debug("unhandled agent→client request", "has_method", method != "")
 	}
 
 	data, err := json.Marshal(resp)
 	if err != nil {
-		c.cfg.Logger.Warn("marshal agent-request response", "method", method, "error", err)
+		c.cfg.Logger.Warn("marshal agent-request response", "has_method", method != "", "has_error", true)
 		return
 	}
 	data = append(data, '\n')
 	if err := c.writeLine(data); err != nil {
-		c.cfg.Logger.Warn("write agent-request response", "method", method, "error", err)
+		c.cfg.Logger.Warn("write agent-request response", "has_method", method != "", "has_error", true)
 	}
 }
 
@@ -1919,7 +1919,7 @@ func buildACPMcpServers(raw json.RawMessage, logger *slog.Logger) ([]any, error)
 		entry, err := convertACPMcpServer(name, parsed.McpServers[name])
 		if err != nil {
 			if logger != nil {
-				logger.Warn("skipping invalid mcp_config entry", "name", name, "error", err)
+				logger.Warn("skipping invalid mcp_config entry", "has_error", true)
 			}
 			continue
 		}
@@ -2075,7 +2075,7 @@ func filterACPMcpServersByCapability(
 			if !caps.HTTP {
 				if logger != nil {
 					logger.Warn("dropping http MCP server: runtime did not advertise mcpCapabilities.http",
-						"backend", backend, "name", entry["name"])
+						"backend", backend)
 				}
 				continue
 			}
@@ -2083,7 +2083,7 @@ func filterACPMcpServersByCapability(
 			if !caps.SSE {
 				if logger != nil {
 					logger.Warn("dropping sse MCP server: runtime did not advertise mcpCapabilities.sse",
-						"backend", backend, "name", entry["name"])
+						"backend", backend)
 				}
 				continue
 			}

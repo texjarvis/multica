@@ -659,7 +659,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 		env.OpenclawIncludeRoot = result.IncludeRoot
 	}
 
-	logger.Info("execenv: reusing env", "workdir", params.WorkDir)
+	logger.Info("execenv: reusing env", "has_workdir", params.WorkDir != "")
 	return env
 }
 

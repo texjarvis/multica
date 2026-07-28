@@ -66,6 +66,8 @@ System-critical variables cannot be overridden: `PATH`, `HOME`, `USER`, `SHELL`,
 <Callout type="warning">
 **Values in `custom_env` are stored in plaintext in Multica's server database.** Agent list/get responses no longer carry env values at all — only an opaque count. Reading values requires a workspace owner or admin to hit the dedicated, audited `GET /api/agents/{id}/env` endpoint (CLI: `multica agent env get <id>`). Agents running tasks can NOT use their host's owner credentials to reveal env on other agents — the endpoint denies agent-actor sessions.
 
+Updating env uses the dedicated `PUT /api/agents/{id}/env` endpoint (CLI: `multica agent env set <id>`). Its response confirms only the final key names/count, a compatibility `custom_env` map whose values are all `"****"`, and which keys were added, removed, changed, or preserved; it never echoes the submitted values. A submitted value of `"****"` preserves an existing key, so masked clients cannot accidentally overwrite a real secret.
+
 **Don't put high-value secrets in `custom_env`** (production database passwords, root-level tokens, etc.). Use **dedicated, limited-scope credentials** for agents (read-only API keys, single-scope PATs), and rotate them regularly. Database backups and DB audits remain a meaningful exposure surface.
 </Callout>
 
@@ -85,9 +87,27 @@ claude --model <model> --max-turns 100 --append-system-prompt "always respond in
 
 Arguments are passed as-is, not through a shell (no injection risk), but whether a given flag is recognized is up to the AI coding tool itself — tools differ substantially here.
 
+Any CLI argument may contain credentials — split/equal `--api-key` and `--token` flags, authorization headers, and provider-specific values are all common. Generic agent responses therefore hide **every non-empty** `custom_args` list and return only `custom_args: []`, `custom_args_count`, and `custom_args_redacted: true`. The daemon still receives the raw stored arguments. Replace the complete list from fresh input or clear it; never treat the empty placeholder as editable source data. API updates that change this hidden field must pair `custom_args` with `custom_args_intent: "replace"` or `"clear"`. Replaying an empty public placeholder without intent preserves stored arguments; an ambiguous non-empty legacy replay is rejected when hidden arguments already exist.
+
+For CLI writes, prefer `--custom-args-file <0600-json>` or `--custom-args-stdin`. Inline `--custom-args <json>` can expose credentials through shell history and process listings. Create and update support all three mutually exclusive channels; use an explicit `[]` to clear the list.
+
 <Callout type="tip">
 `custom_env` and `custom_args` have no hard caps, but in practice **keep each under 10 entries**. Too many makes the command line long, slows startup, and gets harder to maintain.
 </Callout>
+
+## Managed MCP configuration (mcp_config)
+
+Managed MCP entries commonly contain commands, URLs, headers, environment variables, and API tokens. Multica stores the raw configuration for runtime use, but **generic agent responses never return those values — even to owners and admins**. Supported configurations are returned only as a masked structural summary; malformed or unknown shapes are suppressed entirely. The raw config reaches the assigned runtime through the daemon's separate claim path.
+
+Masked summaries are display-only. To change a configured MCP value, provide a complete replacement built from fresh input and `mcp_config_intent: "replace"`, omit `mcp_config` to preserve it, or send `null` with `mcp_config_intent: "clear"` to clear it. A legacy full-response replay preserves the hidden config; an ambiguous non-empty legacy replacement is rejected once hidden config exists. The server rejects masked `"****"` placeholders so a GET → PUT round-trip cannot replace working credentials with masks.
+
+## Runtime-specific configuration (runtime_config)
+
+`runtime_config` is free-form provider JSON and may contain tokens, authorization headers, internal hosts, environment values, or future fields Multica does not understand. Generic agent responses expose only a fail-closed public projection: known non-secret routing metadata such as mode, port, and TLS may remain; hosts/tokens are masked and unknown keys are suppressed. Count/redaction metadata indicates that stored configuration exists. The authenticated daemon claim path still receives the raw persisted JSON.
+
+The projection is display-only. Omit `runtime_config` on update to preserve the complete stored value, provide a complete fresh object to replace it, or send `{}` to clear it. The management UI requires an explicit Replace or Clear action and never seeds a replacement from the projection.
+
+For CLI writes, prefer `--runtime-config-file <0600-json>` or `--runtime-config-stdin`; inline `--runtime-config <json>` is unsafe for credentials. The channels are mutually exclusive, empty file/stdin input is rejected, and `{}` is the explicit clear value. A command can consume stdin for only one JSON field; use files for any additional secret-bearing fields in the same request.
 
 ## Visibility
 
@@ -96,7 +116,7 @@ Arguments are passed as-is, not through a shell (no injection risk), but whether
 
 New agents default to `private`.
 
-**Private does not mean hidden** — every member sees a private agent's name and description in the list, they just can't read sensitive config (env values never appear in agent list/get responses; MCP config is masked for non-owners). Full meaning in [Agents → Who can assign an agent](/agents#who-can-assign-an-agent).
+**Private does not mean hidden** — every member sees a private agent's name and description in the list, but sensitive values do not appear in generic agent responses (env values are omitted; MCP values are masked or suppressed for everyone). Full meaning in [Agents → Who can assign an agent](/agents#who-can-assign-an-agent).
 
 ## Concurrency limit
 

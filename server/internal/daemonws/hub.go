@@ -23,6 +23,12 @@ const (
 type ClientIdentity struct {
 	DaemonID string
 	UserID   string
+	// AuthPath and cloud instance fields are copied from the verified HTTP
+	// upgrade request so in-process WebSocket RPCs retain the same
+	// runtime-binding semantics as the HTTP control-plane routes.
+	AuthPath              string
+	CloudInstanceID       string
+	CloudInstanceRecordID string
 	// WorkspaceID is the legacy single-workspace scope used by older callers
 	// and daemon-token auth. New code should populate WorkspaceIDs from the
 	// runtime rows authorized for this connection.
@@ -79,6 +85,20 @@ func (i ClientIdentity) AllowsWorkspace(workspaceID string) bool {
 	}
 	for _, id := range ids {
 		if id == workspaceID {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsRuntime reports whether runtimeID belongs to the fixed runtime set
+// authorized when this connection was upgraded.
+func (i ClientIdentity) AllowsRuntime(runtimeID string) bool {
+	if strings.TrimSpace(runtimeID) == "" {
+		return false
+	}
+	for _, allowed := range i.RuntimeIDs {
+		if allowed == runtimeID {
 			return true
 		}
 	}
@@ -817,7 +837,7 @@ func (c *client) handleHeartbeatFrame(raw json.RawMessage) {
 	// that keeps the HTTP heartbeat from putting a per-call timeout on
 	// PopPending. The natural bound is the read pump's lifetime (the conn
 	// closes if the daemon goes away) plus Redis's own server-side limits.
-	ack, err := handler(context.Background(), c.identity, payload.RuntimeID, payload.SupportsBatchImport)
+	ack, err := handler(c.ctx, c.identity, payload.RuntimeID, payload.SupportsBatchImport)
 	if err != nil {
 		slog.Warn("daemon websocket heartbeat handler failed",
 			"error", err,

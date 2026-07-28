@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -161,11 +163,15 @@ func init() {
 	agentCreateCmd.Flags().String("description", "", "Agent description")
 	agentCreateCmd.Flags().String("instructions", "", "Agent instructions")
 	agentCreateCmd.Flags().String("runtime-id", "", "Runtime ID (required)")
-	agentCreateCmd.Flags().String("runtime-config", "", "Runtime config as JSON string")
+	agentCreateCmd.Flags().String("runtime-config", "", "Runtime config as inline JSON (unsafe for credentials; prefer --runtime-config-file or --runtime-config-stdin)")
+	agentCreateCmd.Flags().Bool("runtime-config-stdin", false, "Read runtime config JSON from stdin. Mutually exclusive with --runtime-config and --runtime-config-file.")
+	agentCreateCmd.Flags().String("runtime-config-file", "", "Read runtime config JSON from a file (suggested mode: 0600). Mutually exclusive with --runtime-config and --runtime-config-stdin.")
 	agentCreateCmd.Flags().String("model", "", "Model identifier (e.g. claude-sonnet-4-6, openai/gpt-4o). Prefer this over passing --model in --custom-args.")
 	agentCreateCmd.Flags().String("thinking-level", "", "Reasoning/effort level for the agent's runtime (e.g. Claude: low|medium|high|xhigh|max; Codex values come from the runtime model catalog). The set is runtime/model-specific; malformed values are rejected server-side and the daemon validates the exact model/level pair. Empty = runtime default.")
 	agentCreateCmd.Flags().String("service-tier", "", "Codex execution service tier from the selected model's runtime catalog (e.g. priority, displayed as Fast). Empty = inherit local Codex configuration.")
-	agentCreateCmd.Flags().String("custom-args", "", "Custom CLI arguments as JSON array. For model selection prefer --model; some providers (codex app-server, openclaw) reject --model in custom_args.")
+	agentCreateCmd.Flags().String("custom-args", "", "Custom CLI arguments as inline JSON (unsafe for credentials; prefer --custom-args-file or --custom-args-stdin). For model selection prefer --model.")
+	agentCreateCmd.Flags().Bool("custom-args-stdin", false, "Read custom CLI arguments JSON from stdin. Mutually exclusive with --custom-args and --custom-args-file.")
+	agentCreateCmd.Flags().String("custom-args-file", "", "Read custom CLI arguments JSON from a file (suggested mode: 0600). Mutually exclusive with --custom-args and --custom-args-stdin.")
 	agentCreateCmd.Flags().String("custom-env", "", "Custom environment variables as JSON object, e.g. '{\"KEY\":\"value\"}'. Treated as secret material — never logged by the CLI, but values passed on the command line are visible to shell history and 'ps'; prefer --custom-env-stdin or --custom-env-file for real secrets. Pass '{}' to set an empty map.")
 	agentCreateCmd.Flags().Bool("custom-env-stdin", false, "Read the --custom-env JSON object from stdin. Keeps secrets out of shell history and 'ps'. Mutually exclusive with --custom-env and --custom-env-file.")
 	agentCreateCmd.Flags().String("custom-env-file", "", "Read the --custom-env JSON object from a file path (suggested mode: 0600). Mutually exclusive with --custom-env and --custom-env-stdin.")
@@ -184,11 +190,15 @@ func init() {
 	agentUpdateCmd.Flags().String("description", "", "New description")
 	agentUpdateCmd.Flags().String("instructions", "", "New instructions")
 	agentUpdateCmd.Flags().String("runtime-id", "", "New runtime ID")
-	agentUpdateCmd.Flags().String("runtime-config", "", "New runtime config as JSON string")
+	agentUpdateCmd.Flags().String("runtime-config", "", "New runtime config as inline JSON (unsafe for credentials; prefer --runtime-config-file or --runtime-config-stdin)")
+	agentUpdateCmd.Flags().Bool("runtime-config-stdin", false, "Read runtime config JSON from stdin. Mutually exclusive with --runtime-config and --runtime-config-file.")
+	agentUpdateCmd.Flags().String("runtime-config-file", "", "Read runtime config JSON from a file (suggested mode: 0600). Mutually exclusive with --runtime-config and --runtime-config-stdin.")
 	agentUpdateCmd.Flags().String("model", "", "New model identifier. Pass an empty string to clear and fall back to the runtime default.")
 	agentUpdateCmd.Flags().String("thinking-level", "", "New reasoning/effort level for the agent's runtime (e.g. Claude: low|medium|high|xhigh|max; Codex values come from the runtime model catalog). The set is runtime/model-specific; malformed values are rejected server-side and the daemon validates the exact model/level pair. Pass an empty string to clear and fall back to the runtime default.")
 	agentUpdateCmd.Flags().String("service-tier", "", "New Codex execution service tier from the selected model's runtime catalog. Pass an empty string to clear and inherit local Codex configuration.")
-	agentUpdateCmd.Flags().String("custom-args", "", "New custom CLI arguments as JSON array. For model selection prefer --model; some providers (codex app-server, openclaw) reject --model in custom_args.")
+	agentUpdateCmd.Flags().String("custom-args", "", "Replace custom CLI arguments from inline JSON (unsafe for credentials; prefer --custom-args-file or --custom-args-stdin); pass [] to clear.")
+	agentUpdateCmd.Flags().Bool("custom-args-stdin", false, "Read replacement custom CLI arguments JSON from stdin. Mutually exclusive with --custom-args and --custom-args-file.")
+	agentUpdateCmd.Flags().String("custom-args-file", "", "Read replacement custom CLI arguments JSON from a file (suggested mode: 0600). Mutually exclusive with --custom-args and --custom-args-stdin.")
 	// custom_env is intentionally NOT part of `agent update`. Use
 	// `multica agent env set <id>` — that path is owner/admin-only,
 	// denies agent actors, and writes a persisted audit trail.
@@ -413,6 +423,109 @@ func requireWorkspaceID(cmd *cobra.Command) (string, error) {
 // Agent commands
 // ---------------------------------------------------------------------------
 
+var safeAgentOutputKeys = map[string]struct{}{
+	"id": {}, "workspace_id": {}, "runtime_id": {}, "name": {},
+	"description": {}, "instructions": {}, "avatar_url": {}, "runtime_mode": {},
+	"has_runtime_config": {}, "runtime_config_key_count": {}, "runtime_config_redacted": {},
+	"custom_args_count": {}, "custom_args_redacted": {},
+	"has_custom_env": {}, "custom_env_key_count": {},
+	"mcp_config_redacted": {}, "composio_toolkit_allowlist_count": {},
+	"composio_toolkit_allowlist_redacted": {}, "visibility": {},
+	"permission_mode": {}, "invocation_targets": {}, "status": {},
+	"max_concurrent_tasks": {}, "model": {}, "thinking_level": {},
+	"service_tier": {}, "owner_id": {}, "skills": {},
+	"disabled_runtime_skills": {}, "created_at": {}, "updated_at": {},
+	"archived_at": {}, "archived_by": {},
+}
+
+// sanitizeAgentForCLIOutput is a defense-in-depth boundary for mixed-version
+// deployments. A legacy or drifted server may still return raw custom_env,
+// custom_args, mcp_config, runtime_config, or an unknown secret field. Rebuild
+// the map from an allowlist before either JSON or table rendering.
+func sanitizeAgentForCLIOutput(input map[string]any) map[string]any {
+	out := make(map[string]any, len(safeAgentOutputKeys)+3)
+	for key := range safeAgentOutputKeys {
+		if value, ok := input[key]; ok {
+			out[key] = value
+		}
+	}
+
+	rawArgs, hasArgs := input["custom_args"]
+	argCount := 0
+	argsRedacted, _ := input["custom_args_redacted"].(bool)
+	if args, ok := rawArgs.([]any); ok {
+		argCount = len(args)
+		argsRedacted = argsRedacted || argCount > 0
+	} else if hasArgs && rawArgs != nil {
+		argsRedacted = true
+	}
+	if count, ok := numericMapCount(input["custom_args_count"]); ok {
+		argCount = count
+	}
+	out["custom_args"] = []any{}
+	out["custom_args_count"] = argCount
+	out["custom_args_redacted"] = argsRedacted
+
+	runtimeConfig := input["runtime_config"]
+	runtimeKeyCount := 0
+	hasRuntimeConfig, _ := input["has_runtime_config"].(bool)
+	runtimeRedacted, _ := input["runtime_config_redacted"].(bool)
+	if config, ok := runtimeConfig.(map[string]any); ok {
+		runtimeKeyCount = len(config)
+		hasRuntimeConfig = hasRuntimeConfig || runtimeKeyCount > 0
+	} else if runtimeConfig != nil {
+		hasRuntimeConfig = true
+	}
+	if count, ok := numericMapCount(input["runtime_config_key_count"]); ok {
+		runtimeKeyCount = count
+	}
+	if hasRuntimeConfig {
+		out["runtime_config"] = map[string]any{"_redacted": "****"}
+		out["runtime_config_redacted"] = true
+	} else {
+		out["runtime_config"] = map[string]any{}
+		out["runtime_config_redacted"] = runtimeRedacted
+	}
+	out["has_runtime_config"] = hasRuntimeConfig
+	out["runtime_config_key_count"] = runtimeKeyCount
+
+	if input["mcp_config"] != nil {
+		out["mcp_config_redacted"] = true
+	}
+	out["mcp_config"] = nil
+
+	composioCount := 0
+	composioRedacted, _ := input["composio_toolkit_allowlist_redacted"].(bool)
+	if raw, present := input["composio_toolkit_allowlist"]; present {
+		if allowlist, ok := raw.([]any); ok {
+			composioCount = len(allowlist)
+			composioRedacted = composioRedacted || composioCount > 0
+		} else if raw != nil {
+			composioRedacted = true
+		}
+	}
+	if count, ok := numericMapCount(input["composio_toolkit_allowlist_count"]); ok {
+		composioCount = count
+	}
+	out["composio_toolkit_allowlist_count"] = composioCount
+	out["composio_toolkit_allowlist_redacted"] = composioRedacted || composioCount > 0
+	return out
+}
+
+func numericMapCount(value any) (int, bool) {
+	switch count := value.(type) {
+	case float64:
+		if count >= 0 {
+			return int(count), true
+		}
+	case int:
+		if count >= 0 {
+			return count, true
+		}
+	}
+	return 0, false
+}
+
 func runAgentList(cmd *cobra.Command, _ []string) error {
 	client, err := newAPIClient(cmd)
 	if err != nil {
@@ -439,6 +552,9 @@ func runAgentList(cmd *cobra.Command, _ []string) error {
 	}
 	if err := client.GetJSON(ctx, path, &agents); err != nil {
 		return fmt.Errorf("list agents: %w", err)
+	}
+	for i := range agents {
+		agents[i] = sanitizeAgentForCLIOutput(agents[i])
 	}
 
 	output, _ := cmd.Flags().GetString("output")
@@ -478,6 +594,7 @@ func runAgentGet(cmd *cobra.Command, args []string) error {
 	if err := client.GetJSON(ctx, "/api/agents/"+args[0], &agent); err != nil {
 		return fmt.Errorf("get agent: %w", err)
 	}
+	agent = sanitizeAgentForCLIOutput(agent)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -544,6 +661,9 @@ func runAgentCreate(cmd *cobra.Command, _ []string) error {
 	if runtimeID == "" {
 		return fmt.Errorf("--runtime-id is required")
 	}
+	if err := validateSingleJSONStdin(cmd, "runtime-config", "custom-args", "custom-env", "mcp-config"); err != nil {
+		return err
+	}
 
 	body := map[string]any{
 		"name":       name,
@@ -555,17 +675,19 @@ func runAgentCreate(cmd *cobra.Command, _ []string) error {
 	if v, _ := cmd.Flags().GetString("instructions"); v != "" {
 		body["instructions"] = v
 	}
-	if cmd.Flags().Changed("runtime-config") {
-		v, _ := cmd.Flags().GetString("runtime-config")
-		var rc any
-		if err := json.Unmarshal([]byte(v), &rc); err != nil {
-			return fmt.Errorf("--runtime-config must be valid JSON: %w", err)
+	if raw, ok, err := resolveJSONInput(cmd, "runtime-config", "pass '{}' to clear"); err != nil {
+		return err
+	} else if ok {
+		rc, err := parseRuntimeConfig(raw)
+		if err != nil {
+			return err
 		}
 		body["runtime_config"] = rc
 	}
-	if cmd.Flags().Changed("custom-args") {
-		v, _ := cmd.Flags().GetString("custom-args")
-		ca, err := parseCustomArgs(v)
+	if raw, ok, err := resolveJSONInput(cmd, "custom-args", "pass '[]' to clear"); err != nil {
+		return err
+	} else if ok {
+		ca, err := parseCustomArgs(raw)
 		if err != nil {
 			return err
 		}
@@ -614,6 +736,16 @@ func runAgentCreate(cmd *cobra.Command, _ []string) error {
 	if err := client.PostJSON(ctx, "/api/agents", body, &result); err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}
+	if err := validateCommittedAgentCreateResponse(
+		result,
+		name,
+		runtimeID,
+		"",
+		"create agent",
+	); err != nil {
+		return err
+	}
+	result = sanitizeAgentForCLIOutput(result)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -631,6 +763,9 @@ func runAgentUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	body := map[string]any{}
+	if err := validateSingleJSONStdin(cmd, "runtime-config", "custom-args", "mcp-config"); err != nil {
+		return err
+	}
 	if cmd.Flags().Changed("name") {
 		v, _ := cmd.Flags().GetString("name")
 		body["name"] = v
@@ -647,21 +782,33 @@ func runAgentUpdate(cmd *cobra.Command, args []string) error {
 		v, _ := cmd.Flags().GetString("runtime-id")
 		body["runtime_id"] = v
 	}
-	if cmd.Flags().Changed("runtime-config") {
-		v, _ := cmd.Flags().GetString("runtime-config")
-		var rc any
-		if err := json.Unmarshal([]byte(v), &rc); err != nil {
-			return fmt.Errorf("--runtime-config must be valid JSON: %w", err)
+	if raw, ok, err := resolveJSONInput(cmd, "runtime-config", "pass '{}' to clear"); err != nil {
+		return err
+	} else if ok {
+		rc, err := parseRuntimeConfig(raw)
+		if err != nil {
+			return err
 		}
 		body["runtime_config"] = rc
+		if len(rc) == 0 {
+			body["runtime_config_intent"] = "clear"
+		} else {
+			body["runtime_config_intent"] = "replace"
+		}
 	}
-	if cmd.Flags().Changed("custom-args") {
-		v, _ := cmd.Flags().GetString("custom-args")
-		ca, err := parseCustomArgs(v)
+	if raw, ok, err := resolveJSONInput(cmd, "custom-args", "pass '[]' to clear"); err != nil {
+		return err
+	} else if ok {
+		ca, err := parseCustomArgs(raw)
 		if err != nil {
 			return err
 		}
 		body["custom_args"] = ca
+		if len(ca) == 0 {
+			body["custom_args_intent"] = "clear"
+		} else {
+			body["custom_args_intent"] = "replace"
+		}
 	}
 	if cmd.Flags().Changed("model") {
 		v, _ := cmd.Flags().GetString("model")
@@ -695,6 +842,11 @@ func runAgentUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	} else if ok {
 		body["mcp_config"] = mc
+		if string(mc) == "null" {
+			body["mcp_config_intent"] = "clear"
+		} else {
+			body["mcp_config_intent"] = "replace"
+		}
 	}
 
 	if len(body) == 0 {
@@ -708,6 +860,7 @@ func runAgentUpdate(cmd *cobra.Command, args []string) error {
 	if err := client.PutJSON(ctx, "/api/agents/"+args[0], body, &result); err != nil {
 		return fmt.Errorf("update agent: %w", err)
 	}
+	result = sanitizeAgentForCLIOutput(result)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -731,6 +884,7 @@ func runAgentArchive(cmd *cobra.Command, args []string) error {
 	if err := client.PostJSON(ctx, "/api/agents/"+args[0]+"/archive", nil, &result); err != nil {
 		return fmt.Errorf("archive agent: %w", err)
 	}
+	result = sanitizeAgentForCLIOutput(result)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -754,6 +908,7 @@ func runAgentRestore(cmd *cobra.Command, args []string) error {
 	if err := client.PostJSON(ctx, "/api/agents/"+args[0]+"/restore", nil, &result); err != nil {
 		return fmt.Errorf("restore agent: %w", err)
 	}
+	result = sanitizeAgentForCLIOutput(result)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -1011,6 +1166,29 @@ func printAgentSkillsMutationResult(cmd *cobra.Command, agentID string, result j
 // Agent env subcommands
 // ---------------------------------------------------------------------------
 
+type agentEnvUpdateResult struct {
+	AgentID           string   `json:"agent_id"`
+	HasCustomEnv      bool     `json:"has_custom_env"`
+	CustomEnvKeyCount int      `json:"custom_env_key_count"`
+	CustomEnvKeys     []string `json:"custom_env_keys"`
+	AddedKeys         []string `json:"added_keys"`
+	RemovedKeys       []string `json:"removed_keys"`
+	ChangedKeys       []string `json:"changed_keys"`
+	PreservedKeys     []string `json:"preserved_keys"`
+}
+
+type agentEnvUpdateWireResult struct {
+	AgentID           string            `json:"agent_id"`
+	CustomEnv         map[string]string `json:"custom_env"`
+	HasCustomEnv      bool              `json:"has_custom_env"`
+	CustomEnvKeyCount int               `json:"custom_env_key_count"`
+	CustomEnvKeys     []string          `json:"custom_env_keys"`
+	AddedKeys         []string          `json:"added_keys"`
+	RemovedKeys       []string          `json:"removed_keys"`
+	ChangedKeys       []string          `json:"changed_keys"`
+	PreservedKeys     []string          `json:"preserved_keys"`
+}
+
 // runAgentEnvGet fetches the plaintext custom_env for a single agent
 // via the audited `/env` endpoint. The CLI prints raw JSON in JSON
 // mode and a key/value table otherwise; we never truncate or mask
@@ -1044,12 +1222,13 @@ func runAgentEnvGet(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runAgentEnvSet replaces an agent's custom_env wholesale via the
-// audited `/env` endpoint. The three secret-safe input channels
-// (--custom-env, --custom-env-stdin, --custom-env-file) are required
-// — at least one must be supplied — and the server treats any value
-// equal to "****" as "preserve the existing entry" (see the **** guard
-// in the handler).
+// runAgentEnvSet replaces an agent's custom_env wholesale via the audited
+// `/env` endpoint. The response is a value-free confirmation containing key
+// names/counts and change metadata; neither table nor JSON output receives the
+// submitted values. The three secret-safe input channels
+// (--custom-env, --custom-env-stdin, --custom-env-file) are required — at
+// least one must be supplied — and the server treats any value equal to
+// "****" as "preserve the existing entry" (see the **** guard in the handler).
 func runAgentEnvSet(cmd *cobra.Command, args []string) error {
 	client, err := newAPIClient(cmd)
 	if err != nil {
@@ -1069,9 +1248,17 @@ func runAgentEnvSet(cmd *cobra.Command, args []string) error {
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
-	var result map[string]any
-	if err := client.PutJSON(ctx, "/api/agents/"+args[0]+"/env", body, &result); err != nil {
-		return fmt.Errorf("update agent env: %w", err)
+	var rawResult json.RawMessage
+	if err := client.PutJSON(ctx, "/api/agents/"+args[0]+"/env", body, &rawResult); err != nil {
+		var httpErr *cli.HTTPError
+		if errors.As(err, &httpErr) {
+			return fmt.Errorf("update agent env: %w", err)
+		}
+		return fmt.Errorf("update agent env response unreadable; the update may have saved; refresh before retry")
+	}
+	result, err := decodeAgentEnvUpdateResult(rawResult, args[0])
+	if err != nil {
+		return fmt.Errorf("update agent env response unreadable; the update may have saved; refresh before retry")
 	}
 
 	output, _ := cmd.Flags().GetString("output")
@@ -1079,14 +1266,158 @@ func runAgentEnvSet(cmd *cobra.Command, args []string) error {
 		return cli.PrintJSON(os.Stdout, result)
 	}
 
-	env, _ := result["custom_env"].(map[string]any)
-	fmt.Printf("Env updated for agent %s (%d keys)\n", args[0], len(env))
+	fmt.Printf("Env updated for agent %s (%d keys)\n", args[0], agentEnvUpdateKeyCount(result))
 	return nil
+}
+
+func decodeAgentEnvUpdateResult(raw json.RawMessage, expectedAgentID string) (agentEnvUpdateResult, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return agentEnvUpdateResult{}, errors.New("invalid response")
+	}
+
+	legacyKeys := map[string]struct{}{"agent_id": {}, "custom_env": {}}
+	currentKeys := map[string]struct{}{
+		"agent_id": {}, "custom_env": {}, "has_custom_env": {},
+		"custom_env_key_count": {}, "custom_env_keys": {}, "added_keys": {},
+		"removed_keys": {}, "changed_keys": {}, "preserved_keys": {},
+	}
+	if exactJSONFieldSet(fields, legacyKeys) {
+		var legacy struct {
+			AgentID   string            `json:"agent_id"`
+			CustomEnv map[string]string `json:"custom_env"`
+		}
+		if err := json.Unmarshal(raw, &legacy); err != nil ||
+			strings.TrimSpace(legacy.AgentID) == "" ||
+			legacy.AgentID != expectedAgentID ||
+			legacy.CustomEnv == nil {
+			return agentEnvUpdateResult{}, errors.New("invalid legacy response")
+		}
+		keys := make([]string, 0, len(legacy.CustomEnv))
+		for key := range legacy.CustomEnv {
+			if strings.TrimSpace(key) == "" {
+				return agentEnvUpdateResult{}, errors.New("invalid legacy key")
+			}
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		return agentEnvUpdateResult{
+			AgentID:           legacy.AgentID,
+			HasCustomEnv:      len(keys) > 0,
+			CustomEnvKeyCount: len(keys),
+			CustomEnvKeys:     keys,
+			AddedKeys:         []string{},
+			RemovedKeys:       []string{},
+			ChangedKeys:       []string{},
+			PreservedKeys:     []string{},
+		}, nil
+	}
+	if !exactJSONFieldSet(fields, currentKeys) {
+		return agentEnvUpdateResult{}, errors.New("unexpected response fields")
+	}
+
+	var wire agentEnvUpdateWireResult
+	if err := json.Unmarshal(raw, &wire); err != nil ||
+		strings.TrimSpace(wire.AgentID) == "" ||
+		wire.AgentID != expectedAgentID ||
+		wire.CustomEnv == nil ||
+		wire.CustomEnvKeyCount < 0 {
+		return agentEnvUpdateResult{}, errors.New("invalid response")
+	}
+	finalKeys, ok := uniqueNonEmptyStrings(wire.CustomEnvKeys)
+	if !ok || len(finalKeys) != wire.CustomEnvKeyCount ||
+		wire.HasCustomEnv != (wire.CustomEnvKeyCount > 0) ||
+		len(wire.CustomEnv) != len(finalKeys) {
+		return agentEnvUpdateResult{}, errors.New("inconsistent key metadata")
+	}
+	for key, value := range wire.CustomEnv {
+		if value != "****" {
+			return agentEnvUpdateResult{}, errors.New("unmasked response value")
+		}
+		if _, exists := finalKeys[key]; !exists {
+			return agentEnvUpdateResult{}, errors.New("custom_env key mismatch")
+		}
+	}
+
+	categories := [][]string{wire.AddedKeys, wire.RemovedKeys, wire.ChangedKeys, wire.PreservedKeys}
+	seenCategory := make(map[string]struct{})
+	for index, values := range categories {
+		set, valid := uniqueNonEmptyStrings(values)
+		if !valid {
+			return agentEnvUpdateResult{}, errors.New("invalid change metadata")
+		}
+		for key := range set {
+			if _, duplicate := seenCategory[key]; duplicate {
+				return agentEnvUpdateResult{}, errors.New("overlapping change metadata")
+			}
+			seenCategory[key] = struct{}{}
+			_, inFinal := finalKeys[key]
+			if (index == 1 && inFinal) || (index != 1 && !inFinal) {
+				return agentEnvUpdateResult{}, errors.New("inconsistent change metadata")
+			}
+		}
+	}
+	return agentEnvUpdateResult{
+		AgentID:           wire.AgentID,
+		HasCustomEnv:      wire.HasCustomEnv,
+		CustomEnvKeyCount: wire.CustomEnvKeyCount,
+		CustomEnvKeys:     append([]string(nil), wire.CustomEnvKeys...),
+		AddedKeys:         append([]string(nil), wire.AddedKeys...),
+		RemovedKeys:       append([]string(nil), wire.RemovedKeys...),
+		ChangedKeys:       append([]string(nil), wire.ChangedKeys...),
+		PreservedKeys:     append([]string(nil), wire.PreservedKeys...),
+	}, nil
+}
+
+func exactJSONFieldSet(fields map[string]json.RawMessage, expected map[string]struct{}) bool {
+	if len(fields) != len(expected) {
+		return false
+	}
+	for key := range fields {
+		if _, ok := expected[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func uniqueNonEmptyStrings(values []string) (map[string]struct{}, bool) {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return nil, false
+		}
+		if _, duplicate := out[value]; duplicate {
+			return nil, false
+		}
+		out[value] = struct{}{}
+	}
+	return out, true
+}
+
+func agentEnvUpdateKeyCount(result agentEnvUpdateResult) int {
+	if result.CustomEnvKeyCount > 0 {
+		return result.CustomEnvKeyCount
+	}
+	// Be tolerant of older/newer servers that omit the explicit count while
+	// retaining the value-free key-name list.
+	return len(result.CustomEnvKeys)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+func parseRuntimeConfig(raw string) (map[string]any, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("--runtime-config: empty input; pass '{}' to clear")
+	}
+	var config map[string]any
+	if err := json.Unmarshal([]byte(raw), &config); err != nil || config == nil {
+		return nil, fmt.Errorf("--runtime-config must be a valid JSON object")
+	}
+	return config, nil
+}
 
 // parseCustomEnv parses the --custom-env flag value (a JSON object literal)
 // into a string map suitable for the request body. The clear-all signal is
@@ -1118,12 +1449,94 @@ func parseCustomEnv(raw string) (map[string]string, error) {
 // secret channel today, it routinely carries values like "--api-key=…"
 // for runtime providers, and json.Unmarshal errors can echo short
 // fragments of malformed input.
-func parseCustomArgs(raw string) ([]string, error) {
+func parseStringArgs(raw, flagName string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("--%s: empty input; pass '[]' to clear", flagName)
+	}
 	var ca []string
 	if err := json.Unmarshal([]byte(raw), &ca); err != nil {
-		return nil, fmt.Errorf("--custom-args must be a valid JSON array of strings")
+		return nil, fmt.Errorf("--%s must be a valid JSON array of strings", flagName)
 	}
 	return ca, nil
+}
+
+func parseCustomArgs(raw string) ([]string, error) {
+	return parseStringArgs(raw, "custom-args")
+}
+
+// resolveJSONInput reads one inline/stdin/file flag family without ever
+// including payload content in an error. It is shared by secret-capable
+// runtime_config, custom_args, and runtime-profile fixed_args inputs.
+func resolveJSONInput(cmd *cobra.Command, name, emptyHint string) (string, bool, error) {
+	inline := cmd.Flags().Changed(name)
+	stdinName := name + "-stdin"
+	fileName := name + "-file"
+	fromStdin := false
+	if cmd.Flags().Lookup(stdinName) != nil {
+		fromStdin, _ = cmd.Flags().GetBool(stdinName)
+	}
+	fromFile := cmd.Flags().Lookup(fileName) != nil && cmd.Flags().Changed(fileName)
+
+	count := 0
+	for _, selected := range []bool{inline, fromStdin, fromFile} {
+		if selected {
+			count++
+		}
+	}
+	if count == 0 {
+		return "", false, nil
+	}
+	if count > 1 {
+		return "", false, fmt.Errorf("--%s, --%s, and --%s are mutually exclusive; pick one", name, stdinName, fileName)
+	}
+
+	var raw string
+	sourceName := name
+	switch {
+	case inline:
+		raw, _ = cmd.Flags().GetString(name)
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: --%s may expose credentials in shell history and process listings; prefer --%s or --%s.\n", name, fileName, stdinName)
+	case fromStdin:
+		sourceName = stdinName
+		buf, err := io.ReadAll(cmd.InOrStdin())
+		if err != nil {
+			return "", false, fmt.Errorf("read --%s: %w", stdinName, err)
+		}
+		raw = string(buf)
+	case fromFile:
+		sourceName = fileName
+		filePath, _ := cmd.Flags().GetString(fileName)
+		if strings.TrimSpace(filePath) == "" {
+			return "", false, fmt.Errorf("--%s: path must not be empty", fileName)
+		}
+		buf, err := os.ReadFile(filePath)
+		if err != nil {
+			return "", false, fmt.Errorf("read --%s: %w", fileName, err)
+		}
+		raw = string(buf)
+	}
+	if strings.TrimSpace(raw) == "" {
+		return "", false, fmt.Errorf("--%s: empty input; %s", sourceName, emptyHint)
+	}
+	return raw, true, nil
+}
+
+func validateSingleJSONStdin(cmd *cobra.Command, names ...string) error {
+	selected := make([]string, 0, 1)
+	for _, name := range names {
+		flagName := name + "-stdin"
+		if cmd.Flags().Lookup(flagName) == nil {
+			continue
+		}
+		on, _ := cmd.Flags().GetBool(flagName)
+		if on {
+			selected = append(selected, "--"+flagName)
+		}
+	}
+	if len(selected) > 1 {
+		return fmt.Errorf("%s cannot share one stdin payload; choose file input for all but one", strings.Join(selected, " and "))
+	}
+	return nil
 }
 
 // resolveCustomEnv collects the --custom-env, --custom-env-stdin, and

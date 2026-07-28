@@ -5,7 +5,10 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Loader2, Lock, Plug } from "lucide-react";
 import { toast } from "sonner";
 import type { Agent, ComposioToolkit } from "@multica/core/types";
-import { useUpdateAgentAllowlist } from "@multica/core/agents";
+import {
+  agentComposioToolkitAllowlistOptions,
+  useUpdateAgentAllowlist,
+} from "@multica/core/agents";
 import { useFeatureEnabled } from "@multica/core/config";
 import {
   composioConnectionsOptions,
@@ -13,6 +16,7 @@ import {
 } from "@multica/core/composio";
 import { COMPOSIO_MCP_APPS_FLAG } from "@multica/core/feature-flags";
 import { useWorkspacePaths } from "@multica/core/paths";
+import { Button } from "@multica/ui/components/ui/button";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { ComposioToolkitLogo } from "../../../common/composio-toolkit-logo";
 import { AppLink } from "../../../navigation";
@@ -20,9 +24,10 @@ import { useT } from "../../../i18n";
 
 /**
  * Creator-only MCP tab on the agent detail page (MUL-3870). Lets the agent
- * owner pick which of *their own* active Composio connections this agent may
- * mount as MCP servers — the selection is written to
- * `agent.composio_toolkit_allowlist`. At dispatch the overlay is mounted for
+ * owner pick which active Composio connections this agent may mount as MCP
+ * servers. Generic Agent resources expose only count/redacted metadata; this
+ * tab explicitly loads the raw selection from the audited human-only endpoint.
+ * At dispatch the overlay is mounted for
  * ANY run that passes the agent's invocation permission and always uses the
  * agent OWNER's Composio connection (MUL-3963) — it is no longer gated on the
  * run originator being the owner. That is why sharing the agent (public_to)
@@ -31,10 +36,9 @@ import { useT } from "../../../i18n";
  *
  * Visibility is enforced by the parent (the tab entry isn't rendered unless
  * `agent.owner_id === viewer.id`), so this component assumes the owner. It
- * still renders a defensive "hidden" state if the server redacted the
- * allowlist, and reads the checked state straight from the agent prop so the
- * optimistic cache write in `useUpdateAgentAllowlist` flips each box
- * instantly.
+ * still renders a defensive locked state if the privileged reveal fails.
+ * `useUpdateAgentAllowlist` optimistically updates only the dedicated raw
+ * query cache, so generic Agent caches remain value-free.
  */
 export function AgentMcpTab({ agent }: { agent: Agent }) {
   const { t } = useT("agents");
@@ -49,6 +53,13 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
   const toolkitsQuery = useQuery({
     ...composioToolkitsOptions(),
     enabled: composioEnabled,
+  });
+  const allowlistQuery = useQuery({
+    ...agentComposioToolkitAllowlistOptions(agent.id),
+    // A failed unreadable-2xx recovery is a persistent security fence. Do not
+    // let mount, focus, or reconnect issue an independent raw GET around the
+    // hook's exactly-one audited recovery/retry path.
+    enabled: composioEnabled && !updateAllowlist.isCommitUncertain,
   });
 
   // Toolkit metadata (name / logo) keyed by slug, so each connection row can
@@ -75,10 +86,18 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
     return out;
   }, [connectionsQuery.data]);
 
-  const allowlist = useMemo(
-    () => agent.composio_toolkit_allowlist ?? [],
-    [agent.composio_toolkit_allowlist],
-  );
+  const allowlist = allowlistQuery.data?.toolkit_slugs ?? [];
+  // A background refetch can be the recovery path after a mutation returned
+  // an unreadable 2xx confirmation. Never leave stale full-list controls
+  // interactive during that window: only a successful audited reveal for this
+  // agent makes the raw selection authoritative again.
+  const allowlistUnavailable =
+    allowlistQuery.isLoading ||
+    allowlistQuery.isFetching ||
+    !allowlistQuery.data ||
+    updateAllowlist.isCommitUncertain;
+  const allowlistRecoveryFailed =
+    updateAllowlist.allowlistRecoveryStatus === "failed";
 
   const settingsHref = `${paths.settings()}?tab=integrations`;
 
@@ -101,6 +120,9 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
   }
 
   const handleToggle = (slug: string, checked: boolean) => {
+    // Controls are hidden/disabled while fenced, but fail closed against an
+    // event that was already queued before the recovery-state rerender.
+    if (allowlistUnavailable) return;
     const set = new Set(allowlist);
     if (checked) set.add(slug);
     else set.delete(slug);
@@ -110,11 +132,19 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
     });
   };
 
-  // Defensive: the tab is owner-gated, so a redacted allowlist should never
-  // reach here. If it somehow does (stale cache, future fan-out), show the
-  // same "configured but hidden" affordance as the MCP config tab rather than
-  // an empty editor that a Save could clobber.
-  if (agent.composio_toolkit_allowlist_redacted === true) {
+  // A failed privileged reveal must never degrade into an empty editor: that
+  // would turn a subsequent Save into an accidental clear of hidden slugs.
+  if (
+    allowlistRecoveryFailed ||
+    (allowlistQuery.isError && !updateAllowlist.isCommitUncertain)
+  ) {
+    const retryReveal = () => {
+      if (updateAllowlist.isCommitUncertain) {
+        void updateAllowlist.retryCommitUncertainReveal();
+      } else {
+        void allowlistQuery.refetch();
+      }
+    };
     return (
       <div className="space-y-3">
         <p className="flex items-center gap-2 text-sm font-medium">
@@ -124,6 +154,9 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
         <p className="text-xs text-muted-foreground">
           {t(($) => $.tab_body.composio_mcp.redacted_hint)}
         </p>
+        <Button type="button" size="sm" variant="outline" onClick={retryReveal}>
+          {t(($) => $.tab_body.composio_mcp.retry_reveal)}
+        </Button>
       </div>
     );
   }
@@ -148,7 +181,7 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
         </div>
       )}
 
-      {connectionsQuery.isLoading ? (
+      {connectionsQuery.isLoading || allowlistUnavailable ? (
         <p className="text-sm text-muted-foreground">
           {t(($) => $.tab_body.composio_mcp.loading)}
         </p>
@@ -189,7 +222,12 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
                 </div>
                 <Checkbox
                   checked={checked}
-                  disabled={updateAllowlist.isPending}
+                  disabled={
+                    updateAllowlist.isPending ||
+                    updateAllowlist.isCommitUncertain ||
+                    allowlistQuery.isFetching ||
+                    !allowlistQuery.data
+                  }
                   onCheckedChange={(value) => handleToggle(slug, value === true)}
                   aria-label={t(($) => $.tab_body.composio_mcp.toggle_aria, {
                     toolkit: name,

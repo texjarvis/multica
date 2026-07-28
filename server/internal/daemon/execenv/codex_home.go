@@ -644,7 +644,7 @@ func linkCodexSessionsToStore(dst, storeDir, sharedSessions, resumeID string, lo
 	if resumeID != "" && len(findCodexRollouts(storeDir, resumeID)) == 0 {
 		if err := exposeResumeRollout(sharedSessions, storeDir, resumeID, logger); err != nil {
 			logger.Warn("execenv: bootstrap resume rollout into session store failed; task will fall back to a fresh thread",
-				"session_id", resumeID, "error", err)
+				"has_session_id", true, "has_error", true)
 		}
 	}
 	if err := ensureCodexSessionsLink(dst, storeDir); err != nil {
@@ -667,7 +667,7 @@ func linkCodexSessionsToStore(dst, storeDir, sharedSessions, resumeID string, lo
 func touchCodexSessionStore(storeDir string, logger *slog.Logger) {
 	now := time.Now()
 	if err := os.Chtimes(storeDir, now, now); err != nil {
-		logger.Warn("execenv: refresh codex session store activity failed", "store", storeDir, "error", err)
+		logger.Warn("execenv: refresh codex session store activity failed", "has_store", storeDir != "", "has_error", true)
 	}
 }
 
@@ -811,7 +811,7 @@ func exposeResumeRollout(sharedSessions, localSessions, sessionID string, logger
 		}
 		linked++
 	}
-	logger.Info("execenv: exposed resume rollout into task-local sessions", "session_id", sessionID, "files", linked)
+	logger.Info("execenv: exposed resume rollout into task-local sessions", "has_session_id", sessionID != "", "files", linked)
 	return nil
 }
 
@@ -1127,16 +1127,15 @@ func ensureSymlink(src, dst string) error {
 func logCodexAuthState(authPath string, logger *slog.Logger) {
 	fi, err := os.Lstat(authPath)
 	if err != nil {
-		logger.Info("execenv: codex auth.json absent", "path", authPath, "error", err)
+		logger.Info("execenv: codex auth.json absent", "has_path", authPath != "", "has_error", true)
 		return
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		target, _ := os.Readlink(authPath)
-		logger.Info("execenv: codex auth.json is symlink", "path", authPath, "target", target)
+		logger.Info("execenv: codex auth.json is symlink", "has_path", authPath != "")
 		return
 	}
 	logger.Info("execenv: codex auth.json is regular file",
-		"path", authPath,
+		"has_path", authPath != "",
 		"size", fi.Size(),
 		"mtime", fi.ModTime().UTC(),
 	)

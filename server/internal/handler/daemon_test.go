@@ -109,6 +109,7 @@ func setHandlerTestWorkspaceRepos(t *testing.T, repos []map[string]string) {
 // newDaemonTokenRequest creates an HTTP request with daemon token context set
 // (simulating DaemonAuth middleware for mdt_ tokens).
 func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID string) *http.Request {
+	bindReferencedDaemonFixtures(path, body, workspaceID, daemonID)
 	var buf bytes.Buffer
 	if body != nil {
 		json.NewEncoder(&buf).Encode(body)
@@ -118,6 +119,151 @@ func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID 
 	// No X-User-ID — daemon tokens don't set it.
 	ctx := middleware.WithDaemonContext(req.Context(), workspaceID, daemonID)
 	return req.WithContext(ctx)
+}
+
+// newDaemonPATRequest simulates the user-token branch of DaemonAuth for
+// handler tests that call DaemonRegister directly.
+func newDaemonPATRequest(method, path string, body any) *http.Request {
+	req := newRequest(method, path, body)
+	ctx := middleware.WithDaemonUserAuthContext(
+		req.Context(),
+		middleware.DaemonAuthPathPAT,
+		"",
+		"",
+	)
+	return req.WithContext(ctx)
+}
+
+// bindReferencedDaemonFixtures gives legacy handler fixtures the exact runtime
+// identity that production DaemonRegister would have written before an mdt_
+// request. These tests call handlers directly, so they bypass registration.
+//
+// Scope is deliberately narrow: update only a runtime/task UUID explicitly
+// named by this request, only inside the token's workspace, and only while the
+// runtime daemon_id is NULL. A non-NULL wrong-daemon fixture is never rebound,
+// so the negative authorization tests keep exercising the production denial.
+func bindReferencedDaemonFixtures(path string, body any, workspaceID, daemonID string) {
+	if testPool == nil ||
+		strings.TrimSpace(workspaceID) == "" ||
+		strings.TrimSpace(daemonID) == "" {
+		return
+	}
+	bindRuntime := func(runtimeID string) {
+		if _, err := uuid.Parse(runtimeID); err != nil {
+			return
+		}
+		_, _ = testPool.Exec(context.Background(), `
+			UPDATE agent_runtime
+			SET daemon_id = $2
+			WHERE id = $1
+			  AND workspace_id = $3
+			  AND daemon_id IS NULL
+		`, runtimeID, daemonID, workspaceID)
+	}
+	bindTask := func(taskID string) {
+		if _, err := uuid.Parse(taskID); err != nil {
+			return
+		}
+		_, _ = testPool.Exec(context.Background(), `
+			UPDATE agent_runtime AS runtime
+			SET daemon_id = $2
+			FROM agent_task_queue AS task
+			WHERE task.id = $1
+			  AND runtime.id = task.runtime_id
+			  AND runtime.workspace_id = $3
+			  AND runtime.daemon_id IS NULL
+		`, taskID, daemonID, workspaceID)
+	}
+
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i, part := range parts {
+		if part == "runtimes" && i+1 < len(parts) {
+			bindRuntime(parts[i+1])
+			break
+		}
+		if part == "tasks" && i+1 < len(parts) {
+			bindTask(parts[i+1])
+			break
+		}
+	}
+
+	requestBody, ok := body.(map[string]any)
+	if !ok {
+		return
+	}
+	bindStringValues := func(value any, bind func(string)) {
+		switch values := value.(type) {
+		case string:
+			bind(values)
+		case []string:
+			for _, item := range values {
+				bind(item)
+			}
+		case []any:
+			for _, item := range values {
+				if text, ok := item.(string); ok {
+					bind(text)
+				}
+			}
+		}
+	}
+	bindStringValues(requestBody["runtime_id"], bindRuntime)
+	bindStringValues(requestBody["runtime_ids"], bindRuntime)
+	bindStringValues(requestBody["task_id"], bindTask)
+	bindStringValues(requestBody["task_ids"], bindTask)
+}
+
+func runtimeDaemonIDForTest(t *testing.T, runtimeID string) string {
+	t.Helper()
+	var daemonID string
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT daemon_id FROM agent_runtime WHERE id = $1`,
+		runtimeID,
+	).Scan(&daemonID); err != nil {
+		t.Fatalf("load runtime daemon identity: %v", err)
+	}
+	if strings.TrimSpace(daemonID) == "" {
+		t.Fatal("runtime fixture is missing its daemon identity")
+	}
+	return daemonID
+}
+
+// runtimeDaemonIDOrFallbackForTest keeps positive daemon-handler tests bound
+// to the identity already registered on their runtime. Legacy fixtures with a
+// NULL daemon_id return fallback; newDaemonTokenRequest then performs the
+// narrowly scoped NULL-only registration simulation above.
+func runtimeDaemonIDOrFallbackForTest(t *testing.T, runtimeID, fallback string) string {
+	t.Helper()
+	var daemonID string
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT COALESCE(daemon_id, '') FROM agent_runtime WHERE id = $1`,
+		runtimeID,
+	).Scan(&daemonID); err != nil {
+		t.Fatalf("load runtime daemon identity: %v", err)
+	}
+	if strings.TrimSpace(daemonID) == "" {
+		return fallback
+	}
+	return daemonID
+}
+
+func taskRuntimeDaemonIDOrFallbackForTest(t *testing.T, taskID, fallback string) string {
+	t.Helper()
+	var daemonID string
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT COALESCE(runtime.daemon_id, '')
+		FROM agent_task_queue AS task
+		JOIN agent_runtime AS runtime ON runtime.id = task.runtime_id
+		WHERE task.id = $1
+	`, taskID).Scan(&daemonID); err != nil {
+		t.Fatalf("load task runtime daemon identity: %v", err)
+	}
+	if strings.TrimSpace(daemonID) == "" {
+		return fallback
+	}
+	return daemonID
 }
 
 func TestListDaemonWorkspaces_UserScopedAndConditional(t *testing.T) {
@@ -520,7 +666,7 @@ func TestExtendTaskPrepareLease(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+otherRuntimeID+"/tasks/"+taskID+"/prepare-lease", nil,
-		testWorkspaceID, "extend-prepare-lease")
+		testWorkspaceID, "extend-other-runtime-daemon")
 	req = withURLParams(req, "runtimeId", otherRuntimeID, "taskId", taskID)
 	testHandler.ExtendTaskPrepareLease(w, req)
 	if w.Code != http.StatusNotFound {
@@ -1054,7 +1200,10 @@ func TestHandleDaemonWSHeartbeat_RuntimeGoneReturnsAckNotError(t *testing.T) {
 	// must turn the resulting pgx.ErrNoRows into a RuntimeGone ack.
 	missingRuntime := uuid.New().String()
 	ack, err := testHandler.HandleDaemonWSHeartbeat(context.Background(),
-		daemonws.ClientIdentity{WorkspaceID: testWorkspaceID},
+		daemonws.ClientIdentity{
+			WorkspaceID: testWorkspaceID,
+			RuntimeIDs:  []string{missingRuntime},
+		},
 		missingRuntime, false)
 	if err != nil {
 		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
@@ -1088,6 +1237,12 @@ func TestHandleDaemonWSHeartbeat_AllowsAnyAuthorizedWorkspace(t *testing.T) {
 	`, "WS Heartbeat Scope", slug, "Temporary workspace for WS heartbeat tests", "HWS").Scan(&workspaceID); err != nil {
 		t.Fatalf("setup: create workspace: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'member')
+	`, workspaceID, testUserID); err != nil {
+		t.Fatalf("setup: create workspace membership: %v", err)
+	}
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, workspaceID)
 	})
@@ -1108,7 +1263,12 @@ func TestHandleDaemonWSHeartbeat_AllowsAnyAuthorizedWorkspace(t *testing.T) {
 	})
 
 	ack, err := testHandler.HandleDaemonWSHeartbeat(ctx,
-		daemonws.ClientIdentity{WorkspaceIDs: []string{testWorkspaceID, workspaceID}},
+		daemonws.ClientIdentity{
+			WorkspaceIDs: []string{testWorkspaceID, workspaceID},
+			RuntimeIDs:   []string{runtimeID},
+			UserID:       testUserID,
+			AuthPath:     middleware.DaemonAuthPathPAT,
+		},
 		runtimeID, false)
 	if err != nil {
 		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
@@ -1166,7 +1326,7 @@ func TestDaemonHeartbeat_SlowProbeDoesNotWedge(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
 		"runtime_id": runtimeID,
-	}, testWorkspaceID, "runtime-local-skills-daemon")
+	}, testWorkspaceID, runtimeDaemonIDForTest(t, runtimeID))
 
 	start := time.Now()
 	testHandler.DaemonHeartbeat(w, req)
@@ -1206,7 +1366,7 @@ func TestDaemonHeartbeat_EmptyQueueSkipsPopPending(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
 		"runtime_id": runtimeID,
-	}, testWorkspaceID, "runtime-local-skills-daemon")
+	}, testWorkspaceID, runtimeDaemonIDForTest(t, runtimeID))
 
 	testHandler.DaemonHeartbeat(w, req)
 	if w.Code != http.StatusOK {
@@ -1272,10 +1432,8 @@ func TestGetTaskStatus_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	// Same request with the CORRECT workspace should succeed.
 	w = httptest.NewRecorder()
 	req = newDaemonTokenRequest("GET", "/api/daemon/tasks/"+taskID+"/status", nil,
-		testWorkspaceID, "legit-daemon")
-	req = req.WithContext(context.WithValue(
-		middleware.WithDaemonContext(req.Context(), testWorkspaceID, "legit-daemon"),
-		chi.RouteCtxKey, rctx))
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 
 	testHandler.GetTaskStatus(w, req)
 	if w.Code != http.StatusOK {
@@ -1921,7 +2079,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	// Register under the new stable UUID, declaring the prior hostname-derived
 	// id as legacy. The handler should merge the legacy row into the new one.
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{legacyDaemonID},
@@ -2015,7 +2173,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_ReverseDotLocal(t *testing.T
 	})
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{"ReverseDotLocalHost", emittedLegacyID},
@@ -2073,7 +2231,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_CaseDrift(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{emittedLegacyID},
@@ -2169,7 +2327,7 @@ func TestDaemonRegister_MergesAllCaseDuplicateLegacyRuntimes(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, lowerAgentID) })
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         newDaemonID,
 		"legacy_daemon_ids": []string{storedLowerID}, // a single candidate must resolve both stored casings
@@ -2226,7 +2384,7 @@ func TestDaemonRegister_LegacyIDNoMatchIsNoop(t *testing.T) {
 	ctx := context.Background()
 
 	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/daemon/register", map[string]any{
+	req := newDaemonPATRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id":      testWorkspaceID,
 		"daemon_id":         "0192a7a1-5e3c-7be9-9a7d-6e0f1cb3deab",
 		"legacy_daemon_ids": []string{"NeverSeenHost", "NeverSeenHost.local"},
@@ -2324,7 +2482,7 @@ func TestStartTask_AutopilotRunOnlyTask_ResolvesWorkspace(t *testing.T) {
 	// Same-workspace daemon token must succeed — this is the bug in #1224.
 	w = httptest.NewRecorder()
 	req = newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/start", nil,
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 
 	testHandler.StartTask(w, req)
@@ -2410,7 +2568,13 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
 
 	w := httptest.NewRecorder()
-	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-project-repos")
+	req := newDaemonTokenRequest(
+		"POST",
+		"/api/daemon/runtimes/"+runtimeID+"/claim",
+		nil,
+		testWorkspaceID,
+		runtimeDaemonIDOrFallbackForTest(t, runtimeID, "test-claim-project-repos"),
+	)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
@@ -2501,7 +2665,13 @@ func TestClaimTask_ProjectDescriptionInjected(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
 
 	w := httptest.NewRecorder()
-	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-project-desc")
+	req := newDaemonTokenRequest(
+		"POST",
+		"/api/daemon/runtimes/"+runtimeID+"/claim",
+		nil,
+		testWorkspaceID,
+		runtimeDaemonIDOrFallbackForTest(t, runtimeID, "test-claim-project-desc"),
+	)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
@@ -2623,7 +2793,13 @@ func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
 
 	w := httptest.NewRecorder()
-	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-fallback")
+	req := newDaemonTokenRequest(
+		"POST",
+		"/api/daemon/runtimes/"+runtimeID+"/claim",
+		nil,
+		testWorkspaceID,
+		runtimeDaemonIDOrFallbackForTest(t, runtimeID, "test-claim-fallback"),
+	)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
@@ -2702,7 +2878,7 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceID(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
-		testWorkspaceID, "test-daemon-claim")
+		testWorkspaceID, runtimeDaemonIDOrFallbackForTest(t, runtimeID, "test-daemon-claim"))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", runtimeID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -2794,7 +2970,7 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+localRuntimeID+"/claim", nil,
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, runtimeDaemonIDOrFallbackForTest(t, localRuntimeID, "legit-daemon"))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", localRuntimeID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -2881,7 +3057,7 @@ func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *test
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
 		map[string]any{"output": agentFinalOutput},
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskId", taskID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -2989,7 +3165,7 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
 		map[string]any{"output": "final terminal text that must NOT become a comment"},
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskId", taskID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -3060,7 +3236,7 @@ func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T)
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
 		map[string]any{"output": "Done."},
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskId", taskID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -3122,7 +3298,7 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
 		map[string]any{"output": "Done."},
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskId", taskID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -4238,7 +4414,7 @@ func TestGetTaskGCCheck(t *testing.T) {
 	// Same-workspace probe — terminal task returns its status.
 	w = httptest.NewRecorder()
 	req = newDaemonTokenRequest("GET", "/api/daemon/tasks/"+taskID+"/gc-check", nil,
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	req = withURLParam(req, "taskId", taskID)
 	testHandler.GetTaskGCCheck(w, req)
 	if w.Code != http.StatusOK {
@@ -4835,7 +5011,7 @@ func TestAckTaskCancelled(t *testing.T) {
 	// Same-workspace token settles the deferred finalize.
 	w = httptest.NewRecorder()
 	req = newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/cancel-ack", nil,
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	req = withURLParam(req, "taskId", taskID)
 	testHandler.AckTaskCancelled(w, req)
 	if w.Code != http.StatusOK {
@@ -4862,7 +5038,7 @@ func TestAckTaskCancelled(t *testing.T) {
 	// Idempotent: a second ack is a no-op (no duplicate Stopped.).
 	w = httptest.NewRecorder()
 	req = newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/cancel-ack", nil,
-		testWorkspaceID, "legit-daemon")
+		testWorkspaceID, taskRuntimeDaemonIDOrFallbackForTest(t, taskID, "legit-daemon"))
 	req = withURLParam(req, "taskId", taskID)
 	testHandler.AckTaskCancelled(w, req)
 	if w.Code != http.StatusOK {

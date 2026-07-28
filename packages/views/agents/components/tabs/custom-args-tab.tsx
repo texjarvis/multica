@@ -1,16 +1,31 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Loader2,
+  Lock,
   Pencil,
   Plus,
   Save,
   Terminal,
   Trash2,
 } from "lucide-react";
-import type { Agent, RuntimeDevice } from "@multica/core/types";
+import type {
+  Agent,
+  RuntimeDevice,
+  UpdateAgentRequest,
+} from "@multica/core/types";
 import { createSafeId } from "@multica/core/utils";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@multica/ui/components/ui/alert-dialog";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { toast } from "sonner";
@@ -47,23 +62,45 @@ export function CustomArgsTab({
   runtimeDevice,
   onSave,
   onDirtyChange,
+  canManage = false,
 }: {
   agent: Agent;
   runtimeDevice?: RuntimeDevice;
-  onSave: (updates: Partial<Agent>) => Promise<void>;
+  onSave: (updates: UpdateAgentRequest) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
+  canManage?: boolean;
 }) {
   const { t } = useT("agents");
-  const [entries, setEntries] = useState<ArgEntry[]>(
-    argsToEntries(agent.custom_args ?? []),
+  const redacted = agent.custom_args_redacted === true;
+  const [stateAgentId, setStateAgentId] = useState(agent.id);
+  const [entriesState, setEntries] = useState<ArgEntry[]>(
+    argsToEntries(redacted ? [] : (agent.custom_args ?? [])),
   );
-  const [editor, setEditor] = useState<EditorState>(null);
-  const [editorValue, setEditorValue] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [editorState, setEditor] = useState<EditorState>(null);
+  const [editorValueState, setEditorValue] = useState("");
+  const [savingState, setSaving] = useState(false);
+  const [replaceModeState, setReplaceMode] = useState(false);
+  const [replacementBaselineState, setReplacementBaseline] = useState<string[]>([]);
+  const [clearRequestedState, setClearRequested] = useState(false);
+  const [clearingState, setClearing] = useState(false);
   const editorInputRef = useRef<HTMLInputElement>(null);
+  const activeAgentIdRef = useRef(agent.id);
+  const generationRef = useRef(0);
+
+  const stateIsCurrent = stateAgentId === agent.id;
+  const entries = stateIsCurrent ? entriesState : [];
+  const editor = stateIsCurrent ? editorState : null;
+  const editorValue = stateIsCurrent ? editorValueState : "";
+  const saving = stateIsCurrent && savingState;
+  const replaceMode = stateIsCurrent && replaceModeState;
+  const replacementBaseline = stateIsCurrent ? replacementBaselineState : [];
+  const clearRequested = stateIsCurrent && clearRequestedState;
+  const clearing = stateIsCurrent && clearingState;
 
   const currentArgs = entriesToArgs(entries);
-  const originalArgs = agent.custom_args ?? [];
+  const originalArgs = replaceMode
+    ? replacementBaseline
+    : (agent.custom_args ?? []);
   const dirty = JSON.stringify(currentArgs) !== JSON.stringify(originalArgs);
 
   useEffect(() => {
@@ -73,6 +110,24 @@ export function CustomArgsTab({
   useEffect(() => {
     if (editor) editorInputRef.current?.focus();
   }, [editor]);
+
+  useLayoutEffect(() => {
+    activeAgentIdRef.current = agent.id;
+    generationRef.current += 1;
+    setStateAgentId(agent.id);
+    setEntries(argsToEntries(redacted ? [] : (agent.custom_args ?? [])));
+    setReplaceMode(false);
+    setReplacementBaseline([]);
+    setEditor(null);
+    setEditorValue("");
+    setClearRequested(false);
+    setSaving(false);
+    setClearing(false);
+    // Intentionally do not depend on agent.custom_args: a successful
+    // replacement refetches the same redacted [] placeholder, and that
+    // must not erase the fresh local replacement while this tab stays open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent.id, redacted]);
 
   const startAdding = () => {
     setEditor({ kind: "add" });
@@ -111,18 +166,100 @@ export function CustomArgsTab({
   };
 
   const handleSave = async () => {
+    const requestAgentId = agent.id;
+    const requestGeneration = generationRef.current;
+    const submittedArgs = currentArgs;
+    const submittedReplaceMode = replaceMode;
     setSaving(true);
     try {
-      await onSave({ custom_args: currentArgs });
+      await onSave({
+        custom_args: submittedArgs,
+        custom_args_intent: submittedArgs.length === 0 ? "clear" : "replace",
+      });
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
+      if (submittedReplaceMode) setReplacementBaseline(submittedArgs);
       toast.success(t(($) => $.tab_body.custom_args.saved_toast));
     } catch (err) {
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       toast.error(
         err instanceof Error && err.message
           ? err.message
           : t(($) => $.tab_body.custom_args.save_failed_toast),
       );
     } finally {
-      setSaving(false);
+      if (
+        activeAgentIdRef.current === requestAgentId &&
+        generationRef.current === requestGeneration
+      ) {
+        setSaving(false);
+      }
+    }
+  };
+
+  const startReplacement = () => {
+    // The redacted [] is not source data. Start a clean, explicit replacement
+    // so no legacy mcp_servers secret placeholder can be written back.
+    setEntries([]);
+    setReplacementBaseline([]);
+    setReplaceMode(true);
+  };
+
+  const cancelReplacement = () => {
+    setEntries([]);
+    setReplacementBaseline([]);
+    setReplaceMode(false);
+    closeEditor();
+  };
+
+  const handleClear = async () => {
+    const requestAgentId = agent.id;
+    const requestGeneration = generationRef.current;
+    setClearing(true);
+    try {
+      await onSave({
+        custom_args: [],
+        custom_args_intent: "clear",
+      });
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
+      setEntries([]);
+      setReplacementBaseline([]);
+      setReplaceMode(false);
+      setClearRequested(false);
+      toast.success(t(($) => $.tab_body.custom_args.cleared_toast));
+    } catch (err) {
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
+      toast.error(
+        err instanceof Error && err.message
+          ? err.message
+          : t(($) => $.tab_body.custom_args.clear_failed_toast),
+      );
+    } finally {
+      if (
+        activeAgentIdRef.current === requestAgentId &&
+        generationRef.current === requestGeneration
+      ) {
+        setClearing(false);
+      }
     }
   };
 
@@ -170,11 +307,111 @@ export function CustomArgsTab({
     ? [launchHeader, ...currentArgs.map(formatArgForPreview)].join(" ")
     : null;
 
+  if (redacted && !replaceMode) {
+    return (
+      <div className="space-y-6">
+        <p className="max-w-2xl text-pretty text-sm leading-6 text-muted-foreground">
+          {t(($) => $.tab_body.custom_args.intro)}
+        </p>
+        <SettingsCard>
+          <div className="space-y-3 p-4">
+            <div className="flex items-start gap-2">
+              <Lock
+                className="mt-0.5 size-4 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <div>
+                <p className="text-sm font-medium">
+                  {t(($) => $.tab_body.custom_args.redacted_title)}
+                </p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t(($) => $.tab_body.custom_args.redacted_hint)}
+                </p>
+              </div>
+            </div>
+            {canManage ? (
+              <div className="flex flex-wrap gap-2 pl-6">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={startReplacement}
+                >
+                  {t(($) => $.tab_body.custom_args.replace_action)}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="text-destructive"
+                  onClick={() => setClearRequested(true)}
+                >
+                  {t(($) => $.tab_body.custom_args.clear_action)}
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        </SettingsCard>
+        <AlertDialog
+          open={clearRequested}
+          onOpenChange={(open) =>
+            !open && !clearing && setClearRequested(false)
+          }
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t(($) => $.tab_body.custom_args.clear_dialog_title)}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {t(($) => $.tab_body.custom_args.clear_dialog_description)}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={clearing}>
+                {t(($) => $.tab_body.custom_args.cancel_action)}
+              </AlertDialogCancel>
+              <AlertDialogAction
+                variant="destructive"
+                onClick={handleClear}
+                disabled={clearing}
+              >
+                {clearing ? (
+                  <Loader2
+                    className="size-3.5 animate-spin motion-reduce:animate-none"
+                    aria-hidden="true"
+                  />
+                ) : null}
+                {t(($) => $.tab_body.custom_args.clear_confirm_action)}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <p className="max-w-2xl text-pretty text-sm leading-6 text-muted-foreground">
         {t(($) => $.tab_body.custom_args.intro)}
       </p>
+
+      {replaceMode ? (
+        <div className="flex items-start justify-between gap-3 rounded-lg border border-dashed px-4 py-3">
+          <p className="text-xs leading-5 text-muted-foreground">
+            {t(($) => $.tab_body.custom_args.replace_hint)}
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={cancelReplacement}
+          >
+            {t(($) => $.tab_body.custom_args.cancel_action)}
+          </Button>
+        </div>
+      ) : null}
 
       <SettingsSection
         title={t(($) => $.tab_body.custom_args.arguments_label)}

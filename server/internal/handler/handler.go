@@ -597,6 +597,13 @@ func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (act
 		slog.Debug("resolveActor: X-Agent-ID rejected, agent not found or workspace mismatch", "agent_id", agentID, "workspace_id", workspaceID)
 		return "member", userID
 	}
+	// This fallback runs under a human JWT/PAT, so the claimed agent must be
+	// owned by that authenticated human. A valid foreign agent/task UUID pair
+	// is not proof that the caller may assume the foreign agent's identity.
+	if uuidToString(agent.OwnerID) != userID {
+		slog.Debug("resolveActor: X-Agent-ID rejected, authenticated user is not agent owner", "agent_id", agentID)
+		return "member", userID
+	}
 
 	taskUUID, err := util.ParseUUID(taskID)
 	if err != nil {

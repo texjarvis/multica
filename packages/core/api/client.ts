@@ -27,9 +27,13 @@ import type {
   CreateAgentFromTemplateResponse,
   AgentBuilderRuntimeSwitch,
   AgentBuilderSession,
+  AgentComposioToolkitAllowlistResponse,
+  AgentComposioToolkitAllowlistUpdateResponse,
   UpdateAgentRequest,
   AgentEnvResponse,
+  AgentEnvUpdateResponse,
   UpdateAgentEnvRequest,
+  UpdateAgentComposioToolkitAllowlistRequest,
   AgentTask,
   AgentActivityBucket,
   AgentRunCount,
@@ -174,8 +178,15 @@ import type {
 import { type Logger, noopLogger } from "../logger";
 import { createRequestId } from "../utils";
 import { getCurrentSlug } from "../platform/workspace-storage";
-import { parseWithFallback } from "./schema";
 import {
+  parseSecretWithFallback,
+  parseWithFallback,
+  SecretResponseUnreadableError,
+} from "./schema";
+import {
+  AgentListSchema,
+  AgentSchema,
+  CommittedAgentSchema,
   AgentTaskListSchema,
   AgentTemplateSchema,
   AgentTemplateSummaryListSchema,
@@ -191,6 +202,10 @@ import {
   CreateAgentFromTemplateResponseSchema,
   AgentBuilderRuntimeSwitchSchema,
   AgentBuilderSessionSchema,
+  AgentComposioToolkitAllowlistResponseSchema,
+  AgentComposioToolkitAllowlistUpdateResponseSchema,
+  AgentEnvResponseSchema,
+  AgentEnvUpdateResponseSchema,
   agentBuilderRuntimeSwitchFallback,
   DashboardAgentRunTimeListSchema,
   DashboardRunTimeDailyListSchema,
@@ -200,12 +215,18 @@ import {
   DashboardUsageDailyListSchema,
   EMPTY_AGENT_TEMPLATE_DETAIL,
   EMPTY_AGENT_TEMPLATE_SUMMARY_LIST,
+  EMPTY_AGENT,
   EMPTY_APP_CONFIG,
   EMPTY_ATTACHMENT,
   EMPTY_CLOUD_RUNTIME_NODE,
   EMPTY_CLOUD_RUNTIME_NODE_LIST,
   EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE,
   EMPTY_AGENT_BUILDER_SESSION,
+  EMPTY_AGENT_COMPOSIO_TOOLKIT_ALLOWLIST_RESPONSE,
+  EMPTY_AGENT_COMPOSIO_TOOLKIT_ALLOWLIST_UPDATE_RESPONSE,
+  EMPTY_AGENT_ENV_RESPONSE,
+  EMPTY_AGENT_ENV_UPDATE_RESPONSE,
+  EMPTY_RUNTIME_PROFILE,
   EMPTY_GROUPED_ISSUES_RESPONSE,
   EMPTY_ISSUE_TABLE_FACETS_RESPONSE,
   EMPTY_ISSUE_TABLE_GROUPS_RESPONSE,
@@ -236,6 +257,9 @@ import {
   CreateIssueResponseSchema,
   ListWebhookDeliveriesResponseSchema,
   RuntimeHourlyActivityListSchema,
+  RuntimeProfileListResponseSchema,
+  CommittedRuntimeProfileSchema,
+  RuntimeProfileSchema,
   RuntimeUsageByAgentListSchema,
   RuntimeUsageByHourListSchema,
   RuntimeUsageListSchema,
@@ -342,6 +366,34 @@ export class ApiError extends Error {
     this.status = status;
     this.statusText = statusText;
     this.body = body;
+  }
+}
+
+// A successful mutation status was received, but its secret-bearing response
+// body failed safe schema validation. The write may already be committed, so
+// retrying could duplicate a create or replay a destructive replacement.
+export class CommittedResponseUnreadableError extends Error {
+  readonly committed = true;
+  readonly endpoint: string;
+
+  constructor(endpoint: string) {
+    super(`The server may have saved this change, but its response could not be read safely. Refresh before retrying.`);
+    this.name = "CommittedResponseUnreadableError";
+    this.endpoint = endpoint;
+  }
+}
+
+function parseCommittedSecretResponse<T>(
+  parse: () => T,
+  endpoint: string,
+): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof SecretResponseUnreadableError) {
+      throw new CommittedResponseUnreadableError(endpoint);
+    }
+    throw error;
   }
 }
 
@@ -1052,34 +1104,63 @@ export class ApiClient {
     const search = new URLSearchParams();
     if (params?.workspace_id) search.set("workspace_id", params.workspace_id);
     if (params?.include_archived) search.set("include_archived", "true");
-    return this.fetch(`/api/agents?${search}`);
+    const raw = await this.fetch<unknown>(`/api/agents?${search}`);
+    return parseSecretWithFallback(raw, AgentListSchema, [], {
+      endpoint: "GET /api/agents",
+    });
   }
 
   async getAgent(id: string): Promise<Agent> {
-    return this.fetch(`/api/agents/${id}`);
+    const raw = await this.fetch<unknown>(`/api/agents/${id}`);
+    return parseSecretWithFallback(raw, AgentSchema, { ...EMPTY_AGENT, id }, {
+      endpoint: "GET /api/agents/:id",
+    });
   }
 
   async createAgent(data: CreateAgentRequest): Promise<Agent> {
-    return this.fetch("/api/agents", {
+    const endpoint = "POST /api/agents";
+    const raw = await this.fetch<unknown>("/api/agents", {
       method: "POST",
       body: JSON.stringify(data),
     });
+    return parseCommittedSecretResponse(
+      () => {
+        const response = parseSecretWithFallback(
+          raw,
+          CommittedAgentSchema,
+          EMPTY_AGENT,
+          { endpoint },
+        );
+        if (response.runtime_id !== data.runtime_id) {
+          throw new SecretResponseUnreadableError(endpoint);
+        }
+        return response;
+      },
+      endpoint,
+    );
   }
 
   async createAgentBuilderSession(data: {
     runtime_id: string;
     model?: string;
   }): Promise<AgentBuilderSession> {
+    const endpoint = "POST /api/agent-builder/sessions";
     const raw = await this.fetch<unknown>("/api/agent-builder/sessions", {
       method: "POST",
       body: JSON.stringify(data),
     });
-    return parseWithFallback(
-      raw,
-      AgentBuilderSessionSchema,
-      EMPTY_AGENT_BUILDER_SESSION,
-      { endpoint: "POST /api/agent-builder/sessions" },
-    );
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+          raw,
+          AgentBuilderSessionSchema,
+          EMPTY_AGENT_BUILDER_SESSION,
+          { endpoint },
+        );
+      if (response.runtime_id !== data.runtime_id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   /** Rebinds a live builder conversation to another runtime. Callers must not
@@ -1138,27 +1219,66 @@ export class ApiClient {
   async createAgentFromTemplate(
     data: CreateAgentFromTemplateRequest,
   ): Promise<CreateAgentFromTemplateResponse> {
+    const endpoint = "POST /api/agents/from-template";
     const raw = await this.fetch<unknown>("/api/agents/from-template", {
       method: "POST",
       body: JSON.stringify(data),
     });
-    return parseWithFallback(
-      raw,
-      CreateAgentFromTemplateResponseSchema,
-      EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE,
-      { endpoint: "POST /api/agents/from-template" },
-    );
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+          raw,
+          CreateAgentFromTemplateResponseSchema,
+          EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE,
+          { endpoint },
+        );
+      if (response.agent.runtime_id !== data.runtime_id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   async updateAgent(id: string, data: UpdateAgentRequest): Promise<Agent> {
-    return this.fetch(`/api/agents/${id}`, {
+    const endpoint = "PUT /api/agents/:id";
+    const raw = await this.fetch<unknown>(`/api/agents/${id}`, {
       method: "PUT",
       body: JSON.stringify(data),
     });
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+        raw,
+        CommittedAgentSchema,
+        { ...EMPTY_AGENT, id },
+        {
+          endpoint,
+        },
+      );
+      if (response.id !== id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   async archiveAgent(id: string): Promise<Agent> {
-    return this.fetch(`/api/agents/${id}/archive`, { method: "POST" });
+    const endpoint = "POST /api/agents/:id/archive";
+    const raw = await this.fetch<unknown>(`/api/agents/${id}/archive`, {
+      method: "POST",
+    });
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+        raw,
+        CommittedAgentSchema,
+        { ...EMPTY_AGENT, id },
+        {
+          endpoint,
+        },
+      );
+      if (response.id !== id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   /**
@@ -1168,26 +1288,122 @@ export class ApiClient {
    * MUL-2600.
    */
   async getAgentEnv(id: string): Promise<AgentEnvResponse> {
-    return this.fetch(`/api/agents/${id}/env`);
+    const endpoint = "GET /api/agents/:id/env";
+    const raw = await this.fetch<unknown>(`/api/agents/${id}/env`);
+    const response = parseSecretWithFallback(
+      raw,
+      AgentEnvResponseSchema,
+      EMPTY_AGENT_ENV_RESPONSE,
+      { endpoint },
+    );
+    if (response.agent_id !== id) {
+      throw new SecretResponseUnreadableError(endpoint);
+    }
+    return response;
   }
 
   /**
    * Replaces an agent's `custom_env` wholesale. Values equal to
    * `"****"` are preserved server-side (the **** guard) so a partial
    * UI edit doesn't overwrite real secrets with the masked
-   * placeholder. Owner/admin only; agent actors get a 403. Every
-   * successful call writes an `agent_env_updated` activity_log row.
-   * MUL-2600.
+   * placeholder. The response is a value-free confirmation with key
+   * names/counts and change metadata, never the submitted values.
+   * Owner/admin only; agent actors get a 403. Every successful call
+   * writes an `agent_env_updated` activity_log row. MUL-2600.
    */
-  async updateAgentEnv(id: string, data: UpdateAgentEnvRequest): Promise<AgentEnvResponse> {
-    return this.fetch(`/api/agents/${id}/env`, {
+  async updateAgentEnv(id: string, data: UpdateAgentEnvRequest): Promise<AgentEnvUpdateResponse> {
+    const endpoint = "PUT /api/agents/:id/env";
+    const raw = await this.fetch<unknown>(`/api/agents/${id}/env`, {
       method: "PUT",
       body: JSON.stringify(data),
     });
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+          raw,
+          AgentEnvUpdateResponseSchema,
+          EMPTY_AGENT_ENV_UPDATE_RESPONSE,
+          { endpoint },
+        );
+      if (response.agent_id !== id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
+  }
+
+  /**
+   * Reveals raw toolkit slugs through the narrow, audited human-only
+   * endpoint. Generic Agent resources remain value-free.
+   */
+  async getAgentComposioToolkitAllowlist(
+    id: string,
+  ): Promise<AgentComposioToolkitAllowlistResponse> {
+    const endpoint = "GET /api/agents/:id/composio-toolkit-allowlist";
+    const raw = await this.fetch<unknown>(
+      `/api/agents/${id}/composio-toolkit-allowlist`,
+    );
+    const response = parseSecretWithFallback(
+      raw,
+      AgentComposioToolkitAllowlistResponseSchema,
+      EMPTY_AGENT_COMPOSIO_TOOLKIT_ALLOWLIST_RESPONSE,
+      { endpoint },
+    );
+    if (response.agent_id !== id) {
+      throw new SecretResponseUnreadableError(endpoint);
+    }
+    return response;
+  }
+
+  /**
+   * Replaces or clears the allowlist with explicit intent. The committed
+   * response contains only the resulting count; unreadable or cross-agent
+   * confirmations are commit-uncertain and must not be retried blindly.
+   */
+  async updateAgentComposioToolkitAllowlist(
+    id: string,
+    data: UpdateAgentComposioToolkitAllowlistRequest,
+  ): Promise<AgentComposioToolkitAllowlistUpdateResponse> {
+    const endpoint = "PUT /api/agents/:id/composio-toolkit-allowlist";
+    const raw = await this.fetch<unknown>(
+      `/api/agents/${id}/composio-toolkit-allowlist`,
+      {
+        method: "PUT",
+        body: JSON.stringify(data),
+      },
+    );
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+        raw,
+        AgentComposioToolkitAllowlistUpdateResponseSchema,
+        EMPTY_AGENT_COMPOSIO_TOOLKIT_ALLOWLIST_UPDATE_RESPONSE,
+        { endpoint },
+      );
+      if (response.agent_id !== id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   async restoreAgent(id: string): Promise<Agent> {
-    return this.fetch(`/api/agents/${id}/restore`, { method: "POST" });
+    const endpoint = "POST /api/agents/:id/restore";
+    const raw = await this.fetch<unknown>(`/api/agents/${id}/restore`, {
+      method: "POST",
+    });
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+        raw,
+        CommittedAgentSchema,
+        { ...EMPTY_AGENT, id },
+        {
+          endpoint,
+        },
+      );
+      if (response.id !== id) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   // Bulk-cancel every active task (queued/dispatched/running) for the agent.
@@ -1425,18 +1641,29 @@ export class ApiClient {
   // ---------------------------------------------------------------------
 
   async listRuntimeProfiles(workspaceId: string): Promise<RuntimeProfile[]> {
-    const res = await this.fetch<{ runtime_profiles?: RuntimeProfile[] }>(
+    const raw = await this.fetch<unknown>(
       `/api/workspaces/${workspaceId}/runtime-profiles`,
     );
-    return res.runtime_profiles ?? [];
+    return parseSecretWithFallback(
+      raw,
+      RuntimeProfileListResponseSchema,
+      [],
+      { endpoint: "GET /api/workspaces/:id/runtime-profiles" },
+    );
   }
 
   async getRuntimeProfile(
     workspaceId: string,
     profileId: string,
   ): Promise<RuntimeProfile> {
-    return this.fetch(
+    const raw = await this.fetch<unknown>(
       `/api/workspaces/${workspaceId}/runtime-profiles/${profileId}`,
+    );
+    return parseSecretWithFallback(
+      raw,
+      RuntimeProfileSchema,
+      { ...EMPTY_RUNTIME_PROFILE, id: profileId, workspace_id: workspaceId },
+      { endpoint: "GET /api/workspaces/:id/runtime-profiles/:profileId" },
     );
   }
 
@@ -1444,10 +1671,26 @@ export class ApiClient {
     workspaceId: string,
     body: CreateRuntimeProfileRequest,
   ): Promise<RuntimeProfile> {
-    return this.fetch(`/api/workspaces/${workspaceId}/runtime-profiles`, {
+    const endpoint = "POST /api/workspaces/:id/runtime-profiles";
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/runtime-profiles`,
+      {
       method: "POST",
       body: JSON.stringify(body),
-    });
+      },
+    );
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+          raw,
+          CommittedRuntimeProfileSchema,
+          { ...EMPTY_RUNTIME_PROFILE, workspace_id: workspaceId },
+          { endpoint },
+        );
+      if (response.workspace_id !== workspaceId) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   async updateRuntimeProfile(
@@ -1455,13 +1698,29 @@ export class ApiClient {
     profileId: string,
     patch: UpdateRuntimeProfileRequest,
   ): Promise<RuntimeProfile> {
-    return this.fetch(
+    const endpoint = "PATCH /api/workspaces/:id/runtime-profiles/:profileId";
+    const raw = await this.fetch<unknown>(
       `/api/workspaces/${workspaceId}/runtime-profiles/${profileId}`,
       {
         method: "PATCH",
         body: JSON.stringify(patch),
       },
     );
+    return parseCommittedSecretResponse(() => {
+      const response = parseSecretWithFallback(
+          raw,
+          CommittedRuntimeProfileSchema,
+          { ...EMPTY_RUNTIME_PROFILE, id: profileId, workspace_id: workspaceId },
+          { endpoint },
+        );
+      if (
+        response.id !== profileId ||
+        response.workspace_id !== workspaceId
+      ) {
+        throw new SecretResponseUnreadableError(endpoint);
+      }
+      return response;
+    }, endpoint);
   }
 
   async deleteRuntimeProfile(

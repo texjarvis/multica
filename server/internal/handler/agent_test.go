@@ -994,6 +994,36 @@ func TestUpdateAgentEnv_PreservesSentinelValues(t *testing.T) {
 		t.Fatalf("UpdateAgentEnv: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
+	// The mutation response is a value-free confirmation. Submitted and
+	// persisted values must never be reflected into an API/CLI/UI response.
+	for _, leak := range []string{"real-secret", "another-secret", "rotated", "fresh"} {
+		if strings.Contains(w.Body.String(), leak) {
+			t.Fatalf("UpdateAgentEnv response leaked env value %q: %s", leak, w.Body.String())
+		}
+	}
+	var confirmation AgentEnvUpdateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &confirmation); err != nil {
+		t.Fatalf("decode update confirmation: %v", err)
+	}
+	if confirmation.AgentID != agentID {
+		t.Errorf("confirmation agent_id = %q, want %q", confirmation.AgentID, agentID)
+	}
+	if !confirmation.HasCustomEnv || confirmation.CustomEnvKeyCount != 3 {
+		t.Errorf("confirmation env summary = has=%v count=%d, want true/3", confirmation.HasCustomEnv, confirmation.CustomEnvKeyCount)
+	}
+	if !reflect.DeepEqual(confirmation.CustomEnvKeys, []string{"ALSO", "BRAND_NEW", "KEEP_ME"}) {
+		t.Errorf("confirmation custom_env_keys = %v", confirmation.CustomEnvKeys)
+	}
+	if !reflect.DeepEqual(confirmation.AddedKeys, []string{"BRAND_NEW"}) {
+		t.Errorf("confirmation added_keys = %v, want [BRAND_NEW]", confirmation.AddedKeys)
+	}
+	if !reflect.DeepEqual(confirmation.ChangedKeys, []string{"ALSO"}) {
+		t.Errorf("confirmation changed_keys = %v, want [ALSO]", confirmation.ChangedKeys)
+	}
+	if !reflect.DeepEqual(confirmation.PreservedKeys, []string{"KEEP_ME"}) {
+		t.Errorf("confirmation preserved_keys = %v, want [KEEP_ME]", confirmation.PreservedKeys)
+	}
+
 	// Refetch from DB so we don't rely on the response body alone.
 	var stored string
 	if err := testPool.QueryRow(ctx, `SELECT custom_env::text FROM agent WHERE id = $1`, agentID).Scan(&stored); err != nil {
@@ -1194,7 +1224,7 @@ func TestUpdateAgent_RedactsMcpConfigForAgentActor(t *testing.T) {
 	// The target agent has a populated mcp_config that historically would
 	// be leaked back via the UpdateAgent / ArchiveAgent / RestoreAgent
 	// HTTP response.
-	target := createHandlerTestAgent(t, "mut-mcp-target", []byte(`{"server":"secret-config"}`))
+	target := createHandlerTestAgent(t, "mut-mcp-target", []byte(`{"mcpServers":{"private":{"command":"secret-command"}}}`))
 
 	// A second agent acts as the "calling" agent process whose task
 	// token authenticated the request. It is registered in the same
@@ -1237,16 +1267,15 @@ func TestUpdateAgent_RedactsMcpConfigForAgentActor(t *testing.T) {
 	}
 }
 
-// TestUpdateAgent_KeepsMcpConfigForMemberActor is the matching positive
-// test — a normal member request (owner/admin) still receives the full
-// mcp_config in the mutation response, so the redaction does not
-// accidentally regress the legitimate Web admin flow.
-func TestUpdateAgent_KeepsMcpConfigForMemberActor(t *testing.T) {
+// TestUpdateAgent_MasksMcpConfigForMemberActor proves the server-owned
+// boundary is authorization-independent: even an owner/admin receives only a
+// useful masked shape from a generic mutation response.
+func TestUpdateAgent_MasksMcpConfigForMemberActor(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
 
-	target := createHandlerTestAgent(t, "mut-mcp-member", []byte(`{"server":"member-visible"}`))
+	target := createHandlerTestAgent(t, "mut-mcp-member", []byte(`{"mcpServers":{"private":{"command":"member-secret","env":{"TOKEN":"member-token"}}}}`))
 
 	req := newRequest(http.MethodPut, "/api/agents/"+target, map[string]any{
 		"description": "owner-visible mutation",
@@ -1262,10 +1291,14 @@ func TestUpdateAgent_KeepsMcpConfigForMemberActor(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	if resp.McpConfig == nil {
-		t.Errorf("UpdateAgent response should keep mcp_config for member actor; got nil")
+		t.Fatalf("UpdateAgent response should keep a masked mcp_config shape for member actor; got nil")
 	}
-	if resp.McpConfigRedacted {
-		t.Errorf("UpdateAgent response should NOT mark mcp_config redacted for member actor")
+	assertJSONEqual(t, resp.McpConfig, `{"mcpServers":{"server_1":{"command":"****","env":{"env_1":"****"}}}}`)
+	if !resp.McpConfigRedacted {
+		t.Errorf("UpdateAgent response should mark mcp_config redacted for member actor")
+	}
+	if strings.Contains(string(resp.McpConfig), "member-secret") || strings.Contains(string(resp.McpConfig), "member-token") {
+		t.Errorf("UpdateAgent response leaked member MCP values: %s", resp.McpConfig)
 	}
 }
 

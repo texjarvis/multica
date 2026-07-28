@@ -105,8 +105,9 @@ The same workspace profiles can be managed from the CLI:
 
 ```bash
 multica runtime profile list
-multica runtime profile create --display-name "Composer" --protocol-family codex --command-name agent
-multica runtime profile update <profile-id> --command-name agent
+multica runtime profile create --display-name "Composer" --protocol-family codex --command-name agent --fixed-args-file ./composer-args.json
+multica runtime profile update <profile-id> --fixed-args-stdin
+multica runtime profile update <profile-id> --clear-fixed-args
 multica runtime profile delete <profile-id>
 ```
 
@@ -120,8 +121,12 @@ name plus fixed arguments, then the daemon launches it directly with
 `exec.Command(command_name, fixed_args...)`. Plain arguments, quotes, and
 backslash escaping are supported; pipes, redirects, `&&`, `;`, backticks, and
 `$VAR` / `$(...)` expansion are not. Use a wrapper script when the runtime needs
-shell behavior. Today the Runtimes UI owns command-and-argument parsing; the CLI
-profile commands manage the profile row and local path overrides.
+shell behavior. The Runtimes UI parses command text into argv. The CLI accepts
+fixed argv as a JSON string array.
+
+Public runtime-profile responses never expose `fixed_args` values because arbitrary launch arguments can contain credentials. They return an empty placeholder plus `fixed_args_count` / `fixed_args_redacted`; the daemon profile-sync endpoint still receives the raw argv needed to launch the runtime. Editing a profile preserves hidden arguments by default. API updates pair a fresh non-empty list with `fixed_args_intent: "replace"` or an empty list with `fixed_args_intent: "clear"`; the UI and CLI expose those as explicit **Replace arguments** and **Clear arguments** actions. An empty legacy response replay preserves hidden arguments, while an ambiguous non-empty legacy update is rejected once hidden arguments exist.
+
+For CLI writes, prefer `--fixed-args-file <0600-json>` or `--fixed-args-stdin`. Inline `--fixed-args <json>` can expose credentials in shell history and process listings. The three channels are mutually exclusive, empty file/stdin input fails closed, update replacement must be non-empty, and `--clear-fixed-args` is the only clear action.
 
 If a desktop-launched daemon cannot find a command that works in your terminal,
 pin the absolute path on that machine:

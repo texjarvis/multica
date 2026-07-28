@@ -3273,7 +3273,12 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		return nil, fmt.Errorf("fail task: %w", err)
 	}
 
-	slog.Warn("task failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", errMsg, "failure_reason", failureReason)
+	failureLogAttrs := []any{
+		"task_id", util.UUIDToString(task.ID),
+		"issue_id", util.UUIDToString(task.IssueID),
+	}
+	failureLogAttrs = append(failureLogAttrs, redact.FailureLogAttrs(errMsg, failureReason)...)
+	slog.Warn("task failed", failureLogAttrs...)
 	s.captureTaskFailed(ctx, task)
 
 	// The auto-retry child (if any) was created inside the transaction above so
@@ -3286,7 +3291,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		slog.Info("task auto-retry enqueued",
 			"parent_task_id", util.UUIDToString(task.ID),
 			"child_task_id", util.UUIDToString(retried.ID),
-			"reason", failureReason,
+			"has_failure_reason", strings.TrimSpace(failureReason) != "",
 			"attempt", retried.Attempt,
 			"max_attempts", retried.MaxAttempts,
 			"status", retried.Status,
@@ -3976,7 +3981,7 @@ func (s *TaskService) publishAgentStatus(agent db.Agent) {
 		WorkspaceID: util.UUIDToString(agent.WorkspaceID),
 		ActorType:   "system",
 		ActorID:     "",
-		Payload:     map[string]any{"agent": agentToMap(agent)},
+		Payload:     map[string]any{"agent": agentStatusToPublicMap(agent)},
 	})
 }
 
@@ -4831,29 +4836,18 @@ func (s *TaskService) publishQuickCreateInbox(item db.InboxItem, workspaceID, ag
 	})
 }
 
-// agentToMap builds a simple map for broadcasting agent status updates.
-func agentToMap(a db.Agent) map[string]any {
-	var rc any
-	if a.RuntimeConfig != nil {
-		json.Unmarshal(a.RuntimeConfig, &rc)
-	}
+// agentStatusToPublicMap is the task-service WebSocket boundary for
+// EventAgentStatus. Reconciliation and direct status updates load a full
+// db.Agent row, including arbitrary persisted launch configuration. Status
+// subscribers only need identity plus the new status, so rebuild a minimal
+// allowlisted payload instead of serializing that row. In particular, never
+// add custom_env, custom_args, mcp_config, runtime_config, or future/unknown
+// agent fields here; clients invalidate and refetch the public agent resource.
+func agentStatusToPublicMap(a db.Agent) map[string]any {
 	return map[string]any{
-		"id":                   util.UUIDToString(a.ID),
-		"workspace_id":         util.UUIDToString(a.WorkspaceID),
-		"runtime_id":           util.UUIDToString(a.RuntimeID),
-		"name":                 a.Name,
-		"description":          a.Description,
-		"avatar_url":           util.TextToPtr(a.AvatarUrl),
-		"runtime_mode":         a.RuntimeMode,
-		"runtime_config":       rc,
-		"visibility":           a.Visibility,
-		"status":               a.Status,
-		"max_concurrent_tasks": a.MaxConcurrentTasks,
-		"owner_id":             util.UUIDToPtr(a.OwnerID),
-		"skills":               []any{},
-		"created_at":           util.TimestampToString(a.CreatedAt),
-		"updated_at":           util.TimestampToString(a.UpdatedAt),
-		"archived_at":          util.TimestampToPtr(a.ArchivedAt),
-		"archived_by":          util.UUIDToPtr(a.ArchivedBy),
+		"id":           util.UUIDToString(a.ID),
+		"workspace_id": util.UUIDToString(a.WorkspaceID),
+		"status":       a.Status,
+		"updated_at":   util.TimestampToString(a.UpdatedAt),
 	}
 }

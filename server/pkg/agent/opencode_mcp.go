@@ -156,7 +156,7 @@ func translateMCPConfigForOpenCode(raw json.RawMessage) (map[string]any, error) 
 		// daemon-side rejection. One validator, one source of truth.
 		rawTranslated, err := json.Marshal(translated)
 		if err != nil {
-			return nil, fmt.Errorf("opencode mcp_config: server %q: marshal translated entry: %w", name, err)
+			return nil, fmt.Errorf("opencode mcp_config: marshal translated server entry: %w", err)
 		}
 		validated, err := validateOpenCodeNativeMCPEntry(name, rawTranslated)
 		if err != nil {
@@ -192,7 +192,7 @@ func validateOpenCodeNativeMCPMap(mcp map[string]json.RawMessage) (map[string]an
 // errors before they reach OpenCode.
 func validateOpenCodeNativeMCPEntry(name string, raw json.RawMessage) (map[string]any, error) {
 	wrap := func(err error) error {
-		return fmt.Errorf("opencode mcp_config: server %q: %w", name, err)
+		return fmt.Errorf("opencode mcp_config: invalid server entry: %w", err)
 	}
 
 	// JSON-object guard: the discriminator probe and strict decoders
@@ -330,10 +330,10 @@ func translateMCPServerForOpenCode(name string, server map[string]any) (map[stri
 
 	command, err := openCodeCommand(server)
 	if err != nil {
-		return nil, fmt.Errorf("server %q: %w", name, err)
+		return nil, fmt.Errorf("mcp_config server entry has invalid command: %w", err)
 	}
 	if len(command) == 0 {
-		return nil, fmt.Errorf("server %q has neither url nor command", name)
+		return nil, fmt.Errorf("mcp_config server entry has neither url nor command")
 	}
 	out := map[string]any{
 		"type":    "local",

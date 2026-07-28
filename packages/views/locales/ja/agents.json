@@ -370,7 +370,17 @@
       "edit_aria": "引数 {{index}} を編集",
       "remove_aria": "引数 {{index}} を削除",
       "saved_toast": "カスタム引数を保存しました",
-      "save_failed_toast": "カスタム引数を保存できませんでした"
+      "save_failed_toast": "カスタム引数を保存できませんでした",
+      "redacted_title": "引数は設定済み — 値は非表示",
+      "redacted_hint": "カスタム引数には認証情報が含まれる可能性があるため、通常のエージェント応答では値を返しません。新しい値でリスト全体を置換するか、クリアしてください。",
+      "replace_action": "引数を置換",
+      "clear_action": "引数をクリア",
+      "replace_hint": "下で完全な置換リストを作成してください。保存すると非表示の引数全体が上書きされ、マージはできません。",
+      "cleared_toast": "カスタム引数をクリアしました",
+      "clear_failed_toast": "カスタム引数をクリアできませんでした",
+      "clear_dialog_title": "非表示の引数をクリアしますか？",
+      "clear_dialog_description": "非表示の値をすべて含む、保存済みの引数リスト全体を削除します。",
+      "clear_confirm_action": "引数をクリア"
     },
     "mcp_config": {
       "intro": "このエージェントが使用できる MCP Server を管理します。Multica 管理の Server とローカル Runtime から継承した Server は統合して使用されます。",
@@ -436,8 +446,16 @@
       "delete_action": "Server を削除",
       "invalid_json": "無効な JSON: {{error}}",
       "save_failed_toast": "MCP config を保存できませんでした",
-      "redacted_title": "設定済み — 現在の表示では非表示",
-      "redacted_hint": "この config を読み取れるのは、エージェントのオーナーまたはワークスペースの admin のみです。"
+      "redacted_title": "設定済み — シークレット値は非表示",
+      "redacted_hint": "通常のエージェント応答では保存済み MCP 値を返しません。新しい値で設定全体を置換するか、クリアしてください。",
+      "replace_action": "設定を置換",
+      "clear_action": "設定をクリア",
+      "replace_hint": "置換後に必要な Server をすべて追加してください。最初の保存で非表示の設定全体が上書きされ、マージはできません。",
+      "cleared_toast": "MCP config をクリアしました",
+      "clear_failed_toast": "MCP config をクリアできませんでした",
+      "clear_dialog_title": "非表示の MCP config をクリアしますか？",
+      "clear_dialog_description": "保存済み MCP config 全体を削除します。Runtime から継承した Server には影響しません。",
+      "clear_confirm_action": "設定をクリア"
     },
     "composio_mcp": {
       "subtitle": "ツールキットにチェックを入れると、あなた（この agent の作成者）が直接または下位 agent のチェーン経由でこの agent をトリガーしたときに限り、MCP サーバーとしてマウントされます。",
@@ -452,11 +470,22 @@
       "save_failed_toast": "保存できませんでした。もう一度お試しください",
       "redacted_title": "設定済み — あなたには非表示",
       "redacted_hint": "この agent が使用できるアプリを閲覧・変更できるのは作成者のみです。",
+      "retry_reveal": "アプリの読み込みを再試行",
       "shared_warning": "このエージェントは共有されています。このエージェントを実行できる人は、ここで有効化した Composio アプリを利用できます。これらのアプリが機微なデータを扱う場合は、Private にするかアクセス範囲を絞ってください。",
       "workspace_warning": "ワークスペースに公開：ワークスペースの全メンバーがこのエージェントを通じてこれらの Composio アプリを利用できます。"
     },
     "runtime_config": {
       "intro": "OpenClaw ランタイムがこのエージェントの各ターンをどのように実行するかを選択します。Local モードはエージェントを daemon プロセス内で実行します。Gateway モードは各ターンを OpenClaw Gateway に転送します — daemon のホストが軽量な調整役で、エージェントの実作業はより強力なマシンで動かしたい場合に有用です。",
+      "redacted_title": "ルーティング設定は非表示です",
+      "redacted_hint": "保存済みのルーティング値には認証情報が含まれる可能性があるため、ここには返されません。設定全体を置換するか、明示的に消去してください。",
+      "configured_count": "トップレベルのフィールドを {{count}} 件設定済み",
+      "replace_action": "ルーティング設定を置換",
+      "replace_hint": "空の設定から開始します。保存すると、保存済みのルーティング設定全体が置き換わります。",
+      "clear_action": "ルーティング設定を消去",
+      "clear_dialog_title": "ルーティング設定を消去しますか？",
+      "clear_dialog_description": "保存済みのルーティング設定全体を削除します。この操作は元に戻せません。",
+      "clear_confirm_action": "ルーティング設定を消去",
+      "cancel_action": "キャンセル",
       "mode_label": "ルーティングモード",
       "mode_local": "Local",
       "mode_gateway": "Gateway",
@@ -473,7 +502,9 @@
       "tls_label": "TLS を使用",
       "tls_hint": "http:// の代わりに https:// でダイヤル",
       "saved_toast": "ルーティング設定を保存しました",
-      "save_failed_toast": "ルーティング設定の保存に失敗しました"
+      "save_failed_toast": "ルーティング設定の保存に失敗しました",
+      "cleared_toast": "ルーティング設定を消去しました",
+      "clear_failed_toast": "ルーティング設定を消去できませんでした"
     },
     "skills": {
       "assigned_title": "エージェントに割り当て済み",

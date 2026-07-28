@@ -65,6 +65,40 @@ interface AgentDetailPageProps {
   agentId: string;
 }
 
+const OPTIMISTIC_AGENT_UPDATE_KEYS = [
+  "name",
+  "description",
+  "instructions",
+  "avatar_url",
+  "runtime_id",
+  "visibility",
+  "permission_mode",
+  "invocation_targets",
+  "status",
+  "max_concurrent_tasks",
+  "model",
+  "thinking_level",
+  "service_tier",
+] as const satisfies readonly (keyof UpdateAgentRequest)[];
+
+// Request bodies can carry plaintext runtime_config, custom_args, mcp_config,
+// and replacement intent fields. Those values must never be copied into the
+// shared agent-list cache. Only fields that are already public Agent
+// projections may be shown optimistically; secret-bearing writes converge via
+// the server-redacted response/refetch.
+export function optimisticAgentUpdatePatch(
+  data: UpdateAgentRequest,
+): Partial<Agent> {
+  const source = data as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const key of OPTIMISTIC_AGENT_UPDATE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      patch[key] = source[key];
+    }
+  }
+  return patch as Partial<Agent>;
+}
+
 export function AgentDetailPage({ agentId }: AgentDetailPageProps) {
   const { t } = useT("agents");
   const wsId = useWorkspaceId();
@@ -119,7 +153,7 @@ export function AgentDetailPage({ agentId }: AgentDetailPageProps) {
   // overview pane to focus a tab. The pane clears it after consuming.
   const [tabNavIntent, setTabNavIntent] = useState<DetailTab | null>(null);
 
-  const handleUpdate = async (id: string, data: Record<string, unknown>) => {
+  const handleUpdate = async (id: string, data: UpdateAgentRequest) => {
     // Optimistic update: patch the matching agent in the cached list
     // BEFORE the network round-trip so the inspector picker chips flip to
     // the new value immediately on click. Without this, every inspector
@@ -134,23 +168,29 @@ export function AgentDetailPage({ agentId }: AgentDetailPageProps) {
     // resolves last (e.g. flipping visibility then runtime simultaneously
     // and only the visibility PATCH fails).
     const queryKey = workspaceKeys.agents(wsId);
+    const optimisticPatch = optimisticAgentUpdatePatch(data);
+    const optimisticKeys = Object.keys(optimisticPatch);
     const prevAgents = qc.getQueryData<Agent[]>(queryKey);
     const prevAgent = prevAgents?.find((a) => a.id === id);
     const prevFields: Record<string, unknown> = {};
     if (prevAgent) {
-      for (const key of Object.keys(data)) {
+      for (const key of optimisticKeys) {
         prevFields[key] = (prevAgent as unknown as Record<string, unknown>)[key];
       }
     }
-    qc.setQueryData<Agent[]>(queryKey, (old) =>
-      old?.map((a) => (a.id === id ? ({ ...a, ...data } as Agent) : a)),
-    );
+    if (optimisticKeys.length > 0) {
+      qc.setQueryData<Agent[]>(queryKey, (old) =>
+        old?.map((a) =>
+          a.id === id ? ({ ...a, ...optimisticPatch } as Agent) : a,
+        ),
+      );
+    }
     try {
-      await api.updateAgent(id, data as UpdateAgentRequest);
+      await api.updateAgent(id, data);
       qc.invalidateQueries({ queryKey });
       toast.success(t(($) => $.detail.agent_updated_toast));
     } catch (e) {
-      if (prevAgent) {
+      if (prevAgent && optimisticKeys.length > 0) {
         qc.setQueryData<Agent[]>(queryKey, (old) =>
           old?.map((a) =>
             a.id === id ? ({ ...a, ...prevFields } as Agent) : a,

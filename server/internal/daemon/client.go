@@ -106,6 +106,7 @@ type Client struct {
 	platform string
 	version  string
 	os       string
+	daemonID string
 
 	workspaceMu                    sync.Mutex
 	workspaceETag                  string
@@ -165,6 +166,13 @@ func (c *Client) SetVersion(v string) {
 	c.version = v
 }
 
+// SetDaemonID records the persistent machine identity. New daemons send it on
+// every control-plane request so workspace-level raw configuration endpoints
+// can bind a PAT/JWT compatibility caller to a runtime it actually owns.
+func (c *Client) SetDaemonID(id string) {
+	c.daemonID = strings.TrimSpace(id)
+}
+
 // setIdentityHeaders attaches X-Client-Platform/Version/OS to req when set.
 func (c *Client) setIdentityHeaders(req *http.Request) {
 	if c.platform != "" {
@@ -175,6 +183,9 @@ func (c *Client) setIdentityHeaders(req *http.Request) {
 	}
 	if c.os != "" {
 		req.Header.Set("X-Client-OS", c.os)
+	}
+	if c.daemonID != "" {
+		req.Header.Set("X-Multica-Daemon-ID", c.daemonID)
 	}
 	req.Header.Set("X-Client-Capabilities", daemonClientCapabilities())
 }

@@ -3,11 +3,6 @@ import { type Logger, noopLogger } from "../logger";
 
 type EventHandler = (payload: unknown, actorId?: string, actorType?: string) => void;
 
-// Cap how much of an unparseable frame we put into the log. A malformed or
-// rogue server can stream arbitrarily large garbage, and the warn handler may
-// be a console / IPC bridge whose buffers we don't want to blow.
-const UNPARSEABLE_LOG_MAX_CHARS = 200;
-
 // Reconnect backoff parameters. A flat delay causes a thundering herd when many
 // clients reconnect after a server restart; exponential backoff with jitter
 // spreads the reconnection attempts over time. The client retries indefinitely
@@ -16,10 +11,12 @@ const UNPARSEABLE_LOG_MAX_CHARS = 200;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 
-function summarizeUnparseable(data: unknown): string {
-  const text = typeof data === "string" ? data : String(data);
-  if (text.length <= UNPARSEABLE_LOG_MAX_CHARS) return text;
-  return `${text.slice(0, UNPARSEABLE_LOG_MAX_CHARS)}… (truncated, ${text.length} chars total)`;
+function frameLogMetadata(data: unknown): { frame_char_count: number | null } {
+  return {
+    // Never stringify or excerpt a malformed frame here. Mixed-version event
+    // payloads may contain secret-bearing fields before schema validation.
+    frame_char_count: typeof data === "string" ? data.length : null,
+  };
 }
 
 /** Identifies the WS client to the server. Sent as `client_platform`,
@@ -106,7 +103,7 @@ export class WSClient {
       } catch {
         this.logger.warn(
           "ws: received unparseable message",
-          summarizeUnparseable(event.data),
+          frameLogMetadata(event.data),
         );
         return;
       }
@@ -124,7 +121,7 @@ export class WSClient {
           this.badFrameLogged = true;
           this.logger.warn(
             "ws: dropping frame without a string type",
-            summarizeUnparseable(event.data),
+            frameLogMetadata(event.data),
           );
         }
         return;

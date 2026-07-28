@@ -160,11 +160,17 @@ func (d *Daemon) tryAutoUpdate(ctx context.Context) {
 
 	output, err := d.runUpdateFn(release.TagName)
 	if err != nil {
-		d.logger.Warn("auto-update: upgrade failed — will retry", "error", err, "output", output)
+		d.logger.Warn("auto-update: upgrade failed — will retry",
+			"has_error", true,
+			"output_char_count", len(output),
+		)
 		return
 	}
 
-	d.logger.Info("auto-update: upgrade completed, restarting", "target", release.TagName, "output", output)
+	d.logger.Info("auto-update: upgrade completed, restarting",
+		"target", release.TagName,
+		"output_char_count", len(output),
+	)
 	// triggerRestart cancels the root context, which causes Run() to return
 	// and the parent (cmd_daemon.go) to re-exec the new binary. Leave both
 	// the updating flag and the claim barrier held — process exit is

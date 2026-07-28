@@ -137,7 +137,10 @@ export interface RuntimeProfile {
   protocol_family: RuntimeProtocolFamily;
   command_name: string;
   description: string | null;
+  /** Public profile responses never expose fixed argv values. */
   fixed_args: string[];
+  fixed_args_count?: number;
+  fixed_args_redacted?: boolean;
   visibility: RuntimeProfileVisibility;
   created_by: string | null;
   enabled: boolean;
@@ -165,6 +168,8 @@ export interface UpdateRuntimeProfileRequest {
   command_name?: string;
   description?: string | null;
   fixed_args?: string[];
+  /** Required when replacing or clearing a hidden persisted fixed_args list. */
+  fixed_args_intent?: "replace" | "clear";
   visibility?: RuntimeProfileVisibility;
   enabled?: boolean;
 }
@@ -378,8 +383,28 @@ export interface Agent {
   instructions: string;
   avatar_url: string | null;
   runtime_mode: AgentRuntimeMode;
+  /**
+   * Server-owned public projection of the persisted free-form runtime config.
+   * Only known non-secret metadata is retained; arbitrary strings/unknown
+   * fields are masked or suppressed. Never use a redacted projection as an
+   * update source—replace or clear explicitly.
+   */
   runtime_config: Record<string, unknown>;
+  has_runtime_config?: boolean;
+  runtime_config_key_count?: number;
+  runtime_config_redacted?: boolean;
+  /** Generic responses always return an empty value placeholder. */
   custom_args: string[];
+  /**
+   * Number of persisted arguments. The values are intentionally unavailable
+   * because any arbitrary CLI argument may contain credentials.
+   */
+  custom_args_count?: number;
+  /**
+   * True when persisted arguments exist (or malformed persisted JSON was
+   * suppressed). Replace or clear the complete list explicitly.
+   */
+  custom_args_redacted?: boolean;
   /**
    * Coarse metadata signalling whether the agent has any custom env
    * vars configured, without exposing the keys or values. Reads of
@@ -406,36 +431,34 @@ export interface Agent {
    * means no managed config; the daemon falls back to the CLI's own
    * default. MUL-2764.
    *
-   * When the caller can't see secrets (an agent actor, or a non-owner
-   * non-admin), the server replaces the value with `null` and sets
-   * `mcp_config_redacted` to true so the UI can render a "configured
-   * but hidden" state without exposing potentially sensitive fields.
+   * Generic agent responses never expose persisted MCP values, regardless of
+   * caller role. For supported configurations the server rebuilds a useful
+   * masked shape (`"****"` values plus stable server/env/header aliases) and
+   * sets `mcp_config_redacted`; malformed or unknown shapes fail closed to
+   * `null`. Runtime claim paths receive the raw stored data separately.
+   *
+   * A masked response is display-only. Management clients must submit a
+   * complete explicit replacement or `null` to clear; the server rejects
+   * masked placeholders at create/update write boundaries.
    */
   mcp_config?: unknown | null;
   /**
-   * True when the server stripped `mcp_config` from this response
-   * because the caller lacks permission to see secrets. The UI uses
-   * this to distinguish "no config" (`mcp_config === null &&
-   * !mcp_config_redacted`) from "config exists but you can't see it".
-   * Older backends omit this field; treat `undefined` as false.
+   * True when the persisted config contained values or could not be safely
+   * represented. The accompanying `mcp_config` may be a masked structural
+   * summary or `null` after fail-closed suppression. Older backends omit this
+   * field; treat `undefined` as false.
    */
   mcp_config_redacted?: boolean;
   /**
-   * The subset of Composio toolkit slugs this agent is allowed to mount as
-   * MCP servers at task dispatch — but only when the run originator is the
-   * agent owner (MUL-3869 / MUL-3721). `null`/`[]`/omitted all mean "no
-   * overlay regardless of who triggers". Owner-only data: the server hands
-   * it through verbatim to the owner and redacts it to `undefined` +
-   * `composio_toolkit_allowlist_redacted=true` for everyone else (same
-   * contract as `mcp_config`). Treat `undefined` as "unknown — assume none".
+   * Legacy request/UI compatibility only. Generic Agent responses never
+   * populate the raw allowlist, even for owners; reading values would require
+   * a separate audited privileged endpoint.
    */
   composio_toolkit_allowlist?: string[];
+  /** Number of configured toolkits without exposing their slugs. */
+  composio_toolkit_allowlist_count?: number;
   /**
-   * True when the server stripped `composio_toolkit_allowlist` from this
-   * response because the caller is not the agent owner. The MCP tab is
-   * creator-only so a redacted value should never reach the editor, but the
-   * UI renders a "hidden" fallback defensively. Older backends omit this
-   * field; treat `undefined` as false.
+   * True when one or more toolkit slugs are configured but hidden.
    */
   composio_toolkit_allowlist_redacted?: boolean;
   visibility: AgentVisibility;
@@ -646,6 +669,8 @@ export interface UpdateAgentRequest {
   avatar_url?: string;
   runtime_id?: string;
   runtime_config?: Record<string, unknown>;
+  /** Required when replacing or clearing hidden persisted runtime_config. */
+  runtime_config_intent?: "replace" | "clear";
   /**
    * NOTE: `custom_env` is intentionally NOT updatable through this
    * request shape. Env edits flow through `client.updateAgentEnv` /
@@ -656,6 +681,8 @@ export interface UpdateAgentRequest {
    * MUL-2600.
    */
   custom_args?: string[];
+  /** Required when replacing or clearing a hidden persisted custom_args list. */
+  custom_args_intent?: "replace" | "clear";
   /**
    * MCP server configuration. Tri-state semantics (MUL-2764):
    *   - field omitted → no change
@@ -665,18 +692,17 @@ export interface UpdateAgentRequest {
    *     validate / translate it according to their own MCP integration
    */
   mcp_config?: unknown | null;
+  /** Required when replacing or clearing a hidden persisted MCP config. */
+  mcp_config_intent?: "replace" | "clear";
   /**
-   * Composio toolkit allowlist. Tri-state semantics, mirroring the backend
-   * gate (MUL-3869):
-   *   - field omitted → no change
-   *   - `null` → clear the column (no MCP overlay for anyone)
-   *   - string[] → wholesale replace; the server lowercases / trims / dedupes
-   *     the slugs before persisting
-   * Writes are silently dropped server-side unless the caller is the agent
-   * owner, so the UI only ever exposes this field through the creator-only
-   * MCP tab.
+   * Compatibility path for a complete Composio toolkit allowlist mutation.
+   * Generic Agent reads never populate this value, so every write must also
+   * carry `composio_toolkit_allowlist_intent`. Prefer the dedicated
+   * human-only allowlist API for interactive editing.
    */
   composio_toolkit_allowlist?: string[] | null;
+  /** Required whenever `composio_toolkit_allowlist` is present. */
+  composio_toolkit_allowlist_intent?: "replace" | "clear";
   visibility?: AgentVisibility;
   /**
    * Invocation permission mode (MUL-3963). When present it is authoritative;
@@ -708,14 +734,36 @@ export interface UpdateAgentRequest {
 }
 
 /**
- * Wire shape for the dedicated env-management endpoints
- * (`GET /api/agents/{id}/env` and `PUT /api/agents/{id}/env`). Kept
- * deliberately separate from `Agent` so generic agent reads cannot
+ * Plaintext wire shape for the dedicated audited
+ * `GET /api/agents/{id}/env` endpoint. Kept deliberately separate from
+ * `Agent` and the update confirmation so generic reads and writes cannot
  * accidentally surface env values. MUL-2600.
  */
 export interface AgentEnvResponse {
   agent_id: string;
   custom_env: Record<string, string>;
+}
+
+/**
+ * Value-free confirmation returned by `PUT /api/agents/{id}/env`. Key names,
+ * counts, and deterministic change metadata let clients reconcile local
+ * state without reflecting submitted secret values into responses.
+ */
+export interface AgentEnvUpdateResponse {
+  agent_id: string;
+  /**
+   * Compatibility key map. Every value is the public `"****"` sentinel;
+   * plaintext from either a new or legacy server is stripped at the API
+   * schema boundary before this object can enter client state.
+   */
+  custom_env: Record<string, string>;
+  has_custom_env: boolean;
+  custom_env_key_count: number;
+  custom_env_keys: string[];
+  added_keys: string[];
+  removed_keys: string[];
+  changed_keys: string[];
+  preserved_keys: string[];
 }
 
 /**
@@ -727,6 +775,37 @@ export interface AgentEnvResponse {
  */
 export interface UpdateAgentEnvRequest {
   custom_env: Record<string, string>;
+}
+
+/**
+ * Raw result from the dedicated audited
+ * `GET /api/agents/{id}/composio-toolkit-allowlist` endpoint. Raw slugs never
+ * appear on generic Agent resources.
+ */
+export interface AgentComposioToolkitAllowlistResponse {
+  agent_id: string;
+  toolkit_slugs: string[];
+}
+
+/**
+ * Closed mutation contract for the dedicated Composio allowlist endpoint.
+ * Replacing requires a complete non-empty list; clearing is explicit and does
+ * not carry a default/replayed list.
+ */
+export type UpdateAgentComposioToolkitAllowlistRequest =
+  | {
+      intent: "replace";
+      toolkit_slugs: string[];
+    }
+  | {
+      intent: "clear";
+      toolkit_slugs?: [];
+    };
+
+/** Value-free confirmation returned after a committed replace or clear. */
+export interface AgentComposioToolkitAllowlistUpdateResponse {
+  agent_id: string;
+  toolkit_count: number;
 }
 
 // Skills

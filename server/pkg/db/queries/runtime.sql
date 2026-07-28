@@ -68,6 +68,28 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE
+    (EXCLUDED.owner_id IS NULL OR agent_runtime.owner_id = EXCLUDED.owner_id)
+    AND (
+        (
+            NOT @require_cloud_identity::bool
+            AND NOT (
+                agent_runtime.metadata ? 'cloud_instance_id'
+                OR agent_runtime.metadata ? 'cloud_instance_record_id'
+            )
+            AND NOT (
+                EXCLUDED.metadata ? 'cloud_instance_id'
+                OR EXCLUDED.metadata ? 'cloud_instance_record_id'
+            )
+        )
+        OR (
+            @require_cloud_identity::bool
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_id', '') IS NOT NULL
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_record_id', '') IS NOT NULL
+            AND agent_runtime.metadata->>'cloud_instance_id' = EXCLUDED.metadata->>'cloud_instance_id'
+            AND agent_runtime.metadata->>'cloud_instance_record_id' = EXCLUDED.metadata->>'cloud_instance_record_id'
+        )
+    )
 RETURNING *, (xmax = 0) AS inserted;
 
 -- name: UpsertAgentRuntimeWithProfile :one
@@ -102,6 +124,28 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE
+    (EXCLUDED.owner_id IS NULL OR agent_runtime.owner_id = EXCLUDED.owner_id)
+    AND (
+        (
+            NOT @require_cloud_identity::bool
+            AND NOT (
+                agent_runtime.metadata ? 'cloud_instance_id'
+                OR agent_runtime.metadata ? 'cloud_instance_record_id'
+            )
+            AND NOT (
+                EXCLUDED.metadata ? 'cloud_instance_id'
+                OR EXCLUDED.metadata ? 'cloud_instance_record_id'
+            )
+        )
+        OR (
+            @require_cloud_identity::bool
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_id', '') IS NOT NULL
+            AND NULLIF(agent_runtime.metadata->>'cloud_instance_record_id', '') IS NOT NULL
+            AND agent_runtime.metadata->>'cloud_instance_id' = EXCLUDED.metadata->>'cloud_instance_id'
+            AND agent_runtime.metadata->>'cloud_instance_record_id' = EXCLUDED.metadata->>'cloud_instance_record_id'
+        )
+    )
 RETURNING *, (xmax = 0) AS inserted;
 
 -- name: UpdateAgentRuntimeVisibility :one
@@ -332,10 +376,11 @@ WHERE leader_id IN (
 )
   AND archived_at IS NOT NULL;
 
--- name: FindLegacyRuntimesByDaemonID :many
--- Looks up runtime rows keyed on a prior (hostname-derived) daemon_id. Used
--- at register-time to find rows owned by the same machine under its old
--- identity so agents/tasks can be re-pointed at the new UUID-keyed row.
+-- name: FindMergeableLegacyRuntimesByDaemonID :many
+-- Looks up and locks runtime rows keyed on a prior (hostname-derived)
+-- daemon_id, but only when the authenticated registration target proves the
+-- same owner and machine class. A client-supplied legacy_daemon_ids value is
+-- not authority by itself.
 --
 -- Comparison is case-insensitive because os.Hostname() has been observed to
 -- return different casings on the same machine (e.g. `Jiayuans-MacBook-Pro`
@@ -347,11 +392,48 @@ WHERE leader_id IN (
 -- duplicate rows historically (e.g. `Foo.local` AND `foo.local` under the
 -- same workspace+provider). A single-row lookup would consolidate only one
 -- of them and leave the rest orphaned. Callers must merge every returned
--- row into the new UUID-keyed runtime.
-SELECT * FROM agent_runtime
-WHERE workspace_id = @workspace_id
-  AND provider = @provider
-  AND LOWER(daemon_id) = LOWER(@daemon_id);
+-- row into the new UUID-keyed runtime inside the same transaction.
+--
+-- The auth_path branch is deliberately closed:
+--   * PAT/JWT migrations require an unstamped local runtime on both sides.
+--     MDT credentials cannot prove continuity with a different daemon_id.
+--   * Cloud migrations require both server-stamped Fleet identities to match
+--     the verified cloud credential exactly.
+--   * Missing owners, unknown auth paths, cross-provider/profile matches, and
+--     local↔cloud transitions never qualify.
+SELECT old.*
+FROM agent_runtime AS old
+JOIN agent_runtime AS target ON target.id = @new_runtime_id
+WHERE old.id <> target.id
+  AND old.workspace_id = target.workspace_id
+  AND old.provider = target.provider
+  AND old.profile_id IS NULL
+  AND target.profile_id IS NULL
+  AND target.daemon_id = @new_daemon_id
+  AND target.owner_id = @authenticated_owner_id
+  AND old.owner_id = target.owner_id
+  AND LOWER(old.daemon_id) = LOWER(@daemon_id)
+  AND (
+    (
+      @auth_path::text IN ('pat', 'jwt')
+      AND NOT (
+        old.metadata ? 'cloud_instance_id'
+        OR old.metadata ? 'cloud_instance_record_id'
+        OR target.metadata ? 'cloud_instance_id'
+        OR target.metadata ? 'cloud_instance_record_id'
+      )
+    )
+    OR (
+      @auth_path::text = 'cloud_pat'
+      AND @cloud_instance_id::text <> ''
+      AND @cloud_instance_record_id::text <> ''
+      AND old.metadata->>'cloud_instance_id' = @cloud_instance_id
+      AND old.metadata->>'cloud_instance_record_id' = @cloud_instance_record_id
+      AND target.metadata->>'cloud_instance_id' = @cloud_instance_id
+      AND target.metadata->>'cloud_instance_record_id' = @cloud_instance_record_id
+    )
+  )
+FOR UPDATE OF old, target;
 
 -- name: ReassignAgentsToRuntime :execrows
 -- Re-points every agent referencing old_runtime_id at new_runtime_id.

@@ -88,15 +88,20 @@ Claude Code, Codex, Kimi 같은 기본 제공 provider를 기본 명령으로 �
 
 ```bash
 multica runtime profile list
-multica runtime profile create --display-name "Composer" --protocol-family codex --command-name agent
-multica runtime profile update <profile-id> --command-name agent
+multica runtime profile create --display-name "Composer" --protocol-family codex --command-name agent --fixed-args-file ./composer-args.json
+multica runtime profile update <profile-id> --fixed-args-stdin
+multica runtime profile update <profile-id> --clear-fixed-args
 multica runtime profile delete <profile-id>
 ```
 
 기본 제공 런타임과 사용자 지정 런타임은 같은 기기 목록에 표시됩니다. 사용자 지정 런타임 행의 작업 메뉴에서 프로필을 수정하거나 삭제할 수 있습니다. 프로필을 삭제하면 데몬이 동기화된 뒤 등록된 런타임 인스턴스도 제거됩니다. 에이전트가 아직 이 프로필에 의존하면 삭제가 차단될 수 있습니다.
 
 명령은 shell 문자열이 아니라 argv 형식입니다. Multica는 실행 파일 이름과 고정 인수를 저장하고, 데몬은 `exec.Command(command_name, fixed_args...)`로 직접 실행합니다. 일반 인수, 따옴표, 백슬래시 이스케이프는 지원하지만 파이프, 리다이렉션, `&&`, `;`, 백틱, `$VAR` / `$(...)` 확장은 지원하지 않습니다. shell 동작이 필요하면 wrapper script를 사용하세요.
-현재 명령과 인수 파싱은 Runtimes UI가 담당합니다. CLI의 profile 명령은 profile 행과 로컬 경로 override를 관리합니다.
+Runtimes UI는 명령 문자열을 argv로 파싱합니다. CLI는 고정 argv를 JSON 문자열 배열로 받습니다.
+
+공개 runtime profile 응답은 임의의 실행 인수에 자격 증명이 포함될 수 있으므로 `fixed_args` 값을 노출하지 않습니다. 빈 플레이스홀더와 `fixed_args_count` / `fixed_args_redacted`만 반환하며, 데몬 profile 동기화 엔드포인트는 런타임 실행에 필요한 원본 argv를 그대로 받습니다. profile 편집은 숨겨진 인수를 기본적으로 보존합니다. API 업데이트는 새 비어 있지 않은 목록과 `fixed_args_intent: "replace"`를, 빈 목록과 `fixed_args_intent: "clear"`를 함께 보냅니다. UI와 CLI는 이를 명시적인 **인수 교체**와 **인수 지우기** 동작으로 제공합니다. 빈 구형 응답 플레이스홀더 재전송은 숨김 인수를 보존하며, 숨김 인수가 있을 때 모호한 비어 있지 않은 구형 업데이트는 거부됩니다.
+
+CLI로 쓸 때는 `--fixed-args-file <0600-json>` 또는 `--fixed-args-stdin`을 권장합니다. 인라인 `--fixed-args <json>`은 셸 기록과 프로세스 목록에 자격 증명을 노출할 수 있습니다. 세 입력 채널은 상호 배타적이고, 빈 file/stdin 입력은 fail-closed로 거부되며, update 교체는 비어 있지 않아야 합니다. 지우기는 `--clear-fixed-args`만 사용할 수 있습니다.
 
 데스크톱 앱에서 시작한 데몬이 터미널에서는 동작하는 명령을 찾지 못한다면, 해당 기기에서 절대 경로를 고정할 수 있습니다.
 

@@ -66,6 +66,8 @@ ANTHROPIC_BASE_URL = https://my-proxy.example.com
 <Callout type="warning">
 **`custom_env` 的值在 Multica 服务器的数据库里是明文存储的。** agent list/get 接口不再返回任何 env 值——只返回键的数量。读取真实值需要 workspace owner / admin 调用专用且会审计的 `GET /api/agents/{id}/env`（CLI: `multica agent env get <id>`）。正在执行任务的智能体即便宿主是 owner，也无法借此读取其它智能体的 env——这个接口拒绝 agent-actor 会话。数据库备份、DB 审计里仍然能看到真实值。
 
+更新 env 使用专用的 `PUT /api/agents/{id}/env`（CLI: `multica agent env set <id>`）。响应只确认最终键名/数量、所有值均为 `"****"` 的兼容 `custom_env` 映射，以及新增、删除、变更、保留的键，绝不会回显提交的值。提交 `"****"` 会保留已有键的值，避免打码客户端意外覆盖真实 secret。
+
 **不要把高价值 secret 放进 `custom_env`**（生产数据库密码、root 级 token 等）。给智能体用**独立的、有限权限的凭证**（只读 API key、单 scope 的 PAT），定期轮换。
 </Callout>
 
@@ -85,9 +87,27 @@ claude --model <model> --max-turns 100 --append-system-prompt "always respond in
 
 参数按原样传，不走 shell 解析（没有注入风险），但传什么 flag 能不能被识别看 AI 编程工具本身——不同工具差异很大。
 
+任何 CLI 参数都可能包含凭据，例如拆分形式或 `=` 形式的 `--api-key` / `--token`、Authorization header，以及 provider 特有的值。因此，普通 agent 响应会隐藏**所有非空** `custom_args` 列表，只返回 `custom_args: []`、`custom_args_count` 和 `custom_args_redacted: true`。daemon 仍会收到原始已存参数。请用新输入替换完整列表，或明确清空；不要把空占位当作可编辑源数据。修改该隐藏字段的 API 更新必须同时发送 `custom_args` 与 `custom_args_intent: "replace"` 或 `"clear"`。不带 intent 回放空的公开占位会保留已存参数；已有隐藏参数时，含非空值但不带 intent 的旧式模糊更新会被拒绝。
+
+通过 CLI 写入时，优先使用 `--custom-args-file <0600-json>` 或 `--custom-args-stdin`。内联 `--custom-args <json>` 可能通过 shell 历史和进程列表暴露凭据。create 和 update 都支持这三种互斥输入通道；用明确的 `[]` 清空列表。
+
 <Callout type="tip">
 `custom_env` 和 `custom_args` 没有硬限制，但**实际使用建议控制在 10 条以内**。太多会让命令行变长、启动变慢，也更难维护。
 </Callout>
+
+## 托管 MCP 配置（mcp_config）
+
+托管 MCP 条目通常包含命令、URL、header、环境变量和 API token。Multica 会保存原始配置供 Runtime 使用，但**普通 agent 响应永远不会返回这些值，即使调用者是 owner/admin**。支持的配置只会返回打码后的结构摘要；未知或格式错误的结构会被完整隐藏。原始配置通过 daemon 独立的任务领取路径传给已分配的 Runtime。
+
+打码摘要仅用于展示。修改已配置的 MCP 值时，请提交完整新配置并带 `mcp_config_intent: "replace"`；省略 `mcp_config` 可保留；发送 `null` 并带 `mcp_config_intent: "clear"` 可清空。旧客户端回放完整响应时会保留隐藏配置；已有隐藏配置时，不带 intent 的非空旧式模糊替换会被拒绝。服务器拒绝打码占位 `"****"`，避免 GET → PUT 把有效凭证替换成星号。
+
+## 运行时专属配置（runtime_config）
+
+`runtime_config` 是自由结构的 provider JSON，可能包含 token、Authorization header、内部 host、环境值，或 Multica 尚不认识的未来字段。普通 agent 响应只暴露 fail-closed 的公开投影：mode、port、TLS 等已知非敏感路由元数据可能保留；host/token 会被打码，未知键会被移除。数量和 redacted 元数据用于表示存在已存配置。经过认证的 daemon claim 路径仍会收到原始已存 JSON。
+
+该投影只用于展示。更新时省略 `runtime_config` 可保留完整已存值，提交全新的完整对象可替换，提交 `{}` 可清空。管理 UI 要求明确选择 Replace 或 Clear，绝不会从投影初始化替换值。
+
+通过 CLI 写入时，优先使用 `--runtime-config-file <0600-json>` 或 `--runtime-config-stdin`；内联 `--runtime-config <json>` 不适合承载凭据。三种输入通道互斥，空的 file/stdin 输入会被拒绝，`{}` 是明确的清空值。一条命令只能让一个 JSON 字段读取 stdin；同一请求中的其他敏感字段请改用 file。
 
 ## 可见性
 
@@ -96,7 +116,7 @@ claude --model <model> --max-turns 100 --append-system-prompt "always respond in
 
 新建默认 `private`。
 
-**私有不等于隐藏**——列表里所有成员都能看到私有智能体的名字和描述，只是看不到敏感配置（env 值从不会出现在 agent list/get 响应里；MCP 配置对非 owner 会被打码）。完整含义见 [智能体 → 谁能把智能体分配出去](/agents#谁能把智能体分配出去)。
+**私有不等于隐藏**——列表里所有成员都能看到私有智能体的名字和描述，但普通 agent 响应不会包含敏感值（env 值被省略；MCP 值对所有调用者都会打码或隐藏）。完整含义见 [智能体 → 谁能把智能体分配出去](/agents#谁能把智能体分配出去)。
 
 ## 并发上限
 

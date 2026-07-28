@@ -378,7 +378,17 @@
       "edit_aria": "인자 {{index}} 편집",
       "remove_aria": "인자 {{index}} 제거",
       "saved_toast": "사용자 지정 인자를 저장했습니다",
-      "save_failed_toast": "사용자 지정 인자를 저장하지 못했습니다"
+      "save_failed_toast": "사용자 지정 인자를 저장하지 못했습니다",
+      "redacted_title": "인자 설정됨 — 값 숨김",
+      "redacted_hint": "사용자 지정 인자에는 자격 증명이 포함될 수 있으므로 일반 에이전트 응답에서는 값을 반환하지 않습니다. 새 값으로 전체 목록을 교체하거나 지우세요.",
+      "replace_action": "인자 교체",
+      "clear_action": "인자 지우기",
+      "replace_hint": "아래에서 전체 교체 목록을 만드세요. 저장하면 숨겨진 인자 전체를 덮어쓰며 병합할 수 없습니다.",
+      "cleared_toast": "사용자 지정 인자를 지웠습니다",
+      "clear_failed_toast": "사용자 지정 인자를 지우지 못했습니다",
+      "clear_dialog_title": "숨겨진 인자를 지울까요?",
+      "clear_dialog_description": "숨겨진 모든 값을 포함한 저장된 인자 목록 전체를 삭제합니다.",
+      "clear_confirm_action": "인자 지우기"
     },
     "mcp_config": {
       "intro": "이 에이전트가 사용할 수 있는 MCP Server를 관리합니다. Multica에서 관리하는 Server와 로컬 Runtime에서 상속한 Server가 함께 사용됩니다.",
@@ -444,8 +454,16 @@
       "delete_action": "Server 삭제",
       "invalid_json": "잘못된 JSON: {{error}}",
       "save_failed_toast": "MCP config를 저장하지 못했습니다",
-      "redacted_title": "설정됨 - 현재 보기에서는 숨김",
-      "redacted_hint": "에이전트 소유자 또는 워크스페이스 관리자만 이 config를 읽을 수 있습니다."
+      "redacted_title": "설정됨 — 비밀 값 숨김",
+      "redacted_hint": "일반 에이전트 응답에서는 저장된 MCP 값을 반환하지 않습니다. 새 값으로 전체 설정을 교체하거나 지우세요.",
+      "replace_action": "설정 교체",
+      "clear_action": "설정 지우기",
+      "replace_hint": "교체 설정에 필요한 모든 Server를 추가하세요. 첫 저장 시 숨겨진 설정 전체를 덮어쓰며 병합할 수 없습니다.",
+      "cleared_toast": "MCP config를 지웠습니다",
+      "clear_failed_toast": "MCP config를 지우지 못했습니다",
+      "clear_dialog_title": "숨겨진 MCP config를 지울까요?",
+      "clear_dialog_description": "저장된 MCP config 전체를 삭제합니다. Runtime에서 상속한 Server에는 영향을 주지 않습니다.",
+      "clear_confirm_action": "설정 지우기"
     },
     "composio_mcp": {
       "subtitle": "툴킷을 선택하면, 본인(이 에이전트의 생성자)이 직접 또는 하위 에이전트 체인을 통해 이 에이전트를 트리거할 때만 MCP 서버로 마운트됩니다.",
@@ -460,11 +478,22 @@
       "save_failed_toast": "저장하지 못했습니다. 다시 시도하세요",
       "redacted_title": "설정됨 — 보기에서 숨김",
       "redacted_hint": "이 에이전트가 사용할 수 있는 앱은 생성자만 보거나 변경할 수 있습니다.",
+      "retry_reveal": "앱 불러오기 다시 시도",
       "shared_warning": "이 에이전트는 공유되어 있습니다. 이 에이전트를 실행할 수 있는 사람은 여기서 활성화한 Composio 앱을 사용할 수 있습니다. 이러한 앱이 민감한 데이터를 노출한다면 Private로 설정하거나 접근 범위를 좁히세요.",
       "workspace_warning": "워크스페이스에 공개: 워크스페이스의 모든 구성원이 이 에이전트를 통해 이러한 Composio 앱을 사용할 수 있습니다."
     },
     "runtime_config": {
       "intro": "OpenClaw 런타임이 이 에이전트의 각 턴을 어떻게 실행할지 선택하세요. Local 모드는 에이전트를 daemon 프로세스 내부에서 실행합니다. Gateway 모드는 각 턴을 OpenClaw Gateway로 전달합니다 — daemon 호스트가 가벼운 조율기 역할을 하고 실제 작업은 더 강력한 머신에서 돌리고 싶을 때 유용합니다.",
+      "redacted_title": "라우팅 설정이 숨겨져 있습니다",
+      "redacted_hint": "저장된 라우팅 값에는 자격 증명이 포함될 수 있어 여기에는 반환되지 않습니다. 전체 설정을 교체하거나 명시적으로 지우세요.",
+      "configured_count": "최상위 필드 {{count}}개 설정됨",
+      "replace_action": "라우팅 설정 교체",
+      "replace_hint": "빈 설정에서 시작합니다. 저장하면 저장된 라우팅 설정 전체가 교체됩니다.",
+      "clear_action": "라우팅 설정 지우기",
+      "clear_dialog_title": "라우팅 설정을 지울까요?",
+      "clear_dialog_description": "저장된 라우팅 설정 전체를 제거합니다. 이 작업은 되돌릴 수 없습니다.",
+      "clear_confirm_action": "라우팅 설정 지우기",
+      "cancel_action": "취소",
       "mode_label": "라우팅 모드",
       "mode_local": "Local",
       "mode_gateway": "Gateway",
@@ -481,7 +510,9 @@
       "tls_label": "TLS 사용",
       "tls_hint": "http:// 대신 https://로 다이얼",
       "saved_toast": "라우팅 설정이 저장되었습니다",
-      "save_failed_toast": "라우팅 설정 저장 실패"
+      "save_failed_toast": "라우팅 설정 저장 실패",
+      "cleared_toast": "라우팅 설정을 지웠습니다",
+      "clear_failed_toast": "라우팅 설정을 지우지 못했습니다"
     },
     "skills": {
       "assigned_title": "에이전트에 할당됨",

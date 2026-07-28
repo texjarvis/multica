@@ -160,6 +160,9 @@ type fetchFailureResponse struct {
 }
 
 func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineAgentCreation(w, r) {
+		return
+	}
 	workspaceID := h.resolveWorkspaceID(r)
 
 	ownerID, ok := requireUserID(w, r)
@@ -605,7 +608,8 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 			append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(agent.ID))...)
 	}
 	actorType, actorID := h.resolveActor(r, ownerID, workspaceID)
-	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": resp})
+	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": broadcastAgentResponse(resp)})
+	h.projectAgentMutationResponse(r.Context(), &resp, actorType, ownerID, uuidToString(agent.OwnerID))
 
 	obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.AgentCreated(
 		ownerID,

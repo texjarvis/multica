@@ -16,6 +16,19 @@ export interface ParseOptions {
   endpoint: string;
 }
 
+// Secret-bearing endpoint responses must never degrade to a fabricated empty
+// value. Callers use this sanitized, value-free error to keep the prior state
+// and require an explicit refetch/reveal before another write.
+export class SecretResponseUnreadableError extends Error {
+  readonly endpoint: string;
+
+  constructor(endpoint: string) {
+    super(`The server response for ${endpoint} could not be read safely. Refresh before retrying.`);
+    this.name = "SecretResponseUnreadableError";
+    this.endpoint = endpoint;
+  }
+}
+
 /**
  * Validate a JSON value parsed from an API response against a zod schema,
  * returning the parsed value on success or `fallback` on failure.
@@ -52,4 +65,35 @@ export function parseWithFallback<T>(
     },
   );
   return fallback;
+}
+
+/**
+ * Schema fallback for responses whose received payload or validation issue
+ * may contain credentials. Unlike parseWithFallback, this never logs the
+ * received value, issue message, expected-value set, or any other
+ * value-bearing Zod metadata. Endpoint, issue count, code, and path are enough
+ * to diagnose contract drift without copying secrets into telemetry.
+ */
+export function parseSecretWithFallback<T>(
+  data: unknown,
+  schema: ZodType,
+  _fallback: T,
+  opts: ParseOptions,
+): T {
+  const result = schema.safeParse(data);
+  if (result.success) return result.data as T;
+  schemaLogger.warn(
+    `API response failed secret-safe schema validation: ${opts.endpoint}`,
+    {
+      endpoint: opts.endpoint,
+      issue_count: result.error.issues.length,
+      issues: result.error.issues.map((issue) => ({
+        code: issue.code,
+        path: issue.path.map((segment) =>
+          typeof segment === "number" ? segment : "<field>",
+        ),
+      })),
+    },
+  );
+  throw new SecretResponseUnreadableError(opts.endpoint);
 }

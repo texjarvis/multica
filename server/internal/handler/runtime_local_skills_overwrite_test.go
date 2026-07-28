@@ -133,7 +133,13 @@ func reportLocalSkillImport(t *testing.T, runtimeID, requestID string, body map[
 
 	w := httptest.NewRecorder()
 	req := withURLParams(
-		newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/local-skills/import/"+requestID+"/result", body, testWorkspaceID, "overwrite-test-daemon"),
+		newDaemonTokenRequest(
+			http.MethodPost,
+			"/api/daemon/runtimes/"+runtimeID+"/local-skills/import/"+requestID+"/result",
+			body,
+			testWorkspaceID,
+			runtimeDaemonIDForTest(t, runtimeID),
+		),
 		"runtimeId", runtimeID,
 		"requestId", requestID,
 	)

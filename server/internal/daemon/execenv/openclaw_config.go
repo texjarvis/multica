@@ -816,15 +816,15 @@ func openclawManagedMcpServers(raw json.RawMessage) (map[string]any, bool, error
 	for _, name := range names {
 		var entry map[string]any
 		if err := json.Unmarshal(parsed.McpServers[name], &entry); err != nil {
-			return nil, false, fmt.Errorf("mcp_servers.%s: %w", name, err)
+			return nil, false, fmt.Errorf("mcp_config server entry is invalid JSON: %w", err)
 		}
 		if entry == nil {
-			return nil, false, fmt.Errorf("mcp_servers.%s must be a JSON object", name)
+			return nil, false, fmt.Errorf("mcp_config server entry must be a JSON object")
 		}
 		command, _ := entry["command"].(string)
 		url, _ := entry["url"].(string)
 		if strings.TrimSpace(command) == "" && strings.TrimSpace(url) == "" {
-			return nil, false, fmt.Errorf("mcp_servers.%s must declare either `command` (stdio) or `url` (http/sse)", name)
+			return nil, false, fmt.Errorf("mcp_config server entry must declare either `command` (stdio) or `url` (http/sse)")
 		}
 		out[name] = entry
 	}

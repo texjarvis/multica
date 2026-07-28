@@ -458,6 +458,31 @@ func TestDaemonRestartRejectedTokenFailsBeforeStopping(t *testing.T) {
 	}
 }
 
+func TestDaemonRestartPreflightUsesMachineSafeWorkspaceEndpoint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_SERVER_URL", "")
+
+	const profile = "restart-machine-safe-preflight"
+	var gotMethod, gotPath string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer api.Close()
+
+	if err := cli.SaveCLIConfigForProfile(cli.CLIConfig{Token: "mdt_machine", ServerURL: api.URL}, profile); err != nil {
+		t.Fatalf("SaveCLIConfigForProfile: %v", err)
+	}
+	if err := requireDaemonRestartPreflight(newRestartTestCmd(t, profile), profile); err != nil {
+		t.Fatalf("requireDaemonRestartPreflight: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/api/daemon/workspaces" {
+		t.Fatalf("preflight request = %s %s, want GET /api/daemon/workspaces", gotMethod, gotPath)
+	}
+}
+
 // TestDaemonRestartUnreachableServerFailsBeforeStopping pins the other half of
 // the restart preflight: when the configured server cannot be reached at all,
 // restart must abort before stopping the running daemon, because the

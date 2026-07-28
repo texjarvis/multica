@@ -2378,7 +2378,8 @@ func TestAgentCRUD(t *testing.T) {
 }
 
 func TestUpdateAgentMcpConfigAbsentPreservesValue(t *testing.T) {
-	agentID := createHandlerTestAgent(t, "Handler Mcp Preserve", []byte(`{"preset":"keep"}`))
+	const stored = `{"mcpServers":{"preserved":{"command":"node","env":{"TOKEN":"keep-secret"}}}}`
+	agentID := createHandlerTestAgent(t, "Handler Mcp Preserve", []byte(stored))
 
 	w := httptest.NewRecorder()
 	req := newRequest("PUT", "/api/agents/"+agentID, map[string]any{
@@ -2394,8 +2395,11 @@ func TestUpdateAgentMcpConfigAbsentPreservesValue(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&updated); err != nil {
 		t.Fatalf("UpdateAgent: decode response: %v", err)
 	}
-	assertJSONEqual(t, updated.McpConfig, `{"preset":"keep"}`)
-	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), `{"preset":"keep"}`)
+	assertJSONEqual(t, updated.McpConfig, `{"mcpServers":{"server_1":{"command":"****","env":{"env_1":"****"}}}}`)
+	if !updated.McpConfigRedacted {
+		t.Fatal("UpdateAgent: expected mcp_config_redacted for preserved config")
+	}
+	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), stored)
 }
 
 func TestUpdateAgentMcpConfigNullClearsValue(t *testing.T) {
@@ -2403,7 +2407,8 @@ func TestUpdateAgentMcpConfigNullClearsValue(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := newRequest("PUT", "/api/agents/"+agentID, map[string]any{
-		"mcp_config": nil,
+		"mcp_config":        nil,
+		"mcp_config_intent": hiddenMutationIntentClear,
 	})
 	req = withURLParam(req, "id", agentID)
 	testHandler.UpdateAgent(w, req)
@@ -2422,11 +2427,20 @@ func TestUpdateAgentMcpConfigNullClearsValue(t *testing.T) {
 }
 
 func TestUpdateAgentMcpConfigObjectUpdatesValue(t *testing.T) {
-	agentID := createHandlerTestAgent(t, "Handler Mcp Update", []byte(`{"preset":"old"}`))
+	agentID := createHandlerTestAgent(t, "Handler Mcp Update", []byte(`{"mcpServers":{"old":{"command":"old-command"}}}`))
+	replacement := map[string]any{
+		"mcpServers": map[string]any{
+			"new": map[string]any{
+				"url":     "https://example.invalid/mcp?token=new-secret",
+				"headers": map[string]string{"Authorization": "Bearer new-secret"},
+			},
+		},
+	}
 
 	w := httptest.NewRecorder()
 	req := newRequest("PUT", "/api/agents/"+agentID, map[string]any{
-		"mcp_config": map[string]any{"preset": "new"},
+		"mcp_config":        replacement,
+		"mcp_config_intent": hiddenMutationIntentReplace,
 	})
 	req = withURLParam(req, "id", agentID)
 	testHandler.UpdateAgent(w, req)
@@ -2438,8 +2452,60 @@ func TestUpdateAgentMcpConfigObjectUpdatesValue(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&updated); err != nil {
 		t.Fatalf("UpdateAgent: decode response: %v", err)
 	}
-	assertJSONEqual(t, updated.McpConfig, `{"preset":"new"}`)
-	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), `{"preset":"new"}`)
+	assertJSONEqual(t, updated.McpConfig, `{"mcpServers":{"server_1":{"url":"****","headers":{"header_1":"****"}}}}`)
+	if !updated.McpConfigRedacted {
+		t.Fatal("UpdateAgent: expected mcp_config_redacted for replacement config")
+	}
+	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), `{"mcpServers":{"new":{"headers":{"Authorization":"Bearer new-secret"},"url":"https://example.invalid/mcp?token=new-secret"}}}`)
+}
+
+func TestUpdateAgentMcpConfigMaskedPlaceholderRejected(t *testing.T) {
+	const stored = `{"mcpServers":{"real":{"command":"node","env":{"TOKEN":"persisted-secret"}}}}`
+	agentID := createHandlerTestAgent(t, "Handler Mcp Reject Mask", []byte(stored))
+
+	w := httptest.NewRecorder()
+	req := newRequest("PUT", "/api/agents/"+agentID, map[string]any{
+		"mcp_config_intent": hiddenMutationIntentReplace,
+		"mcp_config": map[string]any{
+			"mcpServers": map[string]any{
+				"server_1": map[string]any{"command": envSentinel},
+			},
+		},
+	})
+	req = withURLParam(req, "id", agentID)
+	testHandler.UpdateAgent(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("UpdateAgent: expected 400 for masked MCP config, got %d: %s", w.Code, w.Body.String())
+	}
+	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), stored)
+}
+
+func TestCreateAgentMcpConfigMaskedPlaceholderRejected(t *testing.T) {
+	const agentName = "Handler Mcp Create Reject Mask"
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/agents", map[string]any{
+		"name":       agentName,
+		"runtime_id": handlerTestRuntimeID(t),
+		"mcp_config": map[string]any{
+			"mcpServers": map[string]any{
+				"server_1": map[string]any{"url": envSentinel},
+			},
+		},
+	})
+	testHandler.CreateAgent(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("CreateAgent: expected 400 for masked MCP config, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT count(*) FROM agent WHERE workspace_id = $1 AND name = $2
+	`, parseUUID(testWorkspaceID), agentName).Scan(&count); err != nil {
+		t.Fatalf("count rejected agents: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CreateAgent persisted %d rows for a masked MCP placeholder", count)
+	}
 }
 
 func TestCreateAgentMcpConfigNullStoresSQLNull(t *testing.T) {

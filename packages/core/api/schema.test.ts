@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { ApiClient } from "./client";
-import { parseWithFallback } from "./schema";
+import { ApiClient, CommittedResponseUnreadableError } from "./client";
+import { noopLogger, type Logger } from "../logger";
+import {
+  parseSecretWithFallback,
+  parseWithFallback,
+  SecretResponseUnreadableError,
+  setSchemaLogger,
+} from "./schema";
 
 // Helper: stub fetch with a single JSON response. Status defaults to 200.
 function stubFetchJson(body: unknown, status = 200) {
@@ -18,11 +24,298 @@ function stubFetchJson(body: unknown, status = 200) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  setSchemaLogger(noopLogger);
+});
+
+function recordingSchemaLogger(): {
+  logger: Logger;
+  warn: ReturnType<typeof vi.fn>;
+} {
+  const warn = vi.fn();
+  return {
+    warn,
+    logger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn,
+      error: vi.fn(),
+    },
+  };
+}
+
+describe("secret-safe API response logging", () => {
+  const secret = "sentinel-malformed-env-response-secret";
+
+  it("never logs malformed GET env response values or key names", async () => {
+    const { logger, warn } = recordingSchemaLogger();
+    setSchemaLogger(logger);
+    stubFetchJson({
+      agent_id: 123,
+      custom_env: { ["TOKEN_" + secret]: secret },
+    });
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.getAgentEnv("agent-1")).rejects.toBeInstanceOf(
+      SecretResponseUnreadableError,
+    );
+
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain(secret);
+    expect(logged).not.toContain("TOKEN_");
+    expect(logged).not.toContain("received");
+    expect(logged).toContain("GET /api/agents/:id/env");
+    expect(logged).toContain("issue_count");
+  });
+
+  it("never logs malformed PUT env response values or key names", async () => {
+    const { logger, warn } = recordingSchemaLogger();
+    setSchemaLogger(logger);
+    stubFetchJson({
+      agent_id: 123,
+      custom_env_key_count: "wrong-type",
+      custom_env: { ["AUTHORIZATION_" + secret]: secret },
+    });
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(
+      client.updateAgentEnv("agent-1", {
+        custom_env: { TOKEN: "request-value" },
+      }),
+    ).rejects.toMatchObject({
+      name: "CommittedResponseUnreadableError",
+      committed: true,
+      endpoint: "PUT /api/agents/:id/env",
+    });
+
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain(secret);
+    expect(logged).not.toContain("AUTHORIZATION_");
+    expect(logged).not.toContain("received");
+    expect(logged).not.toContain("wrong-type");
+    expect(logged).toContain("PUT /api/agents/:id/env");
+  });
+
+  it("accepts an old-server plaintext PUT response without exposing or logging values", async () => {
+    const legacySecret = "sentinel-old-server-env-value";
+    const { logger, warn } = recordingSchemaLogger();
+    setSchemaLogger(logger);
+    stubFetchJson({
+      agent_id: "agent-1",
+      custom_env: {
+        API_TOKEN: legacySecret,
+        SECONDARY: "another-old-server-secret",
+      },
+    });
+
+    const client = new ApiClient("https://api.example.test");
+    const result = await client.updateAgentEnv("agent-1", {
+      custom_env: { API_TOKEN: "replacement-value" },
+    });
+
+    expect(result).toEqual({
+      agent_id: "agent-1",
+      custom_env: {
+        API_TOKEN: "****",
+        SECONDARY: "****",
+      },
+      has_custom_env: true,
+      custom_env_key_count: 2,
+      custom_env_keys: ["API_TOKEN", "SECONDARY"],
+      added_keys: [],
+      removed_keys: [],
+      changed_keys: [],
+      preserved_keys: [],
+    });
+    expect(JSON.stringify(result)).not.toContain(legacySecret);
+    expect(JSON.stringify(result)).not.toContain("another-old-server-secret");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing GET map and a response for another agent", async () => {
+    const client = new ApiClient("https://api.example.test");
+
+    stubFetchJson({ agent_id: "agent-1" });
+    await expect(client.getAgentEnv("agent-1")).rejects.toBeInstanceOf(
+      SecretResponseUnreadableError,
+    );
+
+    stubFetchJson({
+      agent_id: "agent-2",
+      custom_env: { TOKEN: "other-agent-private-value" },
+    });
+    await expect(client.getAgentEnv("agent-1")).rejects.toBeInstanceOf(
+      SecretResponseUnreadableError,
+    );
+  });
+
+  it("treats incomplete, inconsistent, or cross-agent PUT confirmations as commit-uncertain", async () => {
+    const client = new ApiClient("https://api.example.test");
+    const expectCommittedUnreadable = async (body: unknown) => {
+      stubFetchJson(body);
+      await expect(
+        client.updateAgentEnv("agent-1", {
+          custom_env: { TOKEN: "replacement-value" },
+        }),
+      ).rejects.toBeInstanceOf(CommittedResponseUnreadableError);
+    };
+
+    await expectCommittedUnreadable({
+      agent_id: "agent-1",
+      custom_env: {},
+      has_custom_env: false,
+    });
+    await expectCommittedUnreadable({
+      agent_id: "agent-1",
+      custom_env: { TOKEN: "****" },
+      has_custom_env: true,
+      custom_env_key_count: 0,
+      custom_env_keys: ["TOKEN"],
+      added_keys: [],
+      removed_keys: [],
+      changed_keys: [],
+      preserved_keys: [],
+    });
+    await expectCommittedUnreadable({
+      agent_id: "agent-2",
+      custom_env: { TOKEN: "****" },
+      has_custom_env: true,
+      custom_env_key_count: 1,
+      custom_env_keys: ["TOKEN"],
+      added_keys: [],
+      removed_keys: [],
+      changed_keys: ["TOKEN"],
+      preserved_keys: [],
+    });
+  });
+
+  it("keeps Composio slugs behind the privileged GET and never logs malformed values", async () => {
+    const secretSlug = "sentinel-private-toolkit-slug";
+    const { logger, warn } = recordingSchemaLogger();
+    setSchemaLogger(logger);
+    stubFetchJson({
+      agent_id: 123,
+      toolkit_slugs: [secretSlug],
+    });
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(
+      client.getAgentComposioToolkitAllowlist("agent-1"),
+    ).rejects.toBeInstanceOf(SecretResponseUnreadableError);
+
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain(secretSlug);
+    expect(logged).toContain(
+      "GET /api/agents/:id/composio-toolkit-allowlist",
+    );
+  });
+
+  it("rejects a cross-agent Composio reveal and treats a cross-agent update confirmation as commit-uncertain", async () => {
+    const client = new ApiClient("https://api.example.test");
+
+    stubFetchJson({ agent_id: "agent-2", toolkit_slugs: ["notion"] });
+    await expect(
+      client.getAgentComposioToolkitAllowlist("agent-1"),
+    ).rejects.toBeInstanceOf(SecretResponseUnreadableError);
+
+    stubFetchJson({
+      agent_id: "agent-2",
+      toolkit_count: 1,
+    });
+    await expect(
+      client.updateAgentComposioToolkitAllowlist("agent-1", {
+        intent: "replace",
+        toolkit_slugs: ["notion"],
+      }),
+    ).rejects.toBeInstanceOf(CommittedResponseUnreadableError);
+  });
+
+  it("sends explicit Composio replace and clear intent to the dedicated endpoint", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ agent_id: "agent-1", toolkit_count: 1 }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ agent_id: "agent-1", toolkit_count: 0 }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("https://api.example.test");
+
+    await client.updateAgentComposioToolkitAllowlist("agent-1", {
+      intent: "replace",
+      toolkit_slugs: ["notion"],
+    });
+    await client.updateAgentComposioToolkitAllowlist("agent-1", {
+      intent: "clear",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      "/api/agents/agent-1/composio-toolkit-allowlist",
+    );
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body)),
+    ).toEqual({ intent: "replace", toolkit_slugs: ["notion"] });
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body)),
+    ).toEqual({ intent: "clear" });
+  });
+
+  it("redacts string path segments in direct secret-safe parsing", () => {
+    const { logger, warn } = recordingSchemaLogger();
+    setSchemaLogger(logger);
+
+    const fallback = { safe: true };
+    expect(() =>
+      parseSecretWithFallback(
+        { [secret]: secret },
+        z.object({ required: z.string() }),
+        fallback,
+        { endpoint: "GET /secret-test" },
+      ),
+    ).toThrow(SecretResponseUnreadableError);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(secret);
+  });
+
+  it("distinguishes an unreadable committed mutation from a safe retryable failure", async () => {
+    stubFetchJson({ id: 123, custom_env: { TOKEN: secret } }, 200);
+    const client = new ApiClient("https://api.example.test");
+
+    let caught: unknown;
+    try {
+      await client.updateAgentEnv("agent-1", {
+        custom_env: { TOKEN: "replacement" },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(CommittedResponseUnreadableError);
+    expect((caught as CommittedResponseUnreadableError).message).toContain(
+      "may have saved",
+    );
+    expect((caught as CommittedResponseUnreadableError).message).toContain(
+      "Refresh before retrying",
+    );
+    expect((caught as Error).message).not.toContain(secret);
+  });
 });
 
 // These tests cover the five failure modes that white-screened the desktop
-// app in past incidents. The contract is: a malformed response degrades to
-// an empty/safe shape, never throws into React.
+// app in past incidents. Non-secret reads degrade to an empty/safe shape.
+// Secret-bearing reads instead throw a sanitized error so callers cannot
+// confuse contract drift with a genuine empty value.
 describe("ApiClient schema fallback", () => {
   describe("listTimeline", () => {
     it("falls back to an empty array when the body is null", async () => {
@@ -455,25 +748,63 @@ describe("ApiClient schema fallback", () => {
     });
   });
 
-  describe("createAgentFromTemplate", () => {
-    it("falls back to an empty agent when the response is malformed", async () => {
-      // The agent was created server-side even though the client can't
-      // parse the response — UI code reads `agent.id === ""` and skips
-      // the navigation step rather than landing on `/agents/`.
-      stubFetchJson({ unexpected: "shape" });
-      const client = new ApiClient("https://api.example.test");
-      const resp = await client.createAgentFromTemplate({
-        template_slug: "x",
-        name: "X",
+  describe("committed agent/profile identities", () => {
+    it("does not report an empty agent id as a successful create", async () => {
+      stubFetchJson({
+        id: "",
+        workspace_id: "workspace-1",
         runtime_id: "rt-1",
       });
-      expect(resp.agent.id).toBe("");
-      expect(resp.imported_skill_ids).toEqual([]);
-      expect(resp.reused_skill_ids).toEqual([]);
+      const client = new ApiClient("https://api.example.test");
+      await expect(
+        client.createAgent({
+          name: "Agent",
+          runtime_id: "rt-1",
+        }),
+      ).rejects.toBeInstanceOf(CommittedResponseUnreadableError);
+    });
+
+    it("does not report an empty profile id as a successful create", async () => {
+      stubFetchJson({
+        id: "",
+        workspace_id: "workspace-1",
+      });
+      const client = new ApiClient("https://api.example.test");
+      await expect(
+        client.createRuntimeProfile("workspace-1", {
+          display_name: "Local Codex",
+          protocol_family: "codex",
+          command_name: "codex",
+        }),
+      ).rejects.toBeInstanceOf(CommittedResponseUnreadableError);
+    });
+  });
+
+  describe("createAgentFromTemplate", () => {
+    it("reports an uncertain committed result when the response is malformed", async () => {
+      stubFetchJson({ unexpected: "shape" });
+      const client = new ApiClient("https://api.example.test");
+      await expect(
+        client.createAgentFromTemplate({
+          template_slug: "x",
+          name: "X",
+          runtime_id: "rt-1",
+        }),
+      ).rejects.toMatchObject({
+        name: "CommittedResponseUnreadableError",
+        committed: true,
+        endpoint: "POST /api/agents/from-template",
+      });
     });
 
     it("defaults imported_skill_ids / reused_skill_ids to [] when missing", async () => {
-      stubFetchJson({ agent: { id: "agent-1" } });
+      stubFetchJson({
+        agent: {
+          id: "agent-1",
+          workspace_id: "workspace-1",
+          runtime_id: "rt-1",
+        },
+      });
       const client = new ApiClient("https://api.example.test");
       const resp = await client.createAgentFromTemplate({
         template_slug: "x",
@@ -483,6 +814,32 @@ describe("ApiClient schema fallback", () => {
       expect(resp.agent.id).toBe("agent-1");
       expect(resp.imported_skill_ids).toEqual([]);
       expect(resp.reused_skill_ids).toEqual([]);
+    });
+  });
+
+  describe("createAgentBuilderSession", () => {
+    it("reports an uncertain committed result when the response is malformed", async () => {
+      stubFetchJson({ unexpected: "shape" });
+      const client = new ApiClient("https://api.example.test");
+      await expect(
+        client.createAgentBuilderSession({ runtime_id: "rt-1" }),
+      ).rejects.toMatchObject({
+        name: "CommittedResponseUnreadableError",
+        committed: true,
+        endpoint: "POST /api/agent-builder/sessions",
+      });
+    });
+
+    it("rejects empty committed identities", async () => {
+      stubFetchJson({
+        session_id: "",
+        builder_agent_id: "agent-1",
+        runtime_id: "rt-1",
+      });
+      const client = new ApiClient("https://api.example.test");
+      await expect(
+        client.createAgentBuilderSession({ runtime_id: "rt-1" }),
+      ).rejects.toBeInstanceOf(CommittedResponseUnreadableError);
     });
   });
 

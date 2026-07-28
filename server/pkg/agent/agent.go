@@ -211,6 +211,36 @@ type Config struct {
 	CodexVersion   string
 }
 
+// logAgentCommand records only launch metadata with a bounded sensitivity
+// surface. Final argv may contain prompts, custom_args, fixed_args, config
+// overrides, temporary config paths, or credentials. Keep argv opaque and log
+// only its cardinality so every provider shares the same fail-safe boundary.
+func logAgentCommand(logger *slog.Logger, executable string, args []string) {
+	logger.Info("agent command", "exec", executable, "arg_count", len(args))
+}
+
+// logProviderUnparsedOutput records only structural metadata for provider
+// output that could not be decoded. Provider stdout may contain prompts,
+// tool results, credentials, or arbitrary user-controlled text.
+func logProviderUnparsedOutput(logger *slog.Logger, stream string, content string) {
+	logger.Debug("provider output was not parseable",
+		"stream", stream,
+		"content_char_count", len(content),
+	)
+}
+
+// logProviderStarted avoids persisting cwd and model values. Both are
+// administrator-controlled strings and can contain paths, inline credentials,
+// or other sensitive configuration.
+func logProviderStarted(logger *slog.Logger, provider string, pid int, opts ExecOptions) {
+	logger.Info("agent provider started",
+		"provider", provider,
+		"pid", pid,
+		"has_cwd", opts.Cwd != "",
+		"has_model", opts.Model != "",
+	)
+}
+
 // New creates a Backend for the given agent type.
 // Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "kiro", "antigravity", "qoder", "traecli", "grok", "qwen".
 //

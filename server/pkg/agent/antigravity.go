@@ -82,7 +82,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	logAgentCommand(b.cfg.Logger, execPath, args)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -104,7 +104,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		return nil, fmt.Errorf("start agy: %w", err)
 	}
 
-	b.cfg.Logger.Info("agy started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "antigravity", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -141,7 +141,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			b.cfg.Logger.Warn("agy stdout scanner error", "err", err)
+			b.cfg.Logger.Warn("agy stdout scanner error", "has_error", true)
 		}
 
 		waitErr := cmd.Wait()

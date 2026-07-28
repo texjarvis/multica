@@ -5,6 +5,7 @@ import type {
   Agent,
   AgentRuntime,
   MemberWithUser,
+  UpdateAgentRequest,
 } from "@multica/core/types";
 import { AGENT_DESCRIPTION_MAX_LENGTH } from "@multica/core/agents";
 import { isImeComposing } from "@multica/core/utils";
@@ -33,7 +34,7 @@ interface InspectorProps {
   members: MemberWithUser[];
   currentUserId: string | null;
   canEdit: boolean;
-  onUpdate: (id: string, data: Record<string, unknown>) => Promise<void>;
+  onUpdate: (id: string, data: UpdateAgentRequest) => Promise<void>;
 }
 
 interface ProfileDraft {
@@ -62,7 +63,7 @@ export function AgentDetailInspector({
   const { t } = useT("agents");
   const { t: ts } = useT("settings");
   const update = useCallback(
-    (data: Record<string, unknown>) => onUpdate(agent.id, data),
+    (data: UpdateAgentRequest) => onUpdate(agent.id, data),
     [agent.id, onUpdate],
   );
 

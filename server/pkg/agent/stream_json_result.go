@@ -112,7 +112,7 @@ func logStreamProtocolObservation(logger *slog.Logger, obs streamProtocolObserva
 	logger.Info("agent stream protocol summary",
 		"provider", obs.provider,
 		"cli_version", obs.cliVersion,
-		"model", obs.model,
+		"has_model", obs.model != "",
 		"exit_code", obs.exitCode,
 		"event_count", obs.eventCount,
 		"invalid_event_count", obs.invalidEventCount,

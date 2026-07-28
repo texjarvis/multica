@@ -267,11 +267,15 @@ func TestCodexHandleServerRequestPermissionsApproval(t *testing.T) {
 func TestCodexPermissionsApprovalResponseDropsUnknownKeysAndLogs(t *testing.T) {
 	t.Parallel()
 
+	const (
+		secretKey   = "sentinel_unknown_permission_key"
+		secretValue = "sentinel_unknown_permission_value"
+	)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
 	resp := codexPermissionsApprovalResponse(
-		json.RawMessage(`{"permissions":{"network":{"enabled":true},"gpu":{"enabled":true}}}`),
+		json.RawMessage(`{"permissions":{"network":{"enabled":true},"`+secretKey+`":{"token":"`+secretValue+`"}}}`),
 		logger,
 	)
 
@@ -285,11 +289,15 @@ func TestCodexPermissionsApprovalResponseDropsUnknownKeysAndLogs(t *testing.T) {
 	if _, ok := perms["network"]; !ok {
 		t.Fatalf("expected network permission to be granted, got %v", perms)
 	}
-	if _, ok := perms["gpu"]; ok {
-		t.Fatalf("expected unrecognized key gpu to be dropped, got %v", perms)
+	if _, ok := perms[secretKey]; ok {
+		t.Fatalf("expected unrecognized key to be dropped, got %v", perms)
 	}
-	if !strings.Contains(buf.String(), "gpu") {
-		t.Fatalf("expected dropped key to be logged, got %q", buf.String())
+	logged := buf.String()
+	if strings.Contains(logged, secretKey) || strings.Contains(logged, secretValue) {
+		t.Fatalf("dropped permission key/value leaked to logs: %q", logged)
+	}
+	if !strings.Contains(logged, "key_count=1") {
+		t.Fatalf("expected value-free dropped-key count in log, got %q", logged)
 	}
 }
 

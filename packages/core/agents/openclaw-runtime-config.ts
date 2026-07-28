@@ -19,10 +19,10 @@ export interface OpenclawRuntimeConfig {
   gateway?: OpenclawGatewayPin;
 }
 
-// Sentinel the API substitutes for a non-empty `gateway.token` on every read.
-// When the form re-submits the same sentinel, the backend's matching
-// preserve hook restores the persisted token instead of overwriting it.
-// Mirrors `runtimeConfigGatewayTokenMask` in server/internal/handler/agent.go.
+// Legacy response sentinel retained for rolling-upgrade parsing/tests. Current
+// generic agent responses use the whole-field `"****"` public projection and
+// management UIs never replay it; older clients may still send this exact
+// gateway.token value, which the backend treats as "preserve".
 export const OPENCLAW_GATEWAY_TOKEN_MASK = "***";
 
 // Parse an arbitrary runtime_config payload into the typed schema. Unknown
@@ -64,9 +64,8 @@ export function serializeOpenclawRuntimeConfig(
     if (cfg.gateway.host) gw.host = cfg.gateway.host;
     if (cfg.gateway.port) gw.port = cfg.gateway.port;
     if (cfg.gateway.tls) gw.tls = true;
-    // The mask sentinel is the explicit "keep persisted token" signal for
-    // the API. Omitting the field means "clear/no token" for partial
-    // gateway pins, so the sentinel must survive serialization.
+    // Preserve arbitrary explicit values verbatim. This also retains the
+    // legacy "***" compatibility sentinel for old callers during rollout.
     if (cfg.gateway.token) {
       gw.token = cfg.gateway.token;
     }

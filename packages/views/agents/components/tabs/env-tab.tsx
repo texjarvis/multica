@@ -1,6 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   Eye,
   EyeOff,
@@ -10,8 +16,12 @@ import {
   Save,
   Trash2,
 } from "lucide-react";
-import { api } from "@multica/core/api";
-import type { Agent } from "@multica/core/types";
+import {
+  api,
+  CommittedResponseUnreadableError,
+  SecretResponseUnreadableError,
+} from "@multica/core/api";
+import type { Agent, AgentEnvUpdateResponse } from "@multica/core/types";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { toast } from "sonner";
@@ -52,6 +62,30 @@ function entriesToEnvMap(entries: EnvEntry[]): Record<string, string> {
   return map;
 }
 
+// PUT /env returns key metadata only. Reconcile the browser's already-revealed
+// form against that authoritative key set without performing a second audited
+// GET or expecting the server to reflect secret values. A submitted **** for
+// an existing key means the server preserved the prior plaintext value; a
+// **** for a new key is absent from custom_env_keys and is therefore dropped.
+export function reconcileEnvUpdate(
+  submitted: Record<string, string>,
+  original: Record<string, string>,
+  confirmation: AgentEnvUpdateResponse,
+): Record<string, string> {
+  return Object.fromEntries(
+    confirmation.custom_env_keys.map((key) => {
+      const submittedValue = submitted[key] ?? "";
+      if (
+        submittedValue === "****" &&
+        Object.prototype.hasOwnProperty.call(original, key)
+      ) {
+        return [key, original[key] ?? ""];
+      }
+      return [key, submittedValue];
+    }),
+  );
+}
+
 export function EnvTab({
   agent,
   onDirtyChange,
@@ -73,10 +107,32 @@ export function EnvTab({
   // no longer carries values — only the dedicated `/env` endpoint
   // does, and that endpoint writes an audit row per call so we never
   // fetch implicitly on mount.
-  const [revealed, setRevealed] = useState<EnvEntry[] | null>(null);
-  const [originalMap, setOriginalMap] = useState<Record<string, string>>({});
+  const [stateAgentId, setStateAgentId] = useState(agent.id);
+  const [revealedState, setRevealed] = useState<EnvEntry[] | null>(null);
+  const [originalMapState, setOriginalMap] = useState<Record<string, string>>(
+    {},
+  );
   const [revealing, setRevealing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const activeAgentIdRef = useRef(agent.id);
+  const generationRef = useRef(0);
+
+  // A prop switch renders before effects run. Gate the displayed state by its
+  // owner id so Agent A plaintext cannot appear for even one render under
+  // Agent B, then synchronously clear the backing state before paint. Bumping
+  // the generation invalidates every in-flight reveal/save from the old id.
+  const stateIsCurrent = stateAgentId === agent.id;
+  const revealed = stateIsCurrent ? revealedState : null;
+  const originalMap = stateIsCurrent ? originalMapState : {};
+  useLayoutEffect(() => {
+    activeAgentIdRef.current = agent.id;
+    generationRef.current += 1;
+    setStateAgentId(agent.id);
+    setRevealed(null);
+    setOriginalMap({});
+    setRevealing(false);
+    setSaving(false);
+  }, [agent.id]);
 
   const keyCount = agent.custom_env_key_count ?? 0;
 
@@ -90,20 +146,44 @@ export function EnvTab({
   }, [dirty, onDirtyChange]);
 
   const handleReveal = useCallback(async () => {
+    const requestAgentId = agent.id;
+    const requestGeneration = generationRef.current;
     setRevealing(true);
     try {
-      const resp = await api.getAgentEnv(agent.id);
-      const env = resp.custom_env ?? {};
+      const resp = await api.getAgentEnv(requestAgentId);
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
+      if (resp.agent_id !== requestAgentId) {
+        throw new SecretResponseUnreadableError(
+          "GET /api/agents/:id/env",
+        );
+      }
+      const env = resp.custom_env;
       setOriginalMap(env);
       setRevealed(envMapToEntries(env));
     } catch (err) {
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       toast.error(
         err instanceof Error && err.message
           ? err.message
           : t(($) => $.tab_body.env.reveal_failed_toast),
       );
     } finally {
-      setRevealing(false);
+      if (
+        activeAgentIdRef.current === requestAgentId &&
+        generationRef.current === requestGeneration
+      ) {
+        setRevealing(false);
+      }
     }
   }, [agent.id, t]);
 
@@ -147,24 +227,62 @@ export function EnvTab({
       return;
     }
 
+    const requestAgentId = agent.id;
+    const requestGeneration = generationRef.current;
+    const submittedMap = currentEnvMap;
+    const submittedOriginalMap = originalMap;
     setSaving(true);
     try {
-      const resp = await api.updateAgentEnv(agent.id, {
-        custom_env: currentEnvMap,
+      const resp = await api.updateAgentEnv(requestAgentId, {
+        custom_env: submittedMap,
       });
-      const env = resp.custom_env ?? {};
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
+      if (resp.agent_id !== requestAgentId) {
+        throw new CommittedResponseUnreadableError(
+          "PUT /api/agents/:id/env",
+        );
+      }
+      const env = reconcileEnvUpdate(
+        submittedMap,
+        submittedOriginalMap,
+        resp,
+      );
       setOriginalMap(env);
       setRevealed(envMapToEntries(env));
       toast.success(t(($) => $.tab_body.env.saved_toast));
       onSaved?.();
     } catch (err) {
+      if (
+        activeAgentIdRef.current !== requestAgentId ||
+        generationRef.current !== requestGeneration
+      ) {
+        return;
+      }
+      if (err instanceof CommittedResponseUnreadableError) {
+        // The PUT may have committed. The submitted browser copy is no longer
+        // authoritative, so leave edit mode and require a fresh audited reveal
+        // before another replacement can be sent.
+        setOriginalMap({});
+        setRevealed(null);
+        onSaved?.();
+      }
       toast.error(
         err instanceof Error && err.message
           ? err.message
           : t(($) => $.tab_body.env.save_failed_toast),
       );
     } finally {
-      setSaving(false);
+      if (
+        activeAgentIdRef.current === requestAgentId &&
+        generationRef.current === requestGeneration
+      ) {
+        setSaving(false);
+      }
     }
   };
 

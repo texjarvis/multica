@@ -83,7 +83,9 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 	`, creatorAID, ownerH).Scan(&creatorTaskID); err != nil {
 		t.Fatalf("create A's acting task: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID)
+	})
 
 	// Step 1: agent A creates an issue through the ordinary create path and
 	// assigns it to the private-leader squad in the same call.
@@ -141,6 +143,12 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 	r = newRequest("POST", "/api/issues/"+created.ID+"/comments", map[string]any{
 		"content": "handing the private part to [@Worker](mention://agent/" + workerJID + ")",
 	})
+	// Production leader runs authenticate with the task-scoped mat_ token.
+	// Auth middleware stamps these values from the token row; simulate that
+	// authoritative path instead of the legacy human-PAT fallback (whose
+	// authenticated user is testUserID, not this leader's owner H).
+	r.Header.Set("X-User-ID", ownerH)
+	r.Header.Set("X-Actor-Source", "task_token")
 	r.Header.Set("X-Agent-ID", leaderID)
 	r.Header.Set("X-Task-ID", leaderTaskID)
 	r = withURLParam(r, "id", created.ID)
@@ -203,7 +211,9 @@ func TestAgentCreateOriginator_E2E_UpdateAssignSquad_HandlerGateAdmitsPrivateLea
 	`, creatorAID, ownerH).Scan(&creatorTaskID); err != nil {
 		t.Fatalf("create A's acting task: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID)
+	})
 
 	// Agent A creates an unassigned issue via the ordinary path.
 	w := httptest.NewRecorder()

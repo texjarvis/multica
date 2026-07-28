@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -320,10 +321,126 @@ func TestCreateRuntimeProfile_ValidatesCommandAndFixedArgs(t *testing.T) {
 				t.Cleanup(func() {
 					testPool.Exec(context.Background(), `DELETE FROM runtime_profile WHERE id = $1`, resp.ID)
 				})
-				if got := strings.Join(resp.FixedArgs, " "); got != strings.Join(tc.fixedArgs, " ") {
-					t.Fatalf("fixed_args = %v, want %v", resp.FixedArgs, tc.fixedArgs)
+				if len(resp.FixedArgs) != 0 ||
+					resp.FixedArgsCount != len(tc.fixedArgs) ||
+					resp.FixedArgsRedacted != (len(tc.fixedArgs) > 0) {
+					t.Fatalf(
+						"public fixed_args = %v, count=%d redacted=%v; want hidden count=%d",
+						resp.FixedArgs,
+						resp.FixedArgsCount,
+						resp.FixedArgsRedacted,
+						len(tc.fixedArgs),
+					)
+				}
+				var stored []byte
+				if err := testPool.QueryRow(
+					context.Background(),
+					`SELECT fixed_args FROM runtime_profile WHERE id = $1`,
+					resp.ID,
+				).Scan(&stored); err != nil {
+					t.Fatalf("read stored fixed_args: %v", err)
+				}
+				var storedArgs []string
+				if err := json.Unmarshal(stored, &storedArgs); err != nil {
+					t.Fatalf("decode stored fixed_args: %v", err)
+				}
+				if strings.Join(storedArgs, " ") != strings.Join(tc.fixedArgs, " ") {
+					t.Fatalf("stored fixed_args = %v, want %v", storedArgs, tc.fixedArgs)
 				}
 			}
 		})
 	}
+}
+
+func fetchRuntimeProfileFixedArgs(t *testing.T, profileID string) []string {
+	t.Helper()
+	var raw []byte
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT fixed_args FROM runtime_profile WHERE id = $1`,
+		profileID,
+	).Scan(&raw); err != nil {
+		t.Fatalf("read fixed_args: %v", err)
+	}
+	var args []string
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatalf("decode fixed_args: %v", err)
+	}
+	return args
+}
+
+func TestUpdateRuntimeProfileFixedArgsRequiresExplicitIntentWhenHidden(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	profileID := insertRuntimeProfileFixture(t, ctx, "Hidden Fixed Args", "codex", "hidden-fixed-codex")
+	const secret = "sentinel-fixed-arg-secret"
+	if _, err := testPool.Exec(ctx,
+		`UPDATE runtime_profile SET fixed_args = $2::jsonb WHERE id = $1`,
+		profileID, `["--token","`+secret+`"]`,
+	); err != nil {
+		t.Fatalf("seed fixed_args: %v", err)
+	}
+
+	update := func(body map[string]any) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := newRequest(http.MethodPatch,
+			"/api/workspaces/"+testWorkspaceID+"/runtime-profiles/"+profileID,
+			body,
+		)
+		req = withURLParams(req, "id", testWorkspaceID, "profileId", profileID)
+		testHandler.UpdateRuntimeProfile(w, req)
+		return w
+	}
+
+	t.Run("full response replay preserves empty placeholder", func(t *testing.T) {
+		w := update(map[string]any{
+			"display_name":        "Hidden Fixed Args Renamed",
+			"fixed_args":          []string{},
+			"fixed_args_redacted": true,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+		if got := fetchRuntimeProfileFixedArgs(t, profileID); !reflect.DeepEqual(got, []string{"--token", secret}) {
+			t.Fatalf("stored args = %v", got)
+		}
+	})
+
+	t.Run("ambiguous legacy nonempty replacement rejects", func(t *testing.T) {
+		w := update(map[string]any{"fixed_args": []string{"--legacy", "value"}})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409: %s", w.Code, w.Body.String())
+		}
+		if got := fetchRuntimeProfileFixedArgs(t, profileID); !reflect.DeepEqual(got, []string{"--token", secret}) {
+			t.Fatalf("ambiguous request changed stored args: %v", got)
+		}
+	})
+
+	t.Run("explicit replacement succeeds", func(t *testing.T) {
+		w := update(map[string]any{
+			"fixed_args":        []string{"--profile", "fresh"},
+			"fixed_args_intent": hiddenMutationIntentReplace,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+		if got := fetchRuntimeProfileFixedArgs(t, profileID); !reflect.DeepEqual(got, []string{"--profile", "fresh"}) {
+			t.Fatalf("stored args = %v", got)
+		}
+	})
+
+	t.Run("explicit clear succeeds", func(t *testing.T) {
+		w := update(map[string]any{
+			"fixed_args":        []string{},
+			"fixed_args_intent": hiddenMutationIntentClear,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+		if got := fetchRuntimeProfileFixedArgs(t, profileID); len(got) != 0 {
+			t.Fatalf("stored args = %v, want empty", got)
+		}
+	})
 }

@@ -210,10 +210,10 @@ func parseCursorManagedMcpServers(raw json.RawMessage) (map[string]json.RawMessa
 		}
 		var obj map[string]any
 		if err := json.Unmarshal(server, &obj); err != nil {
-			return nil, fmt.Errorf("mcp_servers.%s: %w", name, err)
+			return nil, fmt.Errorf("mcp_config server entry is invalid JSON: %w", err)
 		}
 		if obj == nil {
-			return nil, fmt.Errorf("mcp_servers.%s must be a JSON object", name)
+			return nil, fmt.Errorf("mcp_config server entry must be a JSON object")
 		}
 	}
 	return cfg.McpServers, nil
@@ -241,7 +241,7 @@ func cursorMcpApprovalKeys(projectRoot string, servers map[string]json.RawMessag
 	for _, name := range names {
 		compact := &bytes.Buffer{}
 		if err := json.Compact(compact, servers[name]); err != nil {
-			return nil, fmt.Errorf("compact mcp_servers.%s: %w", name, err)
+			return nil, fmt.Errorf("compact mcp_config server entry: %w", err)
 		}
 		pathJSON, err := json.Marshal(projectRoot)
 		if err != nil {

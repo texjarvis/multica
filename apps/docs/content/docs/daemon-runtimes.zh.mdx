@@ -88,15 +88,20 @@ graph TD
 
 ```bash
 multica runtime profile list
-multica runtime profile create --display-name "Composer" --protocol-family codex --command-name agent
-multica runtime profile update <profile-id> --command-name agent
+multica runtime profile create --display-name "Composer" --protocol-family codex --command-name agent --fixed-args-file ./composer-args.json
+multica runtime profile update <profile-id> --fixed-args-stdin
+multica runtime profile update <profile-id> --clear-fixed-args
 multica runtime profile delete <profile-id>
 ```
 
 内置和自定义运行时都显示在同一份机器列表里。打开自定义运行时所在行的操作菜单，即可编辑或删除配置。删除配置后，各机器上由它注册的运行时实例会在守护进程同步后移除；如果仍有智能体依赖它，删除操作可能会被阻止。
 
 这里填写的是 argv 风格命令，不是 shell 字符串。Multica 存的是可执行文件名和固定参数，守护进程会直接用 `exec.Command(command_name, fixed_args...)` 启动。支持普通参数、引号和反斜杠转义；不支持管道、重定向、`&&`、`;`、反引号、`$VAR` / `$(...)` 展开。需要 shell 行为时，用 wrapper script 包一层。
-目前命令和参数的解析入口在 Runtimes UI；CLI 的 profile 命令负责管理 profile 记录和本机路径覆盖。
+Runtimes UI 会把命令文本解析成 argv；CLI 则以 JSON 字符串数组接收固定 argv。
+
+公开的 runtime profile 响应不会暴露 `fixed_args` 值，因为任意启动参数都可能包含凭据。响应只返回空占位以及 `fixed_args_count` / `fixed_args_redacted`；守护进程的 profile 同步端点仍会收到启动运行时所需的原始 argv。编辑 profile 时默认保留隐藏参数。API 更新必须把新的非空列表与 `fixed_args_intent: "replace"` 配对，或把空列表与 `fixed_args_intent: "clear"` 配对；UI 和 CLI 将它们提供为明确的**替换参数**和**清空参数**操作。回放旧响应中的空占位会保留隐藏参数；已有隐藏参数时，非空但无 intent 的旧式模糊更新会被拒绝。
+
+通过 CLI 写入时，优先使用 `--fixed-args-file <0600-json>` 或 `--fixed-args-stdin`。内联 `--fixed-args <json>` 可能在 shell 历史和进程列表中暴露凭据。三种输入通道互斥；空的 file/stdin 输入会 fail-closed；update 的替换列表必须非空；只有 `--clear-fixed-args` 能清空参数。
 
 如果桌面应用拉起的守护进程找不到你在终端里能运行的命令，可以在这台机器上固定绝对路径：
 

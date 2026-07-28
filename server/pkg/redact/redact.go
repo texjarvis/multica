@@ -91,6 +91,17 @@ func InputMap(m map[string]any) map[string]any {
 	return out
 }
 
+// FailureLogAttrs converts daemon/provider failure text into content-free
+// presence metadata suitable for slog. Failure strings are untrusted agent
+// output and can embed argv, prompts, MCP identifiers, URLs, or env/config
+// values; regex redaction cannot safely enumerate every provider format.
+func FailureLogAttrs(errorText, failureReason string) []any {
+	return []any{
+		"has_task_error", strings.TrimSpace(errorText) != "",
+		"has_failure_reason", strings.TrimSpace(failureReason) != "",
+	}
+}
+
 // homeDir is resolved once at init for path redaction.
 var homeDir string
 var username string

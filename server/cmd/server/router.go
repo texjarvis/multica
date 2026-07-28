@@ -850,6 +850,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
+		r.Use(requireHumanOnSensitiveRoutes)
 		r.Use(middleware.RefreshCloudFrontCookies(cfSigner))
 
 		// --- User-scoped routes (no workspace context required) ---
@@ -1278,6 +1279,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// internal/handler/agent_env.go.
 					r.Get("/env", h.GetAgentEnv)
 					r.Put("/env", h.UpdateAgentEnv)
+					// Raw Composio toolkit slugs are never part of generic
+					// Agent responses. This owner/admin, human-only endpoint is
+					// the explicit reveal/replace/clear capability.
+					r.Get("/composio-toolkit-allowlist", h.GetAgentComposioToolkitAllowlist)
+					r.Put("/composio-toolkit-allowlist", h.UpdateAgentComposioToolkitAllowlist)
 				})
 			})
 

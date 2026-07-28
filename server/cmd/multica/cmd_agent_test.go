@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,431 @@ func freshAgentEnvSetCmd() *cobra.Command {
 	c.Flags().Bool("custom-env-stdin", false, "")
 	c.Flags().String("custom-env-file", "", "")
 	return c
+}
+
+func freshAgentUpdateIntentCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "update"}
+	cmd.Flags().String("custom-args", "", "")
+	cmd.Flags().Bool("custom-args-stdin", false, "")
+	cmd.Flags().String("custom-args-file", "", "")
+	cmd.Flags().String("runtime-config", "", "")
+	cmd.Flags().Bool("runtime-config-stdin", false, "")
+	cmd.Flags().String("runtime-config-file", "", "")
+	cmd.Flags().String("mcp-config", "", "")
+	cmd.Flags().Bool("mcp-config-stdin", false, "")
+	cmd.Flags().String("mcp-config-file", "", "")
+	cmd.Flags().String("output", "json", "")
+	cmd.Flags().String("profile", "", "")
+	return cmd
+}
+
+func TestAgentRuntimeConfigAndCustomArgsExposeSafeInputChannels(t *testing.T) {
+	for _, command := range []*cobra.Command{agentCreateCmd, agentUpdateCmd} {
+		for _, family := range []string{"runtime-config", "custom-args"} {
+			for _, suffix := range []string{"", "-stdin", "-file"} {
+				flag := family + suffix
+				if command.Flags().Lookup(flag) == nil {
+					t.Fatalf("%s missing --%s", command.CommandPath(), flag)
+				}
+			}
+			usage := strings.ToLower(command.Flags().Lookup(family).Usage)
+			if !strings.Contains(usage, "unsafe") ||
+				!strings.Contains(usage, "--"+family+"-file") ||
+				!strings.Contains(usage, "--"+family+"-stdin") {
+				t.Fatalf("%s --%s help does not direct users to safe channels: %q", command.CommandPath(), family, usage)
+			}
+		}
+	}
+}
+
+func TestAgentUpdateSafeRuntimeAndArgumentInputs(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+
+	tests := []struct {
+		name      string
+		configure func(*testing.T, *cobra.Command)
+		assert    func(*testing.T, map[string]any)
+	}{
+		{
+			name: "runtime config file",
+			configure: func(t *testing.T, cmd *cobra.Command) {
+				path := filepath.Join(t.TempDir(), "runtime-config.json")
+				if err := os.WriteFile(path, []byte(`{"gateway":{"token":"file-secret"}}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				_ = cmd.Flags().Set("runtime-config-file", path)
+			},
+			assert: func(t *testing.T, body map[string]any) {
+				want := map[string]any{"gateway": map[string]any{"token": "file-secret"}}
+				if !reflect.DeepEqual(body["runtime_config"], want) {
+					t.Fatalf("runtime_config = %#v, want %#v", body["runtime_config"], want)
+				}
+				if body["runtime_config_intent"] != "replace" {
+					t.Fatalf("runtime_config_intent = %#v, want replace", body["runtime_config_intent"])
+				}
+			},
+		},
+		{
+			name: "custom args stdin",
+			configure: func(_ *testing.T, cmd *cobra.Command) {
+				cmd.SetIn(strings.NewReader(`["--api-key","stdin-secret"]`))
+				_ = cmd.Flags().Set("custom-args-stdin", "true")
+			},
+			assert: func(t *testing.T, body map[string]any) {
+				if !reflect.DeepEqual(body["custom_args"], []any{"--api-key", "stdin-secret"}) {
+					t.Fatalf("custom_args = %#v", body["custom_args"])
+				}
+				if body["custom_args_intent"] != "replace" {
+					t.Fatalf("custom_args_intent = %#v, want replace", body["custom_args_intent"])
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+					t.Errorf("decode request body: %v", err)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "agent-1"})
+			}))
+			defer srv.Close()
+			t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+			cmd := freshAgentUpdateIntentCmd()
+			tc.configure(t, cmd)
+			if _, err := captureStdout(t, func() error {
+				return runAgentUpdate(cmd, []string{"agent-1"})
+			}); err != nil {
+				t.Fatalf("agent update: %v", err)
+			}
+			tc.assert(t, gotBody)
+		})
+	}
+}
+
+func TestAgentJSONInputValidationFailsClosed(t *testing.T) {
+	const secret = "sentinel-runtime-input-secret"
+	if _, err := parseRuntimeConfig(`{"token":"` + secret + `",oops}`); err == nil {
+		t.Fatal("expected malformed runtime config error")
+	} else if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "oops") {
+		t.Fatalf("runtime config parse error leaked input: %v", err)
+	}
+
+	cmd := freshAgentUpdateIntentCmd()
+	cmd.SetIn(strings.NewReader(`{"token":"` + secret + `"}`))
+	_ = cmd.Flags().Set("runtime-config-stdin", "true")
+	_ = cmd.Flags().Set("custom-args-stdin", "true")
+	if err := validateSingleJSONStdin(cmd, "runtime-config", "custom-args"); err == nil {
+		t.Fatal("expected shared-stdin rejection")
+	} else if strings.Contains(err.Error(), secret) {
+		t.Fatalf("shared-stdin error leaked input: %v", err)
+	}
+}
+
+func TestAgentUpdateCLIAddsExplicitHiddenFieldIntent(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+
+	tests := []struct {
+		name       string
+		flag       string
+		value      string
+		wantField  string
+		wantIntent string
+	}{
+		{
+			name:       "runtime config replace",
+			flag:       "runtime-config",
+			value:      `{"mode":"gateway","gateway":{"host":"fresh"}}`,
+			wantField:  "runtime_config",
+			wantIntent: "replace",
+		},
+		{
+			name:       "runtime config clear",
+			flag:       "runtime-config",
+			value:      `{}`,
+			wantField:  "runtime_config",
+			wantIntent: "clear",
+		},
+		{
+			name:       "custom args replace",
+			flag:       "custom-args",
+			value:      `["--profile","fresh"]`,
+			wantField:  "custom_args",
+			wantIntent: "replace",
+		},
+		{
+			name:       "custom args clear",
+			flag:       "custom-args",
+			value:      `[]`,
+			wantField:  "custom_args",
+			wantIntent: "clear",
+		},
+		{
+			name:       "MCP replace",
+			flag:       "mcp-config",
+			value:      `{"mcpServers":{"fresh":{"command":"node"}}}`,
+			wantField:  "mcp_config",
+			wantIntent: "replace",
+		},
+		{
+			name:       "MCP clear",
+			flag:       "mcp-config",
+			value:      `null`,
+			wantField:  "mcp_config",
+			wantIntent: "clear",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "agent-1"})
+			}))
+			defer srv.Close()
+			t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+			cmd := freshAgentUpdateIntentCmd()
+			if err := cmd.Flags().Set(tc.flag, tc.value); err != nil {
+				t.Fatalf("set flag: %v", err)
+			}
+			if _, err := captureStdout(t, func() error {
+				return runAgentUpdate(cmd, []string{"agent-1"})
+			}); err != nil {
+				t.Fatalf("agent update: %v", err)
+			}
+
+			intentField := tc.wantField + "_intent"
+			if gotBody[intentField] != tc.wantIntent {
+				t.Fatalf("%s = %#v, want %q; body=%v", intentField, gotBody[intentField], tc.wantIntent, gotBody)
+			}
+			if _, ok := gotBody[tc.wantField]; !ok {
+				t.Fatalf("body missing %s: %v", tc.wantField, gotBody)
+			}
+		})
+	}
+}
+
+func TestAgentEnvUpdateKeyCountUsesValueFreeConfirmation(t *testing.T) {
+	tests := []struct {
+		name   string
+		result agentEnvUpdateResult
+		want   int
+	}{
+		{
+			name:   "explicit JSON number",
+			result: agentEnvUpdateResult{CustomEnvKeyCount: 3, CustomEnvKeys: []string{"A", "B", "C"}},
+			want:   3,
+		},
+		{
+			name:   "key name fallback",
+			result: agentEnvUpdateResult{CustomEnvKeys: []string{"A", "B"}},
+			want:   2,
+		},
+		{
+			name:   "missing summary",
+			result: agentEnvUpdateResult{},
+			want:   0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := agentEnvUpdateKeyCount(tt.result); got != tt.want {
+				t.Fatalf("agentEnvUpdateKeyCount() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeAgentEnvUpdateResultFailsClosed(t *testing.T) {
+	valid := `{
+		"agent_id":"agent-1",
+		"custom_env":{"TOKEN":"****"},
+		"has_custom_env":true,
+		"custom_env_key_count":1,
+		"custom_env_keys":["TOKEN"],
+		"added_keys":["TOKEN"],
+		"removed_keys":[],
+		"changed_keys":[],
+		"preserved_keys":[]
+	}`
+	result, err := decodeAgentEnvUpdateResult(json.RawMessage(valid), "agent-1")
+	if err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+	if result.CustomEnvKeyCount != 1 || !result.HasCustomEnv {
+		t.Fatalf("valid result = %+v", result)
+	}
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"cross agent", strings.Replace(valid, `"agent-1"`, `"agent-2"`, 1)},
+		{"partial current response", `{"agent_id":"agent-1","custom_env":{},"has_custom_env":false}`},
+		{"plaintext current response", strings.Replace(valid, `"****"`, `"sentinel-plaintext"`, 1)},
+		{"unknown extra field", strings.TrimSuffix(valid, "}") + `,"unknown":"sentinel-extra"}`},
+		{"inconsistent count", strings.Replace(valid, `"custom_env_key_count":1`, `"custom_env_key_count":2`, 1)},
+		{"overlapping categories", strings.Replace(valid, `"changed_keys":[]`, `"changed_keys":["TOKEN"]`, 1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := decodeAgentEnvUpdateResult(json.RawMessage(tc.raw), "agent-1"); err == nil {
+				t.Fatalf("malformed response accepted: %s", tc.raw)
+			}
+		})
+	}
+}
+
+func newAgentListRedactionTestCmd(output string) *cobra.Command {
+	cmd := &cobra.Command{Use: "list"}
+	cmd.Flags().String("output", output, "")
+	cmd.Flags().Bool("include-archived", false, "")
+	return cmd
+}
+
+func newAgentGetRedactionTestCmd(output string) *cobra.Command {
+	cmd := &cobra.Command{Use: "get"}
+	cmd.Flags().String("output", output, "")
+	return cmd
+}
+
+func TestAgentListAndGetOutputFailClosedAgainstLegacySecretFields(t *testing.T) {
+	const secret = "sentinel-cli-agent-secret"
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+
+	legacyAgent := map[string]any{
+		"id":                         "agent-1",
+		"name":                       "Safe name",
+		"status":                     "active",
+		"runtime_mode":               "local",
+		"custom_env":                 map[string]any{"TOKEN": secret},
+		"custom_args":                []any{"--api-key", secret},
+		"mcp_config":                 map[string]any{"headers": map[string]any{"Authorization": secret}},
+		"runtime_config":             map[string]any{"provider": map[string]any{"api_key": secret}},
+		"composio_toolkit_allowlist": []any{"notion", secret},
+		"unknown_secret":             secret,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/agents":
+			_ = json.NewEncoder(w).Encode([]map[string]any{legacyAgent})
+		case "/api/agents/agent-1":
+			_ = json.NewEncoder(w).Encode(legacyAgent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "list json",
+			run: func() error {
+				return runAgentList(newAgentListRedactionTestCmd("json"), nil)
+			},
+		},
+		{
+			name: "list table",
+			run: func() error {
+				return runAgentList(newAgentListRedactionTestCmd("table"), nil)
+			},
+		},
+		{
+			name: "get json",
+			run: func() error {
+				return runAgentGet(newAgentGetRedactionTestCmd("json"), []string{"agent-1"})
+			},
+		},
+		{
+			name: "get table",
+			run: func() error {
+				return runAgentGet(newAgentGetRedactionTestCmd("table"), []string{"agent-1"})
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := captureStdout(t, tc.run)
+			if err != nil {
+				t.Fatalf("command failed: %v", err)
+			}
+			if strings.Contains(output, secret) {
+				t.Fatalf("CLI output leaked sentinel: %s", output)
+			}
+			if !strings.Contains(output, "Safe name") {
+				t.Fatalf("CLI output lost safe fields: %s", output)
+			}
+		})
+	}
+}
+
+func TestAgentEnvSetOutputIgnoresLegacyReflectedValues(t *testing.T) {
+	const secret = "sentinel-cli-env-set-secret"
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode env request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id":   "agent-1",
+			"custom_env": map[string]string{"TOKEN": secret},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	for _, outputMode := range []string{"json", "table"} {
+		t.Run(outputMode, func(t *testing.T) {
+			cmd := freshAgentEnvSetCmd()
+			cmd.Flags().String("output", outputMode, "")
+			if err := cmd.Flags().Set("custom-env", `{"TOKEN":"fresh-value"}`); err != nil {
+				t.Fatalf("set custom-env: %v", err)
+			}
+			output, err := captureStdout(t, func() error {
+				return runAgentEnvSet(cmd, []string{"agent-1"})
+			})
+			if err != nil {
+				t.Fatalf("env set failed: %v", err)
+			}
+			if strings.Contains(output, secret) || strings.Contains(output, "fresh-value") {
+				t.Fatalf("env set output leaked a value: %s", output)
+			}
+		})
+	}
 }
 
 func chdirWithDaemonTaskMarker(t *testing.T) {
@@ -1620,7 +2046,12 @@ func TestAgentCreateSendsThinkingLevel(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode request body: %v", err)
 		}
-		json.NewEncoder(w).Encode(map[string]any{"id": "agent-123", "name": "TestAgent", "thinking_level": "high"})
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":             "agent-123",
+			"name":           "TestAgent",
+			"runtime_id":     "runtime-1",
+			"thinking_level": "high",
+		})
 	}))
 	defer srv.Close()
 
@@ -1665,7 +2096,11 @@ func TestAgentCreateOmitsThinkingLevelWhenUnset(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode request body: %v", err)
 		}
-		json.NewEncoder(w).Encode(map[string]any{"id": "agent-123", "name": "TestAgent"})
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":         "agent-123",
+			"name":       "TestAgent",
+			"runtime_id": "runtime-1",
+		})
 	}))
 	defer srv.Close()
 
@@ -1689,6 +2124,68 @@ func TestAgentCreateOmitsThinkingLevelWhenUnset(t *testing.T) {
 	}
 	if _, ok := gotBody["thinking_level"]; ok {
 		t.Fatalf("unset --thinking-level must be omitted from the body; got %v", gotBody)
+	}
+}
+
+func TestAgentCreateRejectsUnreadableCommittedIdentityWithoutRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response map[string]any
+	}{
+		{
+			name: "empty id",
+			response: map[string]any{
+				"id":         "",
+				"name":       "TestAgent",
+				"runtime_id": "runtime-1",
+			},
+		},
+		{
+			name: "mismatched identity",
+			response: map[string]any{
+				"id":         "agent-123",
+				"name":       "DifferentAgent",
+				"runtime_id": "runtime-other",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+			t.Setenv("MULTICA_TOKEN", "test-token")
+			t.Setenv("MULTICA_AGENT_ID", "")
+			t.Setenv("MULTICA_TASK_ID", "")
+
+			requests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				_ = json.NewEncoder(w).Encode(tc.response)
+			}))
+			defer srv.Close()
+			t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+			cmd := &cobra.Command{Use: "create"}
+			cmd.Flags().String("name", "", "")
+			cmd.Flags().String("runtime-id", "", "")
+			cmd.Flags().String("output", "json", "")
+			cmd.Flags().String("profile", "", "")
+			_ = cmd.Flags().Set("name", "TestAgent")
+			_ = cmd.Flags().Set("runtime-id", "runtime-1")
+
+			err := runAgentCreate(cmd, nil)
+			var committedErr *committedCreateResponseUnreadableError
+			if !errors.As(err, &committedErr) {
+				t.Fatalf("error=%v, want committedCreateResponseUnreadableError", err)
+			}
+			if !strings.Contains(err.Error(), "may have committed") ||
+				!strings.Contains(err.Error(), "multica agent list") {
+				t.Fatalf("error lacks inspect-before-retry guidance: %v", err)
+			}
+			if requests != 1 {
+				t.Fatalf("request count=%d, want exactly one (no automatic retry)", requests)
+			}
+		})
 	}
 }
 
@@ -1780,7 +2277,11 @@ func TestAgentServiceTierFlagsAndBodies(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 				t.Errorf("decode request body: %v", err)
 			}
-			json.NewEncoder(w).Encode(map[string]any{"id": "agent-123"})
+			json.NewEncoder(w).Encode(map[string]any{
+				"id":         "agent-123",
+				"name":       "FastAgent",
+				"runtime_id": "runtime-1",
+			})
 		}))
 		defer srv.Close()
 		t.Setenv("MULTICA_SERVER_URL", srv.URL)

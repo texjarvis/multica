@@ -94,16 +94,19 @@ func init() {
 	runtimeProfileCreateCmd.Flags().String("command-name", "", "Executable the daemon resolves on PATH (required)")
 	runtimeProfileCreateCmd.Flags().String("display-name", "", "Human-readable profile name (required)")
 	runtimeProfileCreateCmd.Flags().String("description", "", "Optional description")
+	runtimeProfileCreateCmd.Flags().String("fixed-args", "", "Fixed launch arguments as inline JSON (unsafe for credentials; prefer --fixed-args-file or --fixed-args-stdin)")
+	runtimeProfileCreateCmd.Flags().Bool("fixed-args-stdin", false, "Read fixed launch arguments JSON from stdin. Mutually exclusive with --fixed-args and --fixed-args-file.")
+	runtimeProfileCreateCmd.Flags().String("fixed-args-file", "", "Read fixed launch arguments JSON from a file (suggested mode: 0600). Mutually exclusive with --fixed-args and --fixed-args-stdin.")
 	runtimeProfileCreateCmd.Flags().String("output", "json", "Output format: table or json")
 
 	// update
 	runtimeProfileUpdateCmd.Flags().String("display-name", "", "New display name")
 	runtimeProfileUpdateCmd.Flags().String("command-name", "", "New command name")
 	runtimeProfileUpdateCmd.Flags().String("description", "", "New description")
-	// NOTE: --fixed-arg remains out of the CLI create/update surface for now:
-	// the product path parses command + args in the UI and stores them as
-	// command_name + fixed_args. Keep this CLI shape narrow until we add an
-	// argv-aware command-line parser here too.
+	runtimeProfileUpdateCmd.Flags().String("fixed-args", "", "Replace hidden fixed launch arguments from inline JSON (unsafe for credentials; prefer --fixed-args-file or --fixed-args-stdin)")
+	runtimeProfileUpdateCmd.Flags().Bool("fixed-args-stdin", false, "Read replacement fixed launch arguments JSON from stdin. Mutually exclusive with --fixed-args and --fixed-args-file.")
+	runtimeProfileUpdateCmd.Flags().String("fixed-args-file", "", "Read replacement fixed launch arguments JSON from a file (suggested mode: 0600). Mutually exclusive with --fixed-args and --fixed-args-stdin.")
+	runtimeProfileUpdateCmd.Flags().Bool("clear-fixed-args", false, "Explicitly clear every hidden fixed launch argument")
 	runtimeProfileUpdateCmd.Flags().Bool("enabled", true, "Enable or disable the profile")
 	runtimeProfileUpdateCmd.Flags().String("output", "json", "Output format: table or json")
 
@@ -125,6 +128,37 @@ func validateProtocolFamily(family string) error {
 			family, strings.Join(agent.SupportedTypes, ", "))
 	}
 	return nil
+}
+
+var safeRuntimeProfileOutputKeys = map[string]struct{}{
+	"id": {}, "workspace_id": {}, "display_name": {}, "protocol_family": {},
+	"command_name": {}, "description": {}, "fixed_args_count": {},
+	"fixed_args_redacted": {}, "visibility": {}, "created_by": {},
+	"enabled": {}, "created_at": {}, "updated_at": {},
+}
+
+func sanitizeRuntimeProfileForCLIOutput(input map[string]any) map[string]any {
+	out := make(map[string]any, len(safeRuntimeProfileOutputKeys)+1)
+	for key := range safeRuntimeProfileOutputKeys {
+		if value, ok := input[key]; ok {
+			out[key] = value
+		}
+	}
+	count := 0
+	redacted, _ := input["fixed_args_redacted"].(bool)
+	if args, ok := input["fixed_args"].([]any); ok {
+		count = len(args)
+		redacted = redacted || count > 0
+	} else if input["fixed_args"] != nil {
+		redacted = true
+	}
+	if explicit, ok := numericMapCount(input["fixed_args_count"]); ok {
+		count = explicit
+	}
+	out["fixed_args"] = []any{}
+	out["fixed_args_count"] = count
+	out["fixed_args_redacted"] = redacted
+	return out
 }
 
 // NOTE: a --visibility flag is intentionally NOT exposed in v1. The server
@@ -150,6 +184,9 @@ func runRuntimeProfileList(cmd *cobra.Command, _ []string) error {
 	}
 	if err := client.GetJSON(ctx, runtimeProfilesPath(workspaceID), &resp); err != nil {
 		return fmt.Errorf("list runtime profiles: %w", err)
+	}
+	for i := range resp.RuntimeProfiles {
+		resp.RuntimeProfiles[i] = sanitizeRuntimeProfileForCLIOutput(resp.RuntimeProfiles[i])
 	}
 
 	output, _ := cmd.Flags().GetString("output")
@@ -178,6 +215,9 @@ func runRuntimeProfileCreate(cmd *cobra.Command, _ []string) error {
 	if err := validateProtocolFamily(family); err != nil {
 		return err
 	}
+	if err := validateSingleJSONStdin(cmd, "fixed-args"); err != nil {
+		return err
+	}
 
 	client, err := newAPIClient(cmd)
 	if err != nil {
@@ -196,6 +236,15 @@ func runRuntimeProfileCreate(cmd *cobra.Command, _ []string) error {
 	if description != "" {
 		body["description"] = description
 	}
+	if raw, ok, err := resolveJSONInput(cmd, "fixed-args", "pass '[]' for no fixed arguments"); err != nil {
+		return err
+	} else if ok {
+		fixedArgs, err := parseStringArgs(raw, "fixed-args")
+		if err != nil {
+			return err
+		}
+		body["fixed_args"] = fixedArgs
+	}
 
 	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
@@ -203,6 +252,15 @@ func runRuntimeProfileCreate(cmd *cobra.Command, _ []string) error {
 	var profile map[string]any
 	if err := client.PostJSON(ctx, runtimeProfilesPath(workspaceID), body, &profile); err != nil {
 		return fmt.Errorf("create runtime profile: %w", err)
+	}
+	if err := validateCommittedRuntimeProfileCreateResponse(
+		profile,
+		workspaceID,
+		displayName,
+		family,
+		commandName,
+	); err != nil {
+		return err
 	}
 	return outputRuntimeProfile(cmd, profile)
 }
@@ -223,13 +281,39 @@ func runRuntimeProfileUpdate(cmd *cobra.Command, args []string) error {
 		v, _ := cmd.Flags().GetString("description")
 		body["description"] = v
 	}
+	if err := validateSingleJSONStdin(cmd, "fixed-args"); err != nil {
+		return err
+	}
+	rawFixedArgs, replaceFixedArgs, err := resolveJSONInput(cmd, "fixed-args", "use --clear-fixed-args to clear")
+	if err != nil {
+		return err
+	}
+	clearFixedArgs, _ := cmd.Flags().GetBool("clear-fixed-args")
+	if replaceFixedArgs && clearFixedArgs {
+		return fmt.Errorf("--fixed-args, --fixed-args-stdin, and --fixed-args-file are mutually exclusive with --clear-fixed-args")
+	}
+	if replaceFixedArgs {
+		fixedArgs, err := parseStringArgs(rawFixedArgs, "fixed-args")
+		if err != nil {
+			return err
+		}
+		if len(fixedArgs) == 0 {
+			return fmt.Errorf("--fixed-args replacement must be non-empty; use --clear-fixed-args to clear")
+		}
+		body["fixed_args"] = fixedArgs
+		body["fixed_args_intent"] = "replace"
+	}
+	if clearFixedArgs {
+		body["fixed_args"] = []string{}
+		body["fixed_args_intent"] = "clear"
+	}
 	if cmd.Flags().Changed("enabled") {
 		v, _ := cmd.Flags().GetBool("enabled")
 		body["enabled"] = v
 	}
 
 	if len(body) == 0 {
-		return fmt.Errorf("no fields to update: pass at least one of --display-name, --command-name, --description, --enabled")
+		return fmt.Errorf("no fields to update: pass at least one of --display-name, --command-name, --description, --fixed-args/--fixed-args-stdin/--fixed-args-file, --clear-fixed-args, --enabled")
 	}
 
 	client, err := newAPIClient(cmd)
@@ -341,6 +425,7 @@ func runRuntimeProfileUnsetPath(cmd *cobra.Command, args []string) error {
 
 // outputRuntimeProfile renders a single profile honoring --output.
 func outputRuntimeProfile(cmd *cobra.Command, profile map[string]any) error {
+	profile = sanitizeRuntimeProfileForCLIOutput(profile)
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
 		return cli.PrintJSON(os.Stdout, profile)

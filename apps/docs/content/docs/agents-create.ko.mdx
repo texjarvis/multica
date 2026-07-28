@@ -66,6 +66,8 @@ ANTHROPIC_BASE_URL = https://my-proxy.example.com
 <Callout type="warning">
 **`custom_env`의 값은 Multica 서버 데이터베이스에 평문으로 저장됩니다.** 에이전트 list/get 응답은 더 이상 환경 변수 값을 전혀 포함하지 않으며, 불투명한 개수만 반환합니다. 실제 값을 읽으려면 워크스페이스 owner 또는 admin이 전용으로 감사되는 `GET /api/agents/{id}/env` 엔드포인트(CLI: `multica agent env get <id>`)를 호출해야 합니다. 작업을 실행 중인 에이전트는 호스트의 owner 자격 증명을 이용해 다른 에이전트의 환경 변수를 드러낼 수 없습니다. 이 엔드포인트는 에이전트 액터 세션을 거부합니다.
 
+env 업데이트는 전용 `PUT /api/agents/{id}/env` 엔드포인트(CLI: `multica agent env set <id>`)를 사용합니다. 응답은 최종 키 이름/개수, 모든 값이 `"****"`인 호환용 `custom_env` 맵, 추가·삭제·변경·보존된 키만 확인하며 제출한 값을 되돌려 주지 않습니다. `"****"`를 제출하면 기존 키 값이 보존되어 마스킹된 클라이언트가 실제 secret을 실수로 덮어쓰지 않습니다.
+
 **가치가 높은 secret은 `custom_env`에 넣지 마세요**(운영 데이터베이스 비밀번호, root 수준 토큰 등). 에이전트에는 **권한 범위가 제한된 전용 자격 증명**(읽기 전용 API 키, 단일 스코프 PAT)을 사용하고 정기적으로 교체하세요. 데이터베이스 백업과 DB 감사는 여전히 의미 있는 노출 표면으로 남아 있습니다.
 </Callout>
 
@@ -85,9 +87,27 @@ claude --model <model> --max-turns 100 --append-system-prompt "always respond in
 
 인자는 셸을 거치지 않고 있는 그대로 전달되므로(주입 위험 없음), 특정 플래그가 인식되는지 여부는 AI 코딩 도구 자체에 달려 있습니다. 이 부분은 도구마다 상당한 차이가 있습니다.
 
+CLI 인수에는 분리형/`=`형 `--api-key`, `--token`, Authorization 헤더, 공급자별 값처럼 어떤 값에도 자격 증명이 들어갈 수 있습니다. 따라서 일반 에이전트 응답은 **비어 있지 않은 모든** `custom_args` 목록을 숨기고 `custom_args: []`, `custom_args_count`, `custom_args_redacted: true`만 반환합니다. 데몬은 저장된 원본 인수를 그대로 받습니다. 새 입력으로 전체 목록을 교체하거나 지우고, 빈 플레이스홀더를 편집 원본으로 사용하지 마세요. 이 숨김 필드를 변경하는 API 업데이트는 `custom_args`와 `custom_args_intent: "replace"` 또는 `"clear"`를 함께 전송해야 합니다. intent 없이 빈 공개 플레이스홀더를 재전송하면 저장된 인수를 보존하며, 숨김 인수가 이미 있을 때 모호한 비어 있지 않은 구형 업데이트는 거부됩니다.
+
+CLI로 쓸 때는 `--custom-args-file <0600-json>` 또는 `--custom-args-stdin`을 권장합니다. 인라인 `--custom-args <json>`은 셸 기록과 프로세스 목록을 통해 자격 증명을 노출할 수 있습니다. create와 update는 상호 배타적인 세 입력 채널을 모두 지원하며, 명시적인 `[]`로 목록을 지웁니다.
+
 <Callout type="tip">
 `custom_env`와 `custom_args`에는 엄격한 상한이 없지만, 실제로는 **각각 10개 이내로 유지하세요**. 너무 많으면 명령줄이 길어지고 시작이 느려지며 유지 관리도 어려워집니다.
 </Callout>
+
+## 관리형 MCP 설정 (mcp_config)
+
+관리형 MCP 항목에는 명령어, URL, 헤더, 환경 변수, API 토큰이 포함될 수 있습니다. Multica는 Runtime 사용을 위해 원본 설정을 저장하지만, **일반 에이전트 응답은 owner/admin에게도 해당 값을 반환하지 않습니다**. 지원되는 설정은 마스킹된 구조 요약만 반환하며, 알 수 없거나 잘못된 구조는 완전히 숨깁니다. 원본 설정은 데몬의 별도 작업 claim 경로를 통해 할당된 Runtime에 전달됩니다.
+
+마스킹된 요약은 표시 전용입니다. 설정된 MCP 값을 변경하려면 완전한 새 교체와 `mcp_config_intent: "replace"`를 제출하고, 유지하려면 `mcp_config`를 생략하며, 지우려면 `null`과 `mcp_config_intent: "clear"`를 보내세요. 구형 클라이언트의 전체 응답 재전송은 숨김 설정을 보존하며, 숨김 설정이 이미 있을 때 모호한 비어 있지 않은 구형 교체는 거부됩니다. 서버는 `"****"` 플레이스홀더를 거부하므로 GET → PUT 왕복으로 유효한 자격 증명이 마스크 값으로 바뀌지 않습니다.
+
+## 런타임별 설정 (runtime_config)
+
+`runtime_config`는 자유 형식 공급자 JSON이며 토큰, Authorization 헤더, 내부 호스트, 환경 값 또는 Multica가 아직 모르는 미래 필드를 포함할 수 있습니다. 일반 에이전트 응답은 fail-closed 공개 투영만 제공합니다. mode, port, TLS 같은 알려진 비밀이 아닌 라우팅 메타데이터는 남을 수 있지만 host/token은 마스킹되고 알 수 없는 키는 제거됩니다. 개수/redacted 메타데이터로 저장된 설정의 존재를 알 수 있습니다. 인증된 데몬 claim 경로에는 저장된 원본 JSON이 계속 전달됩니다.
+
+이 투영은 표시 전용입니다. 업데이트에서 `runtime_config`를 생략하면 전체 저장 값을 유지하고, 완전한 새 객체를 보내면 교체하며, `{}`를 보내면 지웁니다. 관리 UI는 명시적 Replace 또는 Clear 동작을 요구하며 투영에서 교체 값을 초기화하지 않습니다.
+
+CLI로 쓸 때는 `--runtime-config-file <0600-json>` 또는 `--runtime-config-stdin`을 권장합니다. 인라인 `--runtime-config <json>`은 자격 증명에 안전하지 않습니다. 세 입력 채널은 상호 배타적이고, 빈 file/stdin 입력은 거부되며, `{}`가 명시적인 지우기 값입니다. 한 명령에서는 하나의 JSON 필드만 stdin을 사용할 수 있으므로 같은 요청의 추가 비밀 필드에는 file을 사용하세요.
 
 ## 공개 범위
 
@@ -96,7 +116,7 @@ claude --model <model> --max-turns 100 --append-system-prompt "always respond in
 
 새 에이전트는 기본적으로 `private`입니다.
 
-**비공개라고 해서 숨겨지는 것은 아닙니다** — 모든 멤버가 목록에서 비공개 에이전트의 이름과 설명을 볼 수 있으며, 다만 민감한 구성은 읽을 수 없습니다(환경 변수 값은 에이전트 list/get 응답에 절대 나타나지 않으며, MCP 구성은 owner가 아닌 사용자에게는 마스킹됩니다). 자세한 의미는 [에이전트 → 누가 에이전트를 할당할 수 있나요](/agents#who-can-assign-an-agent)를 참고하세요.
+**비공개라고 해서 숨겨지는 것은 아닙니다** — 모든 멤버가 목록에서 비공개 에이전트의 이름과 설명을 볼 수 있지만 일반 에이전트 응답에는 민감한 값이 포함되지 않습니다(env 값은 생략되고 MCP 값은 모든 호출자에게 마스킹되거나 숨겨집니다). 자세한 의미는 [에이전트 → 누가 에이전트를 할당할 수 있나요](/agents#who-can-assign-an-agent)를 참고하세요.
 
 ## 동시 실행 제한
 

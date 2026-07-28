@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   AppConfigSchema,
+  AgentSchema,
+  AgentComposioToolkitAllowlistResponseSchema,
+  AgentComposioToolkitAllowlistUpdateResponseSchema,
+  AgentEnvResponseSchema,
+  AgentEnvUpdateResponseSchema,
   AgentTaskListSchema,
   AutopilotRunSchema,
   FALLBACK_AUTOPILOT_RUN,
@@ -11,6 +16,7 @@ import {
   DashboardUsageByAgentListSchema,
   DashboardUsageDailyListSchema,
   ChatDraftRestoresResponseSchema,
+  CreateAgentFromTemplateResponseSchema,
   CreateFeedbackResponseSchema,
   DuplicateIssueErrorBodySchema,
   EMPTY_CHAT_DRAFT_RESTORES,
@@ -26,6 +32,8 @@ import {
   ListPropertiesResponseSchema,
   SearchProjectsResponseSchema,
   RuntimeHourlyActivityListSchema,
+  AgentBuilderSessionSchema,
+  RuntimeProfileSchema,
   RuntimeUsageByAgentListSchema,
   RuntimeUsageByHourListSchema,
   RuntimeUsageListSchema,
@@ -35,6 +43,329 @@ import {
   UserSchema,
 } from "./schemas";
 import { parseWithFallback } from "./schema";
+
+describe("agent Composio allowlist response schemas", () => {
+  it("keeps slugs only on the exact privileged GET shape", () => {
+    expect(
+      AgentComposioToolkitAllowlistResponseSchema.parse({
+        agent_id: "agent-1",
+        toolkit_slugs: ["notion", "github"],
+      }),
+    ).toEqual({
+      agent_id: "agent-1",
+      toolkit_slugs: ["notion", "github"],
+    });
+  });
+
+  it("rejects missing identities, duplicate slugs, and extra fields", () => {
+    expect(() =>
+      AgentComposioToolkitAllowlistResponseSchema.parse({
+        agent_id: "",
+        toolkit_slugs: [],
+      }),
+    ).toThrow();
+    expect(() =>
+      AgentComposioToolkitAllowlistResponseSchema.parse({
+        agent_id: "agent-1",
+        toolkit_slugs: ["notion", "notion"],
+      }),
+    ).toThrow();
+    expect(() =>
+      AgentComposioToolkitAllowlistResponseSchema.parse({
+        agent_id: "agent-1",
+        toolkit_slugs: [],
+        leaked_field: "unexpected",
+      }),
+    ).toThrow();
+  });
+
+  it("accepts only a value-free committed update confirmation", () => {
+    expect(
+      AgentComposioToolkitAllowlistUpdateResponseSchema.parse({
+        agent_id: "agent-1",
+        toolkit_count: 2,
+      }),
+    ).toEqual({ agent_id: "agent-1", toolkit_count: 2 });
+    expect(() =>
+      AgentComposioToolkitAllowlistUpdateResponseSchema.parse({
+        agent_id: "agent-1",
+        toolkit_count: 2,
+        toolkit_slugs: ["notion", "github"],
+      }),
+    ).toThrow();
+  });
+});
+
+describe("agent env response schemas", () => {
+  it("keeps plaintext values only on the audited GET shape", () => {
+    expect(
+      AgentEnvResponseSchema.parse({
+        agent_id: "agent-1",
+        custom_env: { TOKEN: "sentinel-get-secret" },
+      }),
+    ).toEqual({
+      agent_id: "agent-1",
+      custom_env: { TOKEN: "sentinel-get-secret" },
+    });
+  });
+
+  it("accepts the exact value-free PUT confirmation shape", () => {
+    const parsed = AgentEnvUpdateResponseSchema.parse({
+      agent_id: "agent-1",
+      has_custom_env: true,
+      custom_env_key_count: 1,
+      custom_env_keys: ["TOKEN"],
+      added_keys: ["TOKEN"],
+      removed_keys: [],
+      changed_keys: [],
+      preserved_keys: [],
+      custom_env: { TOKEN: "****" },
+    });
+    expect(parsed).toEqual({
+      agent_id: "agent-1",
+      custom_env: { TOKEN: "****" },
+      has_custom_env: true,
+      custom_env_key_count: 1,
+      custom_env_keys: ["TOKEN"],
+      added_keys: ["TOKEN"],
+      removed_keys: [],
+      changed_keys: [],
+      preserved_keys: [],
+    });
+  });
+
+  it("rejects missing or inconsistent confirmation fields instead of inventing an empty env", () => {
+    expect(() =>
+      AgentEnvResponseSchema.parse({ agent_id: "agent-1" }),
+    ).toThrow();
+    expect(() =>
+      AgentEnvUpdateResponseSchema.parse({
+        agent_id: "agent-1",
+        custom_env: {},
+        has_custom_env: true,
+        custom_env_key_count: 0,
+        custom_env_keys: [],
+        added_keys: [],
+        removed_keys: [],
+        changed_keys: [],
+        preserved_keys: [],
+      }),
+    ).toThrow();
+    expect(() =>
+      AgentEnvUpdateResponseSchema.parse({
+        agent_id: "agent-1",
+        custom_env: { TOKEN: "****" },
+        has_custom_env: true,
+        custom_env_key_count: 0,
+        custom_env_keys: ["TOKEN"],
+        added_keys: [],
+        removed_keys: [],
+        changed_keys: [],
+        preserved_keys: [],
+      }),
+    ).toThrow();
+    expect(() =>
+      AgentEnvUpdateResponseSchema.parse({
+        agent_id: "agent-1",
+        custom_env: { TOKEN: "****" },
+        has_custom_env: true,
+        custom_env_key_count: 1,
+        custom_env_keys: [],
+        added_keys: [],
+        removed_keys: [],
+        changed_keys: [],
+        preserved_keys: [],
+      }),
+    ).toThrow();
+  });
+
+  it("rejects empty response identities", () => {
+    expect(() =>
+      AgentEnvResponseSchema.parse({ agent_id: "", custom_env: {} }),
+    ).toThrow();
+    expect(() =>
+      AgentEnvUpdateResponseSchema.parse({
+        agent_id: " ",
+        custom_env: {},
+      }),
+    ).toThrow();
+  });
+
+  it("accepts an old-server plaintext PUT response and exposes masks only", () => {
+    const secret = "sentinel-legacy-env-update-plaintext";
+    const parsed = AgentEnvUpdateResponseSchema.parse({
+      agent_id: "agent-legacy",
+      custom_env: {
+        API_TOKEN: secret,
+        OTHER: "another-private-value",
+      },
+    });
+
+    expect(parsed).toEqual({
+      agent_id: "agent-legacy",
+      custom_env: {
+        API_TOKEN: "****",
+        OTHER: "****",
+      },
+      has_custom_env: true,
+      custom_env_key_count: 2,
+      custom_env_keys: ["API_TOKEN", "OTHER"],
+      added_keys: [],
+      removed_keys: [],
+      changed_keys: [],
+      preserved_keys: [],
+    });
+    expect(JSON.stringify(parsed)).not.toContain(secret);
+    expect(JSON.stringify(parsed)).not.toContain("another-private-value");
+  });
+});
+
+describe("agent response secret boundary", () => {
+  const secret = "sentinel-agent-response-schema-secret";
+
+  it("fails closed when present custom_args are malformed", () => {
+    expect(
+      AgentSchema.safeParse({
+        id: "agent-1",
+        custom_args: { token: secret },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("strips legacy raw secret fields before the response enters client cache", () => {
+    const parsed = AgentSchema.parse({
+      id: "agent-1",
+      custom_env: { TOKEN: secret },
+      env: { TOKEN: secret },
+      custom_args: ["--api-key", secret],
+      runtime_config: {
+        mode: "gateway",
+        gateway: {
+          host: secret,
+          token: secret,
+          port: 18789,
+          tls: true,
+          Authorization: "Bearer " + secret,
+        },
+        api_key: secret,
+        headers: { Authorization: "Bearer " + secret },
+        env: { TOKEN: secret },
+      },
+      mcp_config: {
+        mcpServers: {
+          private: {
+            command: "node",
+            env: { TOKEN: secret },
+          },
+        },
+      },
+      composio_toolkit_allowlist: ["notion", secret],
+      unknown_secret: secret,
+    });
+
+    const encoded = JSON.stringify(parsed);
+    expect(encoded).not.toContain(secret);
+    expect(parsed.custom_args).toEqual([]);
+    expect(parsed.custom_args_count).toBe(2);
+    expect(parsed.custom_args_redacted).toBe(true);
+    expect(parsed.runtime_config_redacted).toBe(true);
+    expect(parsed.runtime_config).toEqual({
+      mode: "gateway",
+      gateway: {
+        host: "****",
+        token: "****",
+        port: 18789,
+        tls: true,
+      },
+      _redacted: "****",
+    });
+    expect(parsed.mcp_config).toBeNull();
+    expect(parsed.mcp_config_redacted).toBe(true);
+    expect(parsed).not.toHaveProperty("composio_toolkit_allowlist");
+    expect(parsed.composio_toolkit_allowlist_count).toBe(2);
+    expect(parsed.composio_toolkit_allowlist_redacted).toBe(true);
+    expect(parsed).not.toHaveProperty("custom_env");
+    expect(parsed).not.toHaveProperty("env");
+    expect(parsed).not.toHaveProperty("unknown_secret");
+  });
+
+  it("accepts only the server's validated masked MCP projection", () => {
+    const parsed = AgentSchema.parse({
+      id: "agent-1",
+      mcp_config: {
+        mcpServers: {
+          server_1: {
+            command: "****",
+            args: ["****", "****"],
+            env: { env_1: "****" },
+            headers: { header_1: "****" },
+            type: "stdio",
+          },
+        },
+      },
+      mcp_config_redacted: true,
+    });
+    expect(parsed.mcp_config).toEqual({
+      mcpServers: {
+        server_1: {
+          command: "****",
+          args: ["****", "****"],
+          env: { env_1: "****" },
+          headers: { header_1: "****" },
+          type: "stdio",
+        },
+      },
+    });
+  });
+
+  it("strips unknown fields from committed agent creation envelopes", () => {
+    const template = CreateAgentFromTemplateResponseSchema.parse({
+      agent: {
+        id: "agent-1",
+        workspace_id: "workspace-1",
+        runtime_id: "runtime-1",
+      },
+      imported_skill_ids: [],
+      reused_skill_ids: [],
+      unknown_secret: secret,
+    });
+    const builder = AgentBuilderSessionSchema.parse({
+      session_id: "session-1",
+      builder_agent_id: "agent-1",
+      runtime_id: "runtime-1",
+      unknown_secret: secret,
+    });
+
+    expect(template).not.toHaveProperty("unknown_secret");
+    expect(builder).not.toHaveProperty("unknown_secret");
+    expect(JSON.stringify({ template, builder })).not.toContain(secret);
+  });
+});
+
+describe("runtime profile response secret boundary", () => {
+  it("suppresses legacy raw fixed args while retaining value-free metadata", () => {
+    const secret = "sentinel-runtime-profile-schema-secret";
+    const parsed = RuntimeProfileSchema.parse({
+      id: "profile-1",
+      fixed_args: ["--token", secret],
+      unknown_secret: secret,
+    });
+    expect(JSON.stringify(parsed)).not.toContain(secret);
+    expect(parsed.fixed_args).toEqual([]);
+    expect(parsed.fixed_args_count).toBe(2);
+    expect(parsed.fixed_args_redacted).toBe(true);
+    expect(parsed).not.toHaveProperty("unknown_secret");
+  });
+
+  it("fails closed when present fixed_args are malformed", () => {
+    expect(
+      RuntimeProfileSchema.safeParse({
+        id: "profile-1",
+        fixed_args: { token: "malformed-present-secret" },
+      }).success,
+    ).toBe(false);
+  });
+});
 
 const baseIssue = {
   id: "11111111-1111-1111-1111-111111111111",

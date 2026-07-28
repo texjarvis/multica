@@ -207,7 +207,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 	cmd := exec.CommandContext(runCtx, argv0, cmdArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", argv0, "args", cmdArgs)
+	logAgentCommand(b.cfg.Logger, argv0, cmdArgs)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -240,7 +240,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	}
 	_ = stdin.Close()
 
-	b.cfg.Logger.Info("pi started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	logProviderStarted(b.cfg.Logger, "pi", cmd.Process.Pid, opts)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
