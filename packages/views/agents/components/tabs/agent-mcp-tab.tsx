@@ -16,6 +16,7 @@ import {
 } from "@multica/core/composio";
 import { COMPOSIO_MCP_APPS_FLAG } from "@multica/core/feature-flags";
 import { useWorkspacePaths } from "@multica/core/paths";
+import { Button } from "@multica/ui/components/ui/button";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { ComposioToolkitLogo } from "../../../common/composio-toolkit-logo";
 import { AppLink } from "../../../navigation";
@@ -55,7 +56,10 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
   });
   const allowlistQuery = useQuery({
     ...agentComposioToolkitAllowlistOptions(agent.id),
-    enabled: composioEnabled,
+    // A failed unreadable-2xx recovery is a persistent security fence. Do not
+    // let mount, focus, or reconnect issue an independent raw GET around the
+    // hook's exactly-one audited recovery/retry path.
+    enabled: composioEnabled && !updateAllowlist.isCommitUncertain,
   });
 
   // Toolkit metadata (name / logo) keyed by slug, so each connection row can
@@ -83,6 +87,17 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
   }, [connectionsQuery.data]);
 
   const allowlist = allowlistQuery.data?.toolkit_slugs ?? [];
+  // A background refetch can be the recovery path after a mutation returned
+  // an unreadable 2xx confirmation. Never leave stale full-list controls
+  // interactive during that window: only a successful audited reveal for this
+  // agent makes the raw selection authoritative again.
+  const allowlistUnavailable =
+    allowlistQuery.isLoading ||
+    allowlistQuery.isFetching ||
+    !allowlistQuery.data ||
+    updateAllowlist.isCommitUncertain;
+  const allowlistRecoveryFailed =
+    updateAllowlist.allowlistRecoveryStatus === "failed";
 
   const settingsHref = `${paths.settings()}?tab=integrations`;
 
@@ -105,6 +120,9 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
   }
 
   const handleToggle = (slug: string, checked: boolean) => {
+    // Controls are hidden/disabled while fenced, but fail closed against an
+    // event that was already queued before the recovery-state rerender.
+    if (allowlistUnavailable) return;
     const set = new Set(allowlist);
     if (checked) set.add(slug);
     else set.delete(slug);
@@ -116,7 +134,17 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
 
   // A failed privileged reveal must never degrade into an empty editor: that
   // would turn a subsequent Save into an accidental clear of hidden slugs.
-  if (allowlistQuery.isError) {
+  if (
+    allowlistRecoveryFailed ||
+    (allowlistQuery.isError && !updateAllowlist.isCommitUncertain)
+  ) {
+    const retryReveal = () => {
+      if (updateAllowlist.isCommitUncertain) {
+        void updateAllowlist.retryCommitUncertainReveal();
+      } else {
+        void allowlistQuery.refetch();
+      }
+    };
     return (
       <div className="space-y-3">
         <p className="flex items-center gap-2 text-sm font-medium">
@@ -126,6 +154,9 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
         <p className="text-xs text-muted-foreground">
           {t(($) => $.tab_body.composio_mcp.redacted_hint)}
         </p>
+        <Button type="button" size="sm" variant="outline" onClick={retryReveal}>
+          {t(($) => $.tab_body.composio_mcp.retry_reveal)}
+        </Button>
       </div>
     );
   }
@@ -150,7 +181,7 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
         </div>
       )}
 
-      {connectionsQuery.isLoading || allowlistQuery.isLoading ? (
+      {connectionsQuery.isLoading || allowlistUnavailable ? (
         <p className="text-sm text-muted-foreground">
           {t(($) => $.tab_body.composio_mcp.loading)}
         </p>
@@ -191,7 +222,12 @@ export function AgentMcpTab({ agent }: { agent: Agent }) {
                 </div>
                 <Checkbox
                   checked={checked}
-                  disabled={updateAllowlist.isPending}
+                  disabled={
+                    updateAllowlist.isPending ||
+                    updateAllowlist.isCommitUncertain ||
+                    allowlistQuery.isFetching ||
+                    !allowlistQuery.data
+                  }
                   onCheckedChange={(value) => handleToggle(slug, value === true)}
                   aria-label={t(($) => $.tab_body.composio_mcp.toggle_aria, {
                     toolkit: name,

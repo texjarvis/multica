@@ -24,13 +24,21 @@ const connectionStateRef = vi.hoisted(() => ({
 }));
 const allowlistStateRef = vi.hoisted(() => ({
   isLoading: false,
+  isFetching: false,
   isError: false,
+  hasData: true,
 }));
 const queryCallsRef = vi.hoisted(() => ({
   current: [] as { queryKey: unknown[]; enabled?: boolean }[],
 }));
 const mutateSpy = vi.hoisted(() => vi.fn());
+const retryRevealSpy = vi.hoisted(() => vi.fn());
+const allowlistRefetchSpy = vi.hoisted(() => vi.fn());
 const isPendingRef = vi.hoisted(() => ({ current: false }));
+const recoveryStateRef = vi.hoisted(() => ({
+  status: "idle" as "idle" | "recovering" | "failed",
+  isCommitUncertain: false,
+}));
 
 vi.mock("@tanstack/react-query", () => ({
   useQuery: (opts: { queryKey: unknown[]; enabled?: boolean }) => {
@@ -38,11 +46,15 @@ vi.mock("@tanstack/react-query", () => ({
     const key = JSON.stringify(opts.queryKey);
     if (key.includes("composio-toolkit-allowlist")) {
       return {
-        data: allowlistStateRef.isLoading || allowlistStateRef.isError
-          ? undefined
-          : { agent_id: "agent-1", toolkit_slugs: allowlistRef.current },
+        data:
+          allowlistStateRef.isLoading ||
+          !allowlistStateRef.hasData
+            ? undefined
+            : { agent_id: "agent-1", toolkit_slugs: allowlistRef.current },
         isLoading: allowlistStateRef.isLoading,
+        isFetching: allowlistStateRef.isFetching,
         isError: allowlistStateRef.isError,
+        refetch: allowlistRefetchSpy,
       };
     }
     if (connectionStateRef.isLoading) {
@@ -80,6 +92,9 @@ vi.mock("@multica/core/agents", () => ({
   useUpdateAgentAllowlist: () => ({
     mutate: mutateSpy,
     isPending: isPendingRef.current,
+    allowlistRecoveryStatus: recoveryStateRef.status,
+    isCommitUncertain: recoveryStateRef.isCommitUncertain,
+    retryCommitUncertainReveal: retryRevealSpy,
   }),
 }));
 
@@ -152,8 +167,14 @@ describe("AgentMcpTab", () => {
     connectionStateRef.isLoading = false;
     connectionStateRef.isError = false;
     allowlistStateRef.isLoading = false;
+    allowlistStateRef.isFetching = false;
     allowlistStateRef.isError = false;
+    allowlistStateRef.hasData = true;
     isPendingRef.current = false;
+    recoveryStateRef.status = "idle";
+    recoveryStateRef.isCommitUncertain = false;
+    retryRevealSpy.mockResolvedValue(true);
+    allowlistRefetchSpy.mockResolvedValue(undefined);
     queryCallsRef.current = [];
     configStore.getState().setFeatureFlags({
       [COMPOSIO_MCP_APPS_FLAG]: true,
@@ -240,6 +261,86 @@ describe("AgentMcpTab", () => {
 
     expect(screen.getByText(/Loading your connections/i)).toBeTruthy();
     expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+  });
+
+  it("locks A after an unreadable committed update, then bases the next toggle on audited state B", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderTab();
+
+    // An active QueryObserver can retain stale/optimistic state A after a
+    // malformed 2xx confirmation. The explicit hook fence, rather than cache
+    // deletion, must make every full-list control non-interactive.
+    recoveryStateRef.status = "recovering";
+    recoveryStateRef.isCommitUncertain = true;
+    allowlistStateRef.isFetching = true;
+    rerender(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <AgentMcpTab agent={baseAgent} />
+      </I18nProvider>,
+    );
+    expect(screen.getByText(/Loading your connections/i)).toBeTruthy();
+    expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+    expect(mutateSpy).not.toHaveBeenCalled();
+    expect(
+      queryCallsRef.current
+        .filter((call) =>
+          JSON.stringify(call.queryKey).includes(
+            "composio-toolkit-allowlist",
+          ),
+        )
+        .at(-1)?.enabled,
+    ).toBe(false);
+
+    // A successful audited reveal establishes state B. The next toggle must
+    // augment B, not resurrect the stale A list from before the uncertain
+    // commit.
+    allowlistRef.current = ["slack"];
+    allowlistStateRef.isFetching = false;
+    recoveryStateRef.status = "idle";
+    recoveryStateRef.isCommitUncertain = false;
+    rerender(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <AgentMcpTab agent={baseAgent} />
+      </I18nProvider>,
+    );
+    await user.click(screen.getByLabelText(/Allow Notion for this agent/i));
+    expect(mutateSpy).toHaveBeenLastCalledWith(
+      ["slack", "notion"],
+      expect.any(Object),
+    );
+  });
+
+  it("keeps stale A locked across a failed recovery remount and exposes only the audited retry", async () => {
+    const user = userEvent.setup();
+    recoveryStateRef.status = "failed";
+    recoveryStateRef.isCommitUncertain = true;
+    allowlistStateRef.isError = true;
+    allowlistRef.current = ["notion"];
+
+    const first = renderTab();
+    expect(screen.getByText(/hidden from your view/i)).toBeTruthy();
+    expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+    expect(mutateSpy).not.toHaveBeenCalled();
+    first.unmount();
+
+    renderTab();
+    expect(screen.queryByLabelText(/Allow Notion for this agent/i)).toBeNull();
+    expect(
+      queryCallsRef.current
+        .filter((call) =>
+          JSON.stringify(call.queryKey).includes(
+            "composio-toolkit-allowlist",
+          ),
+        )
+        .every((call) => call.enabled === false),
+    ).toBe(true);
+
+    await user.click(
+      screen.getByRole("button", { name: /Retry loading apps/i }),
+    );
+    expect(retryRevealSpy).toHaveBeenCalledTimes(1);
+    expect(allowlistRefetchSpy).not.toHaveBeenCalled();
+    expect(mutateSpy).not.toHaveBeenCalled();
   });
 
   it("only offers active connections", () => {

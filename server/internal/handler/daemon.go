@@ -27,8 +27,10 @@ import (
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
+	"github.com/multica-ai/multica/server/pkg/agentroute"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/providerfailover"
 	"github.com/multica-ai/multica/server/pkg/redact"
 )
 
@@ -1882,6 +1884,23 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			RuntimeConfig:         rawConfig.RuntimeConfig,
 			DisabledRuntimeSkills: disabledRuntimeSkillsFor(agent.DisabledRuntimeSkills, runtimeID, runtime.Provider),
 		}
+		if err := applyAdaptiveTaskClaimRoute(task, resp.Agent); err != nil {
+			slog.Error("daemon claim: invalid persisted adaptive route",
+				"task_id", uuidToString(task.ID),
+				"error", err,
+			)
+			if _, cancelErr := h.TaskService.CancelTask(r.Context(), task.ID); cancelErr != nil {
+				slog.Error("daemon claim: cancel invalid adaptive route failed",
+					"task_id", uuidToString(task.ID),
+					"error", cancelErr,
+				)
+			}
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+				outcome: "error_adaptive_route",
+				status:  http.StatusInternalServerError,
+				message: "persisted adaptive route is invalid",
+			}
+		}
 		if useSkillRefs {
 			_, skillRefs := h.TaskService.LoadAgentSkillBundles(r.Context(), task.AgentID)
 			agentSkillCount = len(skillRefs)
@@ -2729,6 +2748,46 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil
+}
+
+// applyAdaptiveTaskClaimRoute overlays only provider execution configuration.
+// Agent identity, instructions, skills, MCP access, custom_env, and authority
+// remain unchanged, which is the core authorization boundary of adaptive
+// routing.
+func applyAdaptiveTaskClaimRoute(task *db.AgentTaskQueue, agent *TaskAgentData) error {
+	if task == nil || agent == nil || task.RouteAdmissionState != "routed" {
+		return nil
+	}
+	var routedArgs []string
+	if task.RouteCustomArgs != nil {
+		if err := json.Unmarshal(task.RouteCustomArgs, &routedArgs); err != nil {
+			return fmt.Errorf("decode route_custom_args: %w", err)
+		}
+	}
+	var routedRuntimeConfig json.RawMessage
+	if task.RouteRuntimeConfig != nil {
+		merged, err := agentroute.MergeRuntimeConfig(agent.RuntimeConfig, task.RouteRuntimeConfig)
+		if err != nil {
+			return fmt.Errorf("merge route_runtime_config: %w", err)
+		}
+		routedRuntimeConfig = merged
+	}
+	if task.RouteModel.Valid {
+		agent.Model = task.RouteModel.String
+	}
+	if task.RouteThinkingLevel.Valid {
+		agent.ThinkingLevel = task.RouteThinkingLevel.String
+	}
+	if task.RouteServiceTier.Valid {
+		agent.ServiceTier = task.RouteServiceTier.String
+	}
+	if routedRuntimeConfig != nil {
+		agent.RuntimeConfig = routedRuntimeConfig
+	}
+	if task.RouteCustomArgs != nil {
+		agent.CustomArgs = routedArgs
+	}
+	return nil
 }
 
 // ClaimTaskByRuntime atomically claims the next queued task for a runtime.
@@ -3802,6 +3861,11 @@ type TaskFailRequest struct {
 	SessionID     string `json:"session_id,omitempty"`
 	WorkDir       string `json:"work_dir,omitempty"`
 	FailureReason string `json:"failure_reason,omitempty"`
+	// FailoverEvidence is the daemon-observed side-effect evidence for provider
+	// failover (td-836aa9). Absent from older daemons; a nil pointer here keeps
+	// active failover fail-closed because completeness is never proven. New
+	// fields decode to nil on old clients, preserving API backward compatibility.
+	FailoverEvidence *providerfailover.SideEffectEvidence `json:"failover_evidence,omitempty"`
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -3828,7 +3892,7 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	// keep a stale mid-flight pin) and flagging the row in the same commit that
 	// creates and wakes the auto-retry, so the retry can never claim the withheld
 	// pointer or miss the continuity gap.
-	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.FailureReason, req.SessionRolloutMissing)
+	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.FailureReason, req.SessionRolloutMissing, req.FailoverEvidence)
 	if err != nil {
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the

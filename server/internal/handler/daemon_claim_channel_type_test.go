@@ -57,7 +57,7 @@ func claimChatChannelFields(t *testing.T, runtimeID string) (channelType string,
 	t.Helper()
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
-		testWorkspaceID, "claim-channel-type")
+		testWorkspaceID, runtimeDaemonIDOrFallbackForTest(t, runtimeID, "claim-channel-type"))
 	req = withURLParam(req, "runtimeId", runtimeID)
 
 	testHandler.ClaimTaskByRuntime(w, req)

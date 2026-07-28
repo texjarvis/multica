@@ -574,6 +574,7 @@
       "save_failed_toast": "保存失败，请重试",
       "redacted_title": "已配置 —— 对你隐藏",
       "redacted_hint": "只有该 agent 的创建者才能查看或修改它可使用的应用。",
+      "retry_reveal": "重试加载应用",
       "shared_warning": "该智能体已共享。能够运行该智能体的人可以通过它使用你在此启用的 Composio 应用。如果这些应用涉及敏感数据，请改用「私有」或缩小访问范围。",
       "workspace_warning": "公开给工作区：工作区内任何成员都可以通过该智能体使用这些 Composio 应用。"
     },

@@ -585,6 +585,7 @@
       "save_failed_toast": "Couldn't save — please try again",
       "redacted_title": "Configured — hidden from your view",
       "redacted_hint": "Only the agent's creator can view or change which apps it may use.",
+      "retry_reveal": "Retry loading apps",
       "shared_warning": "This agent is shared. People who can run this agent may use the Composio apps you enable here. Use Private or narrow the access list if these apps expose sensitive data.",
       "workspace_warning": "Public to workspace: any workspace member may use these Composio apps through this agent."
     },
