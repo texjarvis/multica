@@ -503,6 +503,9 @@ func renderCodexMcpServersBlock(raw json.RawMessage) (string, bool, error) {
 			return "", false, fmt.Errorf("mcp_config server entry must be a JSON object")
 		}
 		serverVal = normalizeCodexMcpServerConfig(serverVal)
+		if err := normalizeCodexMcpEnv(serverVal); err != nil {
+			return "", false, fmt.Errorf("mcp_config server %q: %w", name, err)
+		}
 		if i > 0 {
 			sb.WriteString("\n")
 		}
@@ -528,6 +531,69 @@ func renderCodexMcpServersBlock(raw json.RawMessage) (string, bool, error) {
 	sb.WriteString(multicaCodexMcpEndMarker)
 	sb.WriteString("\n")
 	return sb.String(), true, nil
+}
+
+// normalizeCodexMcpEnv coerces the `env` field of a single mcp_config server
+// entry into something Codex's config schema actually accepts, mutating
+// server in place.
+//
+// Codex requires `env` to be a table of string -> string. The renderer used
+// to pass `env` through verbatim on the assumption that because Codex and
+// Claude spell the key the same way they also agree on its type. They do not
+// agree for every value an admin can save: `args` is legitimately an array,
+// so an admin writing the widely used "pass these variables through"
+// idiom --
+//
+//	"env": ["MULTICA_TOKEN", "MULTICA_TASK_ID"]
+//
+// -- produced a TOML array. Codex then rejected the entire config.toml with
+// `invalid type: sequence, expected a map` and every task for that agent died
+// at thread/start, before any work began, with no per-server attribution.
+//
+// The name-list form is dropped rather than rejected: it is a passthrough
+// request, and the daemon already injects MULTICA_TOKEN / MULTICA_AGENT_ID /
+// MULTICA_WORKSPACE_ID / MULTICA_TASK_ID into the agent process environment,
+// which stdio MCP children inherit. Dropping the key therefore preserves the
+// admin's intent exactly while emitting valid TOML. Genuinely malformed
+// shapes (non-string values, mixed arrays, scalars) are still errors, so they
+// surface here -- named, and before the child is spawned -- instead of as an
+// opaque parse failure inside Codex.
+func normalizeCodexMcpEnv(server map[string]any) error {
+	raw, ok := server["env"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch env := raw.(type) {
+	case map[string]any:
+		for _, k := range sortedKeys(env) {
+			if _, isString := env[k].(string); !isString {
+				return fmt.Errorf("env value for %q must be a string, got %T", k, env[k])
+			}
+		}
+		return nil
+	case []any:
+		// Only an all-strings list is the recognised passthrough idiom.
+		for _, item := range env {
+			if _, isString := item.(string); !isString {
+				return fmt.Errorf("env must be a table of string values, got a list containing %T", item)
+			}
+		}
+		delete(server, "env")
+		return nil
+	default:
+		return fmt.Errorf("env must be a table of string values, got %T", raw)
+	}
+}
+
+// sortedKeys returns m's keys in sorted order so validation errors are
+// deterministic regardless of Go's map iteration order.
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func normalizeCodexMcpServerConfig(server map[string]any) map[string]any {

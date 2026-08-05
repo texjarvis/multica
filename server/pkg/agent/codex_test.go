@@ -4315,3 +4315,161 @@ func TestHasManagedCodexMcpConfig(t *testing.T) {
 		})
 	}
 }
+
+// TestEnsureCodexMcpConfigDropsEnvPassthroughList pins the production
+// regression that killed every Codex task for an agent: an `env` written as a
+// list of variable names rendered as a TOML array, and Codex rejected the
+// whole config.toml with `invalid type: sequence, expected a map`.
+func TestEnsureCodexMcpConfigDropsEnvPassthroughList(t *testing.T) {
+	t.Parallel()
+
+	tmp := filepath.Join(t.TempDir(), "config.toml")
+	raw := json.RawMessage(`{"mcpServers":{"task-manager":{"command":"node","args":["/srv/task-manager.js"],"env":["MULTICA_AGENT_ID","MULTICA_TOKEN"]}}}`)
+	if err := ensureCodexMcpConfig(tmp, raw, slog.Default()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	got := string(data)
+
+	if strings.Contains(got, "env = [") {
+		t.Fatalf("env passthrough list must not render as a TOML array, got:\n%s", got)
+	}
+	if strings.Contains(got, "MULTICA_TOKEN") {
+		t.Fatalf("passthrough names must not be emitted, got:\n%s", got)
+	}
+	// The rest of the entry must survive untouched.
+	for _, want := range []string{
+		`[mcp_servers.task-manager]`,
+		`command = "node"`,
+		`args = ["/srv/task-manager.js"]`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in:\n%s", want, got)
+		}
+	}
+}
+
+// TestEnsureCodexMcpConfigProductionRegression renders the exact three-server
+// shape that was live when the outage began: two valid object-form envs and
+// one passthrough list. Previously the whole file was unparseable by Codex.
+func TestEnsureCodexMcpConfigProductionRegression(t *testing.T) {
+	t.Parallel()
+
+	tmp := filepath.Join(t.TempDir(), "config.toml")
+	raw := json.RawMessage(`{"mcpServers":{
+		"episodic-memory":{"command":"node","args":["/srv/mcp.js"],"env":{"PGUSER":"mcp","PGPORT":"5432"}},
+		"slack":{"command":"node","args":["/srv/slack.js"],"env":{"SLACK_DEFAULT_CHANNEL":"C0ALEMQ2G2Y"}},
+		"task-manager":{"command":"node","args":["/srv/tm.js"],"env":["MULTICA_AGENT_ID","MULTICA_WORKSPACE_ID","MULTICA_TASK_ID","MULTICA_TOKEN"]}}}`)
+	if err := ensureCodexMcpConfig(tmp, raw, slog.Default()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	got := string(data)
+
+	if strings.Contains(got, "env = [") {
+		t.Fatalf("no server may render an array-form env, got:\n%s", got)
+	}
+	// Valid object-form envs must be preserved verbatim.
+	for _, want := range []string{
+		`env = { PGPORT = "5432", PGUSER = "mcp" }`,
+		`env = { SLACK_DEFAULT_CHANNEL = "C0ALEMQ2G2Y" }`,
+		`[mcp_servers.task-manager]`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderCodexMcpServersBlockRejectsMalformedEnv covers the shapes that are
+// not a recoverable passthrough idiom. These must fail loudly, named, before
+// the child process is spawned -- not as an opaque Codex parse error.
+func TestRenderCodexMcpServersBlockRejectsMalformedEnv(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		raw     string
+		wantSub string
+	}{
+		{
+			name:    "non-string value in env table",
+			raw:     `{"mcpServers":{"fetch":{"command":"uvx","env":{"PORT":8080}}}}`,
+			wantSub: `env value for "PORT" must be a string`,
+		},
+		{
+			name:    "nested object value in env table",
+			raw:     `{"mcpServers":{"fetch":{"command":"uvx","env":{"OPTS":{"a":"b"}}}}}`,
+			wantSub: `env value for "OPTS" must be a string`,
+		},
+		{
+			name:    "mixed-type list",
+			raw:     `{"mcpServers":{"fetch":{"command":"uvx","env":["OK",42]}}}`,
+			wantSub: "got a list containing",
+		},
+		{
+			name:    "scalar env",
+			raw:     `{"mcpServers":{"fetch":{"command":"uvx","env":"MULTICA_TOKEN"}}}`,
+			wantSub: "env must be a table of string values",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, err := renderCodexMcpServersBlock(json.RawMessage(tc.raw))
+			if err == nil {
+				t.Fatalf("expected an error for %s", tc.raw)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+			// The failing server must be named so ops can act on it.
+			if !strings.Contains(err.Error(), `"fetch"`) {
+				t.Fatalf("error %q does not name the offending server", err.Error())
+			}
+		})
+	}
+}
+
+// TestRenderCodexMcpServersBlockKeepsValidEnv guards against the fix
+// over-reaching and stripping legitimate object-form envs.
+func TestRenderCodexMcpServersBlockKeepsValidEnv(t *testing.T) {
+	t.Parallel()
+
+	block, hasServers, err := renderCodexMcpServersBlock(
+		json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx","env":{"API_KEY":"secret"}}}}`))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !hasServers {
+		t.Fatal("expected hasServers=true")
+	}
+	if !strings.Contains(block, `env = { API_KEY = "secret" }`) {
+		t.Fatalf("valid env must be preserved, got:\n%s", block)
+	}
+}
+
+// TestNormalizeCodexMcpEnvAbsentAndNull leaves entries without an env alone.
+func TestNormalizeCodexMcpEnvAbsentAndNull(t *testing.T) {
+	t.Parallel()
+
+	for _, server := range []map[string]any{
+		{"command": "node"},
+		{"command": "node", "env": nil},
+	} {
+		if err := normalizeCodexMcpEnv(server); err != nil {
+			t.Fatalf("normalize(%v): %v", server, err)
+		}
+		if _, present := server["env"]; present && server["env"] != nil {
+			t.Fatalf("env should not be synthesised, got %v", server)
+		}
+	}
+}
