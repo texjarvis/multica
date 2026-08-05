@@ -166,10 +166,12 @@ func TestReusedIsolatedCheckoutRepairsPromisorConfig(t *testing.T) {
 	assertCheckoutIsComplete(t, second.Path)
 }
 
-// The linked-worktree path used by every other runtime shares the cache's own
-// object store and config, so it lazily fetches without any extra wiring. This
-// pins that difference so the promisor handling is not "fixed" by pushing it
-// into the shared cache later.
+// The default (non-isolated) checkout path shares the cache's object store
+// through an alternates file, but its config is otherwise task-local and
+// fresh from `git init` — it does not inherit the bare cache's promisor
+// settings automatically, so runWorktreeAdd has to restore them by hand, the
+// same way the isolated path does. This pins that behavior so the promisor
+// handling is not "fixed" by pushing it into the shared cache later.
 func TestCreateWorktreeFromPartialCacheHasFileContents(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createFilterableTestRepo(t)
