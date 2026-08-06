@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -800,6 +801,11 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 }
 
 // resolveIssueByIdentifier tries to look up an issue by "PREFIX-NUMBER" format.
+//
+// The prefix must match the workspace's own issue prefix. Without this check
+// every prefix resolved to the same issue number, so "FOO-134" and "TRS-134"
+// were interchangeable and silently returned whichever workspace's issue
+// happened to have that number (VIS-12650).
 func (h *Handler) resolveIssueByIdentifier(ctx context.Context, id, workspaceID string) (db.Issue, bool) {
 	parts := splitIdentifier(id)
 	if parts == nil {
@@ -810,6 +816,11 @@ func (h *Handler) resolveIssueByIdentifier(ctx context.Context, id, workspaceID 
 	}
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
+		return db.Issue{}, false
+	}
+	// Case-insensitive: a hand-typed "trs-134" should still resolve to "TRS-134".
+	prefix := h.getIssuePrefix(ctx, wsUUID)
+	if prefix == "" || !strings.EqualFold(parts.prefix, prefix) {
 		return db.Issue{}, false
 	}
 	issue, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
