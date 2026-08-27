@@ -24,6 +24,7 @@ function createWrapper() {
 const {
   mockSendCode,
   mockVerifyCode,
+  mockLoginWithCloudflare,
   mockIssueCliToken,
   mockListWorkspaces,
   mockListMyInvitations,
@@ -34,6 +35,7 @@ const {
 } = vi.hoisted(() => ({
   mockSendCode: vi.fn(),
   mockVerifyCode: vi.fn(),
+  mockLoginWithCloudflare: vi.fn(),
   mockIssueCliToken: vi.fn(),
   mockListWorkspaces: vi.fn(),
   mockListMyInvitations: vi.fn(),
@@ -44,6 +46,7 @@ const {
     state: {
       sendCode: vi.fn(),
       verifyCode: vi.fn(),
+      loginWithCloudflare: vi.fn(),
       user: null as null | { id: string; email: string; onboarded_at?: string | null },
       isLoading: false,
     },
@@ -69,6 +72,7 @@ vi.mock("@multica/core/auth", async () => {
     );
   authStateRef.state.sendCode = mockSendCode;
   authStateRef.state.verifyCode = mockVerifyCode;
+  authStateRef.state.loginWithCloudflare = mockLoginWithCloudflare;
   const useAuthStore = Object.assign(
     (selector: (s: typeof authStateRef.state) => unknown) =>
       selector(authStateRef.state),
@@ -104,6 +108,21 @@ describe("LoginPage", () => {
     authStateRef.state.isLoading = false;
     mockListWorkspaces.mockResolvedValue([]);
     mockListMyInvitations.mockResolvedValue([]);
+    mockLoginWithCloudflare.mockRejectedValue(
+      new Error("Cloudflare Access session unavailable"),
+    );
+  });
+
+  it("attempts Cloudflare SSO once before preserving the email fallback", async () => {
+    const { rerender } = render(<LoginPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(mockLoginWithCloudflare).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.getByLabelText("Email")).toBeInTheDocument();
+
+    rerender(<LoginPage />);
+    expect(mockLoginWithCloudflare).toHaveBeenCalledTimes(1);
   });
 
   it("renders login form with email input and continue button", () => {

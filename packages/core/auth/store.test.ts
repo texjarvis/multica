@@ -36,6 +36,29 @@ function makeApi(getMe: () => Promise<User>): ApiClient {
   } as unknown as ApiClient;
 }
 
+describe("authStore.loginWithCloudflare", () => {
+  it("migrates a stale legacy token to the HttpOnly cookie session", async () => {
+    const storage = makeStorage({ multica_token: "expired-token" });
+    const setToken = vi.fn();
+    const onLogin = vi.fn();
+    const api = {
+      setToken,
+      cloudflareLogin: vi.fn().mockResolvedValue({
+        token: "fresh-token",
+        user: fakeUser,
+      }),
+    } as unknown as ApiClient;
+    const store = createAuthStore({ api, storage, onLogin });
+
+    await store.getState().loginWithCloudflare();
+
+    expect(storage.snapshot().multica_token).toBeUndefined();
+    expect(setToken).toHaveBeenCalledWith(null);
+    expect(onLogin).toHaveBeenCalledTimes(1);
+    expect(store.getState().user).toEqual(fakeUser);
+  });
+});
+
 describe("authStore.initialize — token mode", () => {
   it("keeps the stored token when getMe fails with a non-401 ApiError (e.g. 500)", async () => {
     const storage = makeStorage({ multica_token: "t" });
