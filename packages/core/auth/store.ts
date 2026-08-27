@@ -21,6 +21,7 @@ export interface AuthState {
   sendCode: (email: string) => Promise<void>;
   verifyCode: (email: string, code: string) => Promise<User>;
   loginWithGoogle: (code: string, redirectUri: string) => Promise<User>;
+  loginWithCloudflare: () => Promise<User>;
   loginWithToken: (token: string) => Promise<User>;
   logout: () => void;
   setUser: (user: User) => void;
@@ -97,6 +98,19 @@ export function createAuthStore(options: AuthStoreOptions) {
         storage.setItem("multica_token", token);
         api.setToken(token);
       }
+      onLogin?.();
+      identifyAnalytics(user.id, { email: user.email, name: user.name });
+      set({ user });
+      return user;
+    },
+
+    loginWithCloudflare: async () => {
+      const { token, user } = await api.cloudflareLogin();
+      // Replace any expired legacy token immediately. Persisting the new token
+      // also makes the next page load select token mode instead of retrying an
+      // expired cookie left by a previous session.
+      storage.setItem("multica_token", token);
+      api.setToken(token);
       onLogin?.();
       identifyAnalytics(user.id, { email: user.email, name: user.name });
       set({ user });

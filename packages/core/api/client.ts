@@ -587,6 +587,10 @@ export class ApiClient {
     });
   }
 
+  async cloudflareLogin(): Promise<LoginResponse> {
+    return this.fetch("/auth/cloudflare", { method: "POST" });
+  }
+
   async logout(): Promise<void> {
     await this.fetch("/auth/logout", { method: "POST" });
   }

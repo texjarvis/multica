@@ -62,6 +62,7 @@ function LoginPageContent() {
   const { t } = useT("auth");
   const googleClientId = useConfigStore((state) => state.googleClientId);
   const user = useAuthStore((s) => s.user);
+  const loginWithCloudflare = useAuthStore((s) => s.loginWithCloudflare);
   const isLoading = useAuthStore((s) => s.isLoading);
   const searchParams = useSearchParams();
 
@@ -84,6 +85,18 @@ function LoginPageContent() {
   // Any `user` that appears afterwards came from the login form in this
   // session — not from an existing session found on arrival.
   const settledLoggedOutRef = useRef(false);
+
+  const cloudflareAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (isLoading || user || cloudflareAttemptedRef.current) return;
+    cloudflareAttemptedRef.current = true;
+    void loginWithCloudflare()
+      .then(() => {
+        setLoggedInCookie();
+        window.location.replace(nextUrl || "/");
+      })
+      .catch(() => undefined);
+  }, [isLoading, user, loginWithCloudflare, nextUrl]);
 
   // Already authenticated ON ARRIVAL — honor ?next= or fall back to first
   // workspace (or /onboarding if the user has none). Skip this entire path
