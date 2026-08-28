@@ -105,12 +105,12 @@ export function createAuthStore(options: AuthStoreOptions) {
     },
 
     loginWithCloudflare: async () => {
-      const { user } = await api.cloudflareLogin();
-      // CloudflareLogin sets the HttpOnly auth cookie. Remove any legacy
-      // bearer token so the reload enters cookie mode instead of keeping the
-      // browser on the localStorage path that caused the stale-token loop.
-      storage.removeItem("multica_token");
-      api.setToken(null);
+      const { token, user } = await api.cloudflareLogin();
+      // Replace any expired legacy token immediately. Persisting the new token
+      // also makes the next page load select token mode instead of retrying an
+      // expired cookie left by a previous session.
+      storage.setItem("multica_token", token);
+      api.setToken(token);
       onLogin?.();
       identifyAnalytics(user.id, { email: user.email, name: user.name });
       set({ user });
