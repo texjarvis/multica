@@ -2651,6 +2651,39 @@ func TestSendCode(t *testing.T) {
 	})
 }
 
+func TestSendCodeProductionWithoutEmailProviderFailsClosed(t *testing.T) {
+	const email = "sendcode-no-provider@multica.ai"
+	originalEmailService := testHandler.EmailService
+	t.Cleanup(func() {
+		testHandler.EmailService = originalEmailService
+		testPool.Exec(context.Background(), `DELETE FROM verification_code WHERE email = $1`, email)
+	})
+
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("RESEND_API_KEY", "")
+	t.Setenv("SMTP_HOST", "")
+	testHandler.EmailService = service.NewEmailService()
+
+	w := httptest.NewRecorder()
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
+	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	testHandler.SendCode(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("SendCode: expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM verification_code WHERE email = $1`, email).Scan(&count); err != nil {
+		t.Fatalf("count verification codes: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no stored verification code, got %d", count)
+	}
+}
+
 func TestSendCodeDbError(t *testing.T) {
 	// We can't easily mock the DB here without changing architecture,
 	// but we can simulate a DB error by closing the pool temporarily or

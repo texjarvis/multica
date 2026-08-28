@@ -278,6 +278,16 @@ func (h *Handler) SendCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Local development may print verification codes to stdout, but production
+	// must fail closed when no real mail transport is configured. Check before
+	// generating or storing a code so a missing provider cannot leak a usable
+	// login code into application logs while claiming that delivery succeeded.
+	if isProductionEnv() && !h.EmailService.IsConfigured() {
+		slog.Error("email verification unavailable: no delivery provider configured")
+		writeError(w, http.StatusServiceUnavailable, "email verification is unavailable")
+		return
+	}
+
 	// Check signup restrictions before sending magic link
 	_, err := h.Queries.GetUserByEmail(r.Context(), email)
 	if err != nil {
