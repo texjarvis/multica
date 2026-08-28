@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/resend/resend-go/v2"
 )
 
 type fakeSMTPAuthClient struct {
@@ -245,6 +247,27 @@ func TestNewEmailService_FromEmailResolution(t *testing.T) {
 			s := NewEmailService()
 			if s.fromEmail != tt.want {
 				t.Fatalf("fromEmail = %q, want %q", s.fromEmail, tt.want)
+			}
+		})
+	}
+}
+
+func TestEmailServiceIsConfigured(t *testing.T) {
+	tests := []struct {
+		name string
+		svc  *EmailService
+		want bool
+	}{
+		{name: "nil service", svc: nil, want: false},
+		{name: "development stdout fallback", svc: &EmailService{}, want: false},
+		{name: "smtp transport", svc: &EmailService{smtpHost: "smtp.example.com"}, want: true},
+		{name: "resend transport", svc: &EmailService{client: resend.NewClient("test-key")}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.svc.IsConfigured(); got != tt.want {
+				t.Fatalf("IsConfigured() = %v, want %v", got, tt.want)
 			}
 		})
 	}

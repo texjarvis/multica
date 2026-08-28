@@ -35,6 +35,13 @@ type EmailService struct {
 	smtpEHLOName    string
 }
 
+// IsConfigured reports whether this service has a real delivery transport.
+// The stdout fallback is intentionally excluded: it is useful for local
+// development, but must never count as email delivery in production.
+func (s *EmailService) IsConfigured() bool {
+	return s != nil && (s.smtpHost != "" || s.client != nil)
+}
+
 type smtpAuthClient interface {
 	Auth(smtp.Auth) error
 	Extension(string) (bool, string)
