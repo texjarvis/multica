@@ -1,0 +1,13 @@
+-- Repair databases that applied the original 244, which declared REFERENCES
+-- and ON DELETE CASCADE. Fresh installs never create these constraints.
+ALTER TABLE agent_provisioning_audit DROP CONSTRAINT IF EXISTS agent_provisioning_audit_grant_id_fkey;
+ALTER TABLE agent_provisioning_audit DROP CONSTRAINT IF EXISTS agent_provisioning_audit_workspace_id_fkey;
+ALTER TABLE agent_provisioning_grant DROP CONSTRAINT IF EXISTS agent_provisioning_grant_agent_id_fkey;
+ALTER TABLE agent_provisioning_grant DROP CONSTRAINT IF EXISTS agent_provisioning_grant_granted_by_fkey;
+ALTER TABLE agent_provisioning_grant DROP CONSTRAINT IF EXISTS agent_provisioning_grant_revoked_by_fkey;
+ALTER TABLE agent_provisioning_grant DROP CONSTRAINT IF EXISTS agent_provisioning_grant_workspace_id_fkey;
+ALTER TABLE agent_provisioning_grant_managed_agent DROP CONSTRAINT IF EXISTS agent_provisioning_grant_managed_agent_grant_id_fkey;
+ALTER TABLE agent_provisioning_grant_originator DROP CONSTRAINT IF EXISTS agent_provisioning_grant_originator_grant_id_fkey;
+ALTER TABLE agent_provisioning_grant_runtime DROP CONSTRAINT IF EXISTS agent_provisioning_grant_runtime_grant_id_fkey;
+ALTER TABLE agent_provisioning_grant_skill DROP CONSTRAINT IF EXISTS agent_provisioning_grant_skill_grant_id_fkey;
+ALTER TABLE agent_provisioning_grant_squad DROP CONSTRAINT IF EXISTS agent_provisioning_grant_squad_grant_id_fkey;

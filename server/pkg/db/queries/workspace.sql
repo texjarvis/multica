@@ -96,6 +96,11 @@ SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE;
 -- tables the DELETE below sweeps — they are not cleaned up implicitly. Remove
 -- their workspace-owned rows here so they commit or roll back atomically with
 -- the workspace row.
+--
+-- agent_provisioning_* has no foreign keys. Delete the grant children and the
+-- grant for this workspace. Leave agent_provisioning_audit in place: a workspace
+-- delete must not erase the provisioning audit trail. This is correct after
+-- migration 245 has dropped the old ON DELETE CASCADE foreign keys.
 WITH ws_installations AS (
     SELECT id FROM channel_installation WHERE workspace_id = $1
 ),
@@ -192,6 +197,29 @@ cleared_vcs_prs AS (
 ),
 cleared_vcs_connections AS (
     DELETE FROM vcs_connection WHERE workspace_id = $1
+),
+cleared_provisioning_grant_runtimes AS (
+    DELETE FROM agent_provisioning_grant_runtime
+    WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)
+),
+cleared_provisioning_grant_skills AS (
+    DELETE FROM agent_provisioning_grant_skill
+    WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)
+),
+cleared_provisioning_grant_managed AS (
+    DELETE FROM agent_provisioning_grant_managed_agent
+    WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)
+),
+cleared_provisioning_grant_squads AS (
+    DELETE FROM agent_provisioning_grant_squad
+    WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)
+),
+cleared_provisioning_grant_originators AS (
+    DELETE FROM agent_provisioning_grant_originator
+    WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)
+),
+cleared_provisioning_grants AS (
+    DELETE FROM agent_provisioning_grant WHERE workspace_id = $1
 ),
 cleared_client_usage_workspace AS (
     UPDATE client_usage_daily SET workspace_id = NULL WHERE workspace_id = $1

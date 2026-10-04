@@ -257,19 +257,16 @@ These generic targets require a valid env file in the current directory.
 
 ## How Database Creation Works
 
-Database creation is automatic.
+`make setup`, `make start`, `make dev`, `make test`, `make migrate-up`,
+`make migrate-down`, and `make check` call `scripts/ensure-postgres.sh`.
 
-The following commands all ensure the target database exists before they continue:
-
-- `make setup`
-- `make start`
-- `make dev`
-- `make test`
-- `make migrate-up`
-- `make migrate-down`
-- `make check`
-
-That logic lives in `scripts/ensure-postgres.sh`.
+The script does not start Docker Compose on its own. A `DATABASE_URL` is
+checked with `pg_isready` and left untouched, including when the host is
+localhost. Compose starts only when `MULTICA_ISOLATED_POSTGRES=1`,
+`COMPOSE_PROJECT_NAME` is a name other than `multica`, and `COMPOSE_FILE`
+is an explicit compose file that is not part of the self-host stack. Every
+compose invocation passes `-p` and `-f`. Without an external URL or that
+opt-in, the script exits non-zero.
 
 ## Testing
 

@@ -90,9 +90,12 @@ func (a provisioningAudit) params(outcome, reason string) db.InsertProvisioningA
 }
 
 type provisioningWrite struct {
-	tx    pgx.Tx
-	q     *db.Queries
-	audit provisioningAudit
+	tx     pgx.Tx
+	q      *db.Queries
+	audit  provisioningAudit
+	grant  db.AgentProvisioningGrant
+	grants []db.AgentProvisioningGrant
+	human  bool
 }
 
 func (p *provisioningWrite) rollback(ctx context.Context) {
@@ -461,26 +464,46 @@ func skillsAllowed(ctx context.Context, q *db.Queries, grantID pgtype.UUID, skil
 	return nil
 }
 
-func (h *Handler) openProvisioningUpdate(
-	w http.ResponseWriter,
-	r *http.Request,
-	existing db.Agent,
-	req UpdateAgentRequest,
-	checkRuntime bool,
-	runtimeID pgtype.UUID,
-	model string,
-	replacePermission bool,
-	perm resolvedPermission,
-) (*provisioningWrite, bool) {
+func provisioningConfigurationTouched(raw map[string]json.RawMessage) bool {
+	for _, field := range []string{"runtime_id", "model", "thinking_level", "service_tier"} {
+		if _, ok := raw[field]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func lockProvisioningAgent(ctx context.Context, q *db.Queries, workspaceID string, agentID pgtype.UUID) (db.Agent, *provisioningError) {
+	ws, err := util.ParseUUID(workspaceID)
+	if err != nil {
+		return db.Agent{}, provErr(http.StatusNotFound, "agent_denied", "agent not found")
+	}
+	locked, err := q.LockUserAgentForUpdate(ctx, db.LockUserAgentForUpdateParams{
+		ID:          agentID,
+		WorkspaceID: ws,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.Agent{}, provErr(http.StatusNotFound, "agent_denied", "agent not found")
+	}
+	if err != nil {
+		return db.Agent{}, provUnavailable()
+	}
+	return locked, nil
+}
+
+// beginProvisioningAgentUpdate locks the active grant, then the target agent,
+// and returns the locked agent. Callers authorize the resulting configuration
+// on this same transaction after they compute it from the locked row.
+func (h *Handler) beginProvisioningAgentUpdate(w http.ResponseWriter, r *http.Request, existing db.Agent) (*provisioningWrite, db.Agent, bool) {
 	actor, ok := middleware.TaskActorFromRequest(r)
 	if !ok {
 		writeError(w, http.StatusForbidden, "no active provisioning grant for this agent")
-		return nil, false
+		return nil, db.Agent{}, false
 	}
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "provisioning authorization unavailable")
-		return nil, false
+		return nil, db.Agent{}, false
 	}
 	q := h.Queries.WithTx(tx)
 	grant, perr := h.loadProvisioningGrant(r.Context(), q, actor, false)
@@ -489,13 +512,21 @@ func (h *Handler) openProvisioningUpdate(
 		originator, perr = h.verifyProvisioningTask(r.Context(), q, actor, grant)
 	}
 	audit := auditFromActor(actor, grant, originator, "update_agent", "agent", uuidToString(existing.ID))
-	if perr == nil && uuidToString(existing.ID) == actor.AgentID {
+	var locked db.Agent
+	if perr == nil {
+		var lockErr *provisioningError
+		locked, lockErr = lockProvisioningAgent(r.Context(), q, uuidToString(existing.WorkspaceID), existing.ID)
+		if lockErr != nil {
+			perr = lockErr
+		}
+	}
+	if perr == nil && uuidToString(locked.ID) == actor.AgentID {
 		perr = provErr(http.StatusForbidden, "self", "cannot modify the provisioning agent")
 	}
 	if perr == nil {
 		if _, err := q.ProvisioningManagedAgentSource(r.Context(), db.ProvisioningManagedAgentSourceParams{
 			GrantID: grant.ID,
-			AgentID: existing.ID,
+			AgentID: locked.ID,
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				perr = provErr(http.StatusForbidden, "agent_denied", "agent is not managed by the provisioning grant")
@@ -504,21 +535,88 @@ func (h *Handler) openProvisioningUpdate(
 			}
 		}
 	}
-	if perr == nil && checkRuntime {
-		perr = h.runtimeModelAllowed(r.Context(), q, grant.ID, runtimeID, model)
-	}
-	if perr == nil && req.MaxConcurrentTasks != nil && *req.MaxConcurrentTasks > grant.MaxConcurrentTasks {
-		perr = provErr(http.StatusForbidden, "concurrency", "max_concurrent_tasks exceeds the provisioning grant")
-	}
-	if perr == nil && replacePermission {
-		perr = invocationWithinPolicy(grant.InvocationPolicy, perm)
-	}
 	if perr != nil {
 		h.finishProvisioningAuthError(w, r.Context(), tx, q, audit, perr)
-		return nil, false
+		return nil, db.Agent{}, false
 	}
 	audit.originator = originator
-	return &provisioningWrite{tx: tx, q: q, audit: audit}, true
+	audit.targetID = uuidToString(locked.ID)
+	return &provisioningWrite{tx: tx, q: q, audit: audit, grant: grant}, locked, true
+}
+
+// beginHumanConfigurationUpdate locks every active grant that manages the
+// agent, ordered by id, then the agent row. An agent with no grant still
+// takes the agent lock so a concurrent delegated update cannot interleave.
+func (h *Handler) beginHumanConfigurationUpdate(w http.ResponseWriter, r *http.Request, existing db.Agent) (*provisioningWrite, db.Agent, bool) {
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "provisioning authorization unavailable")
+		return nil, db.Agent{}, false
+	}
+	q := h.Queries.WithTx(tx)
+	grants, err := q.LockActiveGrantsForManagedAgent(r.Context(), db.LockActiveGrantsForManagedAgentParams{
+		AgentID:     existing.ID,
+		WorkspaceID: existing.WorkspaceID,
+	})
+	if err != nil {
+		_ = tx.Rollback(r.Context())
+		writeError(w, http.StatusServiceUnavailable, "provisioning authorization unavailable")
+		return nil, db.Agent{}, false
+	}
+	locked, lockErr := lockProvisioningAgent(r.Context(), q, uuidToString(existing.WorkspaceID), existing.ID)
+	if lockErr != nil {
+		_ = tx.Rollback(r.Context())
+		writeError(w, lockErr.status, lockErr.message)
+		return nil, db.Agent{}, false
+	}
+	return &provisioningWrite{tx: tx, q: q, grants: grants, human: true}, locked, true
+}
+
+func (h *Handler) authorizeLockedProvisioningUpdate(
+	r *http.Request,
+	prov *provisioningWrite,
+	req UpdateAgentRequest,
+	checkRuntime bool,
+	runtimeID pgtype.UUID,
+	model string,
+	replacePermission bool,
+	perm resolvedPermission,
+) *provisioningError {
+	if checkRuntime {
+		if perr := h.runtimeModelAllowed(r.Context(), prov.q, prov.grant.ID, runtimeID, model); perr != nil {
+			return perr
+		}
+	}
+	if req.MaxConcurrentTasks != nil && *req.MaxConcurrentTasks > prov.grant.MaxConcurrentTasks {
+		return provErr(http.StatusForbidden, "concurrency", "max_concurrent_tasks exceeds the provisioning grant")
+	}
+	if replacePermission {
+		return invocationWithinPolicy(prov.grant.InvocationPolicy, perm)
+	}
+	return nil
+}
+
+func (h *Handler) authorizeHumanResultingPair(w http.ResponseWriter, r *http.Request, prov *provisioningWrite, existing db.Agent, runtimeID pgtype.UUID, model string) bool {
+	for _, grant := range prov.grants {
+		perr := h.runtimeModelAllowed(r.Context(), prov.q, grant.ID, runtimeID, model)
+		if perr == nil {
+			continue
+		}
+		actorID, _ := util.ParseUUID(requestUserID(r))
+		audit := provisioningAudit{
+			workspace:  existing.WorkspaceID,
+			grantID:    grant.ID,
+			actorType:  "member",
+			actorID:    actorID,
+			action:     "update_agent",
+			targetType: "agent",
+			targetID:   uuidToString(existing.ID),
+		}
+		h.finishProvisioningAuthError(w, r.Context(), prov.tx, prov.q, audit, perr)
+		prov.tx = nil
+		return false
+	}
+	return true
 }
 
 func (h *Handler) authorizeProvisioningSkills(ctx context.Context, q *db.Queries, r *http.Request, agent db.Agent, skillIDs []pgtype.UUID, action string) (provisioningAudit, *provisioningError) {
@@ -542,6 +640,11 @@ func (h *Handler) authorizeProvisioningSkills(ctx context.Context, q *db.Queries
 	if perr != nil {
 		return audit, perr
 	}
+	locked, lockErr := lockProvisioningAgent(ctx, q, actor.WorkspaceID, agent.ID)
+	if lockErr != nil {
+		return audit, lockErr
+	}
+	agent = locked
 	if uuidToString(agent.ID) == actor.AgentID {
 		return audit, provErr(http.StatusForbidden, "self", "cannot modify the provisioning agent")
 	}
@@ -587,6 +690,11 @@ func (h *Handler) authorizeProvisioningSquadAdd(ctx context.Context, q *db.Queri
 	if role != "" && role != "member" {
 		return audit, provErr(http.StatusForbidden, "role", "provisioning grants may only add squad members with role member")
 	}
+	locked, lockErr := lockProvisioningAgent(ctx, q, actor.WorkspaceID, memberID)
+	if lockErr != nil {
+		return audit, lockErr
+	}
+	memberID = locked.ID
 	if uuidToString(memberID) == actor.AgentID {
 		return audit, provErr(http.StatusForbidden, "self", "cannot modify the provisioning agent")
 	}
@@ -769,6 +877,10 @@ func (h *Handler) CreateProvisioningGrant(w http.ResponseWriter, r *http.Request
 	}
 	defer tx.Rollback(r.Context())
 	q := h.Queries.WithTx(tx)
+	if status, msg := h.recheckProvisioningGrantRefs(r.Context(), q, member, wsUUID, prepared); msg != "" {
+		writeError(w, status, msg)
+		return
+	}
 	grant, err := q.CreateProvisioningGrant(r.Context(), prepared.params)
 	if err != nil {
 		if isProvisioningActiveConflict(err) {
@@ -1074,6 +1186,68 @@ func (h *Handler) prepareProvisioningGrant(w http.ResponseWriter, r *http.Reques
 		InvocationPolicy:   req.InvocationPolicy,
 	}
 	return prepared, true
+}
+
+func (h *Handler) recheckProvisioningGrantRefs(ctx context.Context, q *db.Queries, member db.Member, ws pgtype.UUID, prepared preparedGrant) (int, string) {
+	agent, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: prepared.params.AgentID, WorkspaceID: ws})
+	if err != nil {
+		return http.StatusBadRequest, "agent does not belong to this workspace"
+	}
+	if agent.ArchivedAt.Valid {
+		return http.StatusBadRequest, "agent is archived"
+	}
+	seenRuntime := map[string]struct{}{}
+	for _, runtime := range prepared.runtimes {
+		key := uuidToString(runtime.runtimeID)
+		if _, ok := seenRuntime[key]; ok {
+			continue
+		}
+		seenRuntime[key] = struct{}{}
+		rt, err := q.GetAgentRuntimeForWorkspace(ctx, db.GetAgentRuntimeForWorkspaceParams{
+			ID: runtime.runtimeID, WorkspaceID: ws,
+		})
+		if err != nil {
+			return http.StatusBadRequest, "runtime does not belong to this workspace"
+		}
+		if !canUseRuntimeForAgent(member, rt) {
+			return http.StatusForbidden, "this runtime is private; only its owner or a workspace admin can create agents on it"
+		}
+	}
+	for _, skillID := range prepared.skills {
+		if _, err := q.GetSkillInWorkspace(ctx, db.GetSkillInWorkspaceParams{ID: skillID, WorkspaceID: ws}); err != nil {
+			return http.StatusBadRequest, "skill does not belong to this workspace"
+		}
+	}
+	granteeID := uuidToString(prepared.params.AgentID)
+	for _, agentID := range prepared.managed {
+		if uuidToString(agentID) == granteeID {
+			return http.StatusBadRequest, "the provisioning agent cannot be a managed agent of its own grant"
+		}
+		managed, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: agentID, WorkspaceID: ws})
+		if err != nil {
+			return http.StatusBadRequest, "managed agent does not belong to this workspace"
+		}
+		if managed.ArchivedAt.Valid {
+			return http.StatusBadRequest, "managed agent is archived"
+		}
+	}
+	for _, squadID := range prepared.squads {
+		squad, err := q.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: squadID, WorkspaceID: ws})
+		if err != nil {
+			return http.StatusBadRequest, "squad does not belong to this workspace"
+		}
+		if squad.ArchivedAt.Valid {
+			return http.StatusBadRequest, "squad is archived"
+		}
+	}
+	for _, userID := range prepared.originators {
+		if _, err := q.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+			UserID: userID, WorkspaceID: ws,
+		}); err != nil {
+			return http.StatusBadRequest, "originator is not a member of this workspace"
+		}
+	}
+	return 0, ""
 }
 
 func validateProvisioningModel(model string) error {

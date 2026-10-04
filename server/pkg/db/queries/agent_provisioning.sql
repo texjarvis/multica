@@ -136,6 +136,23 @@ SET status = 'revoked',
 WHERE id = $1 AND workspace_id = $3 AND status = 'active'
 RETURNING *;
 
+-- name: LockUserAgentForUpdate :one
+SELECT * FROM agent
+WHERE id = $1 AND workspace_id = $2 AND kind = 'user'
+FOR UPDATE;
+
+-- name: LockActiveGrantsForManagedAgent :many
+SELECT g.id, g.workspace_id, g.agent_id, g.granted_by, g.status, g.expires_at,
+       g.revoked_at, g.revoked_by, g.max_new_agents, g.new_agents_created,
+       g.max_concurrent_tasks, g.invocation_policy, g.created_at, g.updated_at
+FROM agent_provisioning_grant g
+JOIN agent_provisioning_grant_managed_agent m ON m.grant_id = g.id
+WHERE m.agent_id = $1
+  AND g.workspace_id = $2
+  AND g.status = 'active'
+ORDER BY g.id
+FOR UPDATE OF g;
+
 -- name: InsertProvisioningAudit :one
 INSERT INTO agent_provisioning_audit (
     workspace_id, grant_id, actor_type, actor_id, task_id, originator_user_id,

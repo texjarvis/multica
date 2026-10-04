@@ -35,6 +35,26 @@ creates one through the API below.
   revoked row does not admit it. The handler locks the active row in the
   same transaction as the write and rejects expiry there. Revoke takes the
   same lock. A grant that disappears before the lock is acquired does not write.
+- Authorization uses the row state observed after the locks, in the same
+  transaction as the write. Lock order is active `agent_provisioning_grant`
+  rows `FOR UPDATE` (ordered by id when more than one is taken), then the
+  target `agent` row `FOR UPDATE`. Revoke locks the grant by id and does not
+  lock the agent, so the two paths cannot deadlock. The resulting runtime,
+  model, thinking level, service tier, and invocation policy are checked
+  against that locked agent. Two partial updates that are each allowed
+  against a stale snapshot cannot commit as a combination the grant forbids.
+- A human update that sets `runtime_id`, `model`, `thinking_level`, or
+  `service_tier` on a managed agent takes the same lock order. The resulting
+  runtime and model must be allowed by every active grant that manages the
+  agent, including an expired grant that is still `status=active`. The owner
+  lifts that limit by revoking the grant. Metadata-only human updates do not
+  take the grant lock. Denial of a forbidden pair writes the same
+  `runtime_not_allowed` / `model_not_allowed` audit reason as a delegated
+  denial. Human successes are not audited.
+- Skill bind/replace and squad-member add re-lock the target agent inside
+  the grant transaction after the grant lock and before the managed-agent
+  check. Creating a grant re-reads the agent, runtimes, skills, managed
+  agents, squads, and originators inside the insert transaction.
 - Audit rows are written in that transaction for grant, revoke, denied
   attempts, and successful provisioning. The audit stores ids, action,
   outcome, and a stable reason code. It does not store env, args, MCP, or
@@ -87,13 +107,24 @@ limited to managed agents. An expired grant is still
 expired. After revocation, metadata-only updates return to the ungranted
 machine allowlist. Non-metadata updates stay denied.
 
-Human owner and member flows do not enter the grant check.
+Human owner and member flows do not borrow the grant to act as the grantee.
+When the target agent is managed by an active grant, a human change to
+runtime or model still has to leave a pair that grant allows. Thinking
+level and service tier are validated against the locked agent's provider.
 
 ## Files
 
-- `server/migrations/244_agent_provisioning_grant.up.sql`
-- `server/migrations/244_agent_provisioning_grant.down.sql`
+- `server/migrations/244_agent_provisioning_grant.up.sql` creates the tables
+  without foreign keys. Primary keys and secondary indexes are
+  `CREATE [UNIQUE] INDEX CONCURRENTLY` in `246`–`254`, each file one
+  statement, and `255` attaches the primary keys with `USING INDEX`.
+- `server/migrations/245_agent_provisioning_drop_foreign_keys.up.sql` drops
+  foreign keys left by an earlier 244 so an already-migrated database matches
+  a fresh install.
+- `server/pkg/db/queries/workspace.sql` deletes a workspace's grant children
+  and grant rows in `DeleteWorkspace` and leaves `agent_provisioning_audit`.
 - `server/pkg/db/queries/agent_provisioning.sql` and sqlc output
+- `scripts/ensure-postgres.sh` refuses to start the live Compose project.
 - `server/internal/handler/agent_provisioning.go`
 - `server/internal/handler/agent.go`
 - `server/internal/handler/skill.go`
@@ -110,23 +141,31 @@ Human owner and member flows do not enter the grant check.
 
 ## Rollback
 
-Apply `244_agent_provisioning_grant.down.sql` with an explicit `DATABASE_URL`
-pointed at the database you intend to change:
+Production rollback revokes every active grant, then rolls the server and CLI
+binaries back. The audit table and the grant tables stay. `244` down and
+`245` down are `SELECT 1` so a migrate down does not drop
+`agent_provisioning_audit` or the grant tables. Index downs drop only the
+indexes those files created.
+
+Apply the forward migrations, including `245` (drop foreign keys), before
+starting the binary that deletes grant rows from `DeleteWorkspace`. While
+`agent_provisioning_grant_id` still has `ON DELETE CASCADE`, deleting the
+grant or the workspace deletes the audit trail with it.
+
+Run the migrator with an explicit `DATABASE_URL` for the database you intend
+to change:
 
 ```
-cd server && DATABASE_URL='postgres://.../your_db?sslmode=disable' go run ./cmd/migrate down
+cd server && DATABASE_URL='postgres://.../your_db?sslmode=disable' go run ./cmd/migrate up
 ```
 
-`make migrate-up` and `make migrate-down` both call
-`scripts/ensure-postgres.sh`. From a checkout whose compose project is
-`multica`, that script runs `docker compose up -d postgres` and can recreate
-the live self-host database. Do not use those Make targets against this
-worktree. Use `go run ./cmd/migrate` with a URL that is not the live stack.
-
-The down migration drops the grant and audit tables. Previous agent, squad,
-and runtime rows are not modified. Deploy the previous server binary so the
-routes and CLI command disappear with the tables. Revoking a grant is the
-runtime kill switch and does not require a schema rollback.
+`make migrate-up` and `make migrate-down` call `scripts/ensure-postgres.sh`.
+That script does not run `docker compose` unless
+`MULTICA_ISOLATED_POSTGRES=1`, `COMPOSE_PROJECT_NAME` is set to a name other
+than `multica`, and `COMPOSE_FILE` is an explicit file whose name does not
+refer to the self-host stack. A localhost `DATABASE_URL` is checked with
+`pg_isready` and does not start a container. Without either an external URL
+or that isolated opt-in, the script exits non-zero.
 
 ## Eight specialist configurations
 

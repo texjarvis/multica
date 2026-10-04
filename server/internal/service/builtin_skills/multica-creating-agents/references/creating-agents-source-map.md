@@ -86,11 +86,12 @@ only.
 | `multica capability` owner grant/inspect/revoke | `server/cmd/multica/cmd_capability.go` 15 | Human owner CLI. Help states the grant does not copy secrets, does not change runtime permissions, and instructions are not OS isolation |
 | Grant routes | `server/cmd/server/router.go` 1254 | `POST/GET /api/agent-provisioning-grants`, `POST /{id}/revoke`. No machine bypass |
 | Coarse task-token admission | `server/cmd/server/human_only_routes.go` 86 | `provisioningRouteEligible` admits only agent create, skill set/add, and `GET /api/runtimes`, and only when a status=active grant row exists |
-| Create authorization under the grant lock | `server/internal/handler/agent_provisioning.go` 381 | `authorizeProvisioningCreate` checks originator, runtime/model, skills, invocation, concurrency, then increments the new-agent counter in the create transaction |
-| Owner grant handler | `server/internal/handler/agent_provisioning.go` 735 | `CreateProvisioningGrant` rejects machine actors, then requires the workspace owner role |
-| `UpdateAgent` rejects `custom_env` | 2079–2089 | if `custom_env` present in body → 400 "use PUT /api/agents/{id}/env (or `multica agent env set`)" |
-| `UpdateAgent` projects/preserves secret fields | 2090–2218 | runtime config projection → preserve; custom args and MCP require explicit replace/clear intent; blind/full legacy response replay preserves; ambiguous non-empty legacy input against an existing hidden value returns 409 |
-| `description` ≤ 255 on update too | 2042–2047 | same cap re-checked on update |
+| Create authorization under the grant lock | `server/internal/handler/agent_provisioning.go` 391 | `authorizeProvisioningCreate` checks originator, runtime/model, skills, invocation, concurrency, then increments the new-agent counter in the create transaction |
+| Owner grant handler | `server/internal/handler/agent_provisioning.go` 850 | `CreateProvisioningGrant` rejects machine actors, then requires the workspace owner role. Referenced ids are re-read inside the insert transaction |
+| Resulting runtime/model under row locks | `server/internal/handler/agent_provisioning.go` 497 | `beginProvisioningAgentUpdate` locks the active grant, then the agent (`LockUserAgentForUpdate`). A human runtime, model, thinking-level, or service-tier update locks managing grants in id order, then the agent. The write uses that locked row, so a forbidden runtime/model pair cannot persist |
+| `UpdateAgent` rejects `custom_env` | `server/internal/handler/agent.go` 2223–2233 | if `custom_env` present in body → 400 "use PUT /api/agents/{id}/env (or `multica agent env set`)" |
+| `UpdateAgent` projects/preserves secret fields | `server/internal/handler/agent.go` 2302–2449 | runtime config projection → preserve; custom args and MCP require explicit replace/clear intent; blind/full legacy response replay preserves; ambiguous non-empty legacy input against an existing hidden value returns 409 |
+| `description` ≤ 255 on update too | `server/internal/handler/agent.go` 2289–2293 | same cap re-checked on update |
 
 ## Runtime model/thinking discovery — `server/pkg/agent/{models,thinking}.go`
 

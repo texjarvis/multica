@@ -1,15 +1,17 @@
 -- Owner-granted, workspace-and-agent scoped provisioning. No rows are inserted
 -- here. Machine actors stay denied until a human owner creates a grant.
+-- Relationship checks and cleanup live in the handlers. Indexes are later
+-- single-statement CREATE INDEX CONCURRENTLY migrations.
 
-CREATE TABLE agent_provisioning_grant (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
-    agent_id uuid NOT NULL REFERENCES agent(id) ON DELETE CASCADE,
-    granted_by uuid NOT NULL REFERENCES "user"(id),
+CREATE TABLE IF NOT EXISTS agent_provisioning_grant (
+    id uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    agent_id uuid NOT NULL,
+    granted_by uuid NOT NULL,
     status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
     expires_at timestamptz,
     revoked_at timestamptz,
-    revoked_by uuid REFERENCES "user"(id),
+    revoked_by uuid,
     max_new_agents integer NOT NULL CHECK (max_new_agents >= 0 AND max_new_agents <= 100),
     new_agents_created integer NOT NULL DEFAULT 0 CHECK (new_agents_created >= 0),
     max_concurrent_tasks integer NOT NULL CHECK (max_concurrent_tasks >= 1 AND max_concurrent_tasks <= 100),
@@ -23,47 +25,38 @@ CREATE TABLE agent_provisioning_grant (
     CONSTRAINT agent_provisioning_grant_count_ck CHECK (new_agents_created <= max_new_agents)
 );
 
-CREATE UNIQUE INDEX agent_provisioning_grant_one_active
-    ON agent_provisioning_grant (workspace_id, agent_id)
-    WHERE status = 'active';
-
-CREATE TABLE agent_provisioning_grant_runtime (
-    grant_id uuid NOT NULL REFERENCES agent_provisioning_grant(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS agent_provisioning_grant_runtime (
+    grant_id uuid NOT NULL,
     runtime_id uuid NOT NULL,
     model text NOT NULL DEFAULT '',
-    PRIMARY KEY (grant_id, runtime_id, model),
     CONSTRAINT agent_provisioning_grant_runtime_model_len CHECK (char_length(model) <= 200)
 );
 
-CREATE TABLE agent_provisioning_grant_skill (
-    grant_id uuid NOT NULL REFERENCES agent_provisioning_grant(id) ON DELETE CASCADE,
-    skill_id uuid NOT NULL,
-    PRIMARY KEY (grant_id, skill_id)
+CREATE TABLE IF NOT EXISTS agent_provisioning_grant_skill (
+    grant_id uuid NOT NULL,
+    skill_id uuid NOT NULL
 );
 
-CREATE TABLE agent_provisioning_grant_managed_agent (
-    grant_id uuid NOT NULL REFERENCES agent_provisioning_grant(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS agent_provisioning_grant_managed_agent (
+    grant_id uuid NOT NULL,
     agent_id uuid NOT NULL,
-    source text NOT NULL CHECK (source IN ('allowlist', 'created')),
-    PRIMARY KEY (grant_id, agent_id)
+    source text NOT NULL CHECK (source IN ('allowlist', 'created'))
 );
 
-CREATE TABLE agent_provisioning_grant_squad (
-    grant_id uuid NOT NULL REFERENCES agent_provisioning_grant(id) ON DELETE CASCADE,
-    squad_id uuid NOT NULL,
-    PRIMARY KEY (grant_id, squad_id)
+CREATE TABLE IF NOT EXISTS agent_provisioning_grant_squad (
+    grant_id uuid NOT NULL,
+    squad_id uuid NOT NULL
 );
 
-CREATE TABLE agent_provisioning_grant_originator (
-    grant_id uuid NOT NULL REFERENCES agent_provisioning_grant(id) ON DELETE CASCADE,
-    user_id uuid NOT NULL,
-    PRIMARY KEY (grant_id, user_id)
+CREATE TABLE IF NOT EXISTS agent_provisioning_grant_originator (
+    grant_id uuid NOT NULL,
+    user_id uuid NOT NULL
 );
 
-CREATE TABLE agent_provisioning_audit (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
-    grant_id uuid REFERENCES agent_provisioning_grant(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS agent_provisioning_audit (
+    id uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    grant_id uuid,
     actor_type text NOT NULL,
     actor_id uuid,
     task_id uuid,
@@ -76,6 +69,3 @@ CREATE TABLE agent_provisioning_audit (
     created_at timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT agent_provisioning_audit_reason_len CHECK (char_length(reason) <= 500)
 );
-
-CREATE INDEX agent_provisioning_audit_grant_idx
-    ON agent_provisioning_audit (grant_id, created_at);

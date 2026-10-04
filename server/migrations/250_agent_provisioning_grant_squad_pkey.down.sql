@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS agent_provisioning_grant_squad_pkey;

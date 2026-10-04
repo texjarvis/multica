@@ -2252,6 +2252,34 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Lock before any value is taken from the pre-lock snapshot. Delegated
+	// updates lock the grant, then the agent. Human runtime/model/thinking/
+	// service-tier updates lock managing grants, then the agent. The params
+	// below are computed from that locked row.
+	var prov *provisioningWrite
+	writeQ := h.Queries
+	if useProvisioningGrant {
+		var locked db.Agent
+		var opened bool
+		prov, locked, opened = h.beginProvisioningAgentUpdate(w, r, existing)
+		if !opened {
+			return
+		}
+		defer prov.rollback(r.Context())
+		existing = locked
+		writeQ = prov.q
+	} else if provisioningConfigurationTouched(rawFields) {
+		var locked db.Agent
+		var opened bool
+		prov, locked, opened = h.beginHumanConfigurationUpdate(w, r, existing)
+		if !opened {
+			return
+		}
+		defer prov.rollback(r.Context())
+		existing = locked
+		writeQ = prov.q
+	}
+
 	params := db.UpdateAgentParams{
 		ID: existing.ID,
 	}
@@ -2666,30 +2694,29 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeQ := h.Queries
-	var prov *provisioningWrite
-	if useProvisioningGrant {
-		checkRuntime := req.RuntimeID != nil || req.Model != nil
-		modelForGrant := ""
-		if existing.Model.Valid {
-			modelForGrant = existing.Model.String
-		}
-		if req.Model != nil {
-			modelForGrant = *req.Model
-		} else if params.Model.Valid {
-			modelForGrant = params.Model.String
-		}
-		runtimeForGrant := existing.RuntimeID
-		if params.RuntimeID.Valid {
-			runtimeForGrant = params.RuntimeID
-		}
-		var opened bool
-		prov, opened = h.openProvisioningUpdate(w, r, existing, req, checkRuntime, runtimeForGrant, modelForGrant, replacePermissionTargets, resolvedPerm)
-		if !opened {
+	runtimeForGrant := existing.RuntimeID
+	if params.RuntimeID.Valid {
+		runtimeForGrant = params.RuntimeID
+	}
+	modelForGrant := ""
+	if existing.Model.Valid {
+		modelForGrant = existing.Model.String
+	}
+	if params.Model.Valid {
+		modelForGrant = params.Model.String
+	}
+	pairChanged := req.RuntimeID != nil || req.Model != nil || params.Model.Valid
+	if prov != nil && !prov.human {
+		if perr := h.authorizeLockedProvisioningUpdate(r, prov, req, pairChanged, runtimeForGrant, modelForGrant, replacePermissionTargets, resolvedPerm); perr != nil {
+			h.finishProvisioningAuthError(w, r.Context(), prov.tx, prov.q, prov.audit, perr)
+			prov.tx = nil
 			return
 		}
-		defer prov.rollback(r.Context())
-		writeQ = prov.q
+	}
+	if prov != nil && prov.human && pairChanged {
+		if !h.authorizeHumanResultingPair(w, r, prov, existing, runtimeForGrant, modelForGrant) {
+			return
+		}
 	}
 
 	updated, err := writeQ.UpdateAgent(r.Context(), params)
@@ -2760,7 +2787,13 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if prov != nil && !prov.commitSuccess(r.Context(), w) {
+	if prov != nil && prov.human {
+		if err := prov.tx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to update agent: "+err.Error())
+			return
+		}
+		prov.tx = nil
+	} else if prov != nil && !prov.commitSuccess(r.Context(), w) {
 		return
 	}
 

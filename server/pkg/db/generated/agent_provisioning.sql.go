@@ -467,6 +467,59 @@ func (q *Queries) ListProvisioningGrantSquads(ctx context.Context, grantID pgtyp
 	return items, nil
 }
 
+const lockActiveGrantsForManagedAgent = `-- name: LockActiveGrantsForManagedAgent :many
+SELECT g.id, g.workspace_id, g.agent_id, g.granted_by, g.status, g.expires_at,
+       g.revoked_at, g.revoked_by, g.max_new_agents, g.new_agents_created,
+       g.max_concurrent_tasks, g.invocation_policy, g.created_at, g.updated_at
+FROM agent_provisioning_grant g
+JOIN agent_provisioning_grant_managed_agent m ON m.grant_id = g.id
+WHERE m.agent_id = $1
+  AND g.workspace_id = $2
+  AND g.status = 'active'
+ORDER BY g.id
+FOR UPDATE OF g
+`
+
+type LockActiveGrantsForManagedAgentParams struct {
+	AgentID     pgtype.UUID `json:"agent_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) LockActiveGrantsForManagedAgent(ctx context.Context, arg LockActiveGrantsForManagedAgentParams) ([]AgentProvisioningGrant, error) {
+	rows, err := q.db.Query(ctx, lockActiveGrantsForManagedAgent, arg.AgentID, arg.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentProvisioningGrant{}
+	for rows.Next() {
+		var i AgentProvisioningGrant
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.AgentID,
+			&i.GrantedBy,
+			&i.Status,
+			&i.ExpiresAt,
+			&i.RevokedAt,
+			&i.RevokedBy,
+			&i.MaxNewAgents,
+			&i.NewAgentsCreated,
+			&i.MaxConcurrentTasks,
+			&i.InvocationPolicy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockActiveProvisioningGrant = `-- name: LockActiveProvisioningGrant :one
 SELECT id, workspace_id, agent_id, granted_by, status, expires_at, revoked_at, revoked_by, max_new_agents, new_agents_created, max_concurrent_tasks, invocation_policy, created_at, updated_at FROM agent_provisioning_grant
 WHERE workspace_id = $1 AND agent_id = $2 AND status = 'active'
@@ -529,6 +582,53 @@ func (q *Queries) LockProvisioningGrantByID(ctx context.Context, arg LockProvisi
 		&i.InvocationPolicy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const lockUserAgentForUpdate = `-- name: LockUserAgentForUpdate :one
+SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier FROM agent
+WHERE id = $1 AND workspace_id = $2 AND kind = 'user'
+FOR UPDATE
+`
+
+type LockUserAgentForUpdateParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) LockUserAgentForUpdate(ctx context.Context, arg LockUserAgentForUpdateParams) (Agent, error) {
+	row := q.db.QueryRow(ctx, lockUserAgentForUpdate, arg.ID, arg.WorkspaceID)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+		&i.CustomEnv,
+		&i.CustomArgs,
+		&i.McpConfig,
+		&i.Model,
+		&i.ThinkingLevel,
+		&i.ComposioToolkitAllowlist,
+		&i.PermissionMode,
+		&i.Kind,
+		&i.SystemKey,
+		&i.DisabledRuntimeSkills,
+		&i.ServiceTier,
 	)
 	return i, err
 }

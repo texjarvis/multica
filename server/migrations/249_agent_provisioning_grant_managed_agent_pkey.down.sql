@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS agent_provisioning_grant_managed_agent_pkey;

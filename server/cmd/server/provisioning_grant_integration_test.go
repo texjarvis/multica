@@ -53,7 +53,7 @@ func TestProvisioningGrantRouteChain(t *testing.T) {
 	var taskIDs []string
 	t.Cleanup(func() {
 		c := context.Background()
-		_, _ = testPool.Exec(c, `DELETE FROM agent_provisioning_grant WHERE workspace_id = $1`, testWorkspaceID)
+		provDeleteProvisioning(testWorkspaceID)
 		_, _ = testPool.Exec(c, `DELETE FROM agent WHERE workspace_id = $1 AND name LIKE 'prov-%'`, testWorkspaceID)
 		_, _ = testPool.Exec(c, `DELETE FROM skill WHERE workspace_id = $1 AND name LIKE 'prov-%'`, testWorkspaceID)
 		_, _ = testPool.Exec(c, `DELETE FROM squad WHERE workspace_id = $1 AND name LIKE 'prov-%'`, testWorkspaceID)
@@ -694,6 +694,341 @@ func provMintToken(t *testing.T, agentID, runtimeID, userID, originator, status 
 		t.Fatalf("token: %v", err)
 	}
 	return raw, taskID
+}
+
+func provDeleteProvisioning(workspaceID string) {
+	ctx := context.Background()
+	stmts := []string{
+		`DELETE FROM agent_provisioning_grant_runtime WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)`,
+		`DELETE FROM agent_provisioning_grant_skill WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)`,
+		`DELETE FROM agent_provisioning_grant_managed_agent WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)`,
+		`DELETE FROM agent_provisioning_grant_squad WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)`,
+		`DELETE FROM agent_provisioning_grant_originator WHERE grant_id IN (SELECT id FROM agent_provisioning_grant WHERE workspace_id = $1)`,
+		`DELETE FROM agent_provisioning_audit WHERE workspace_id = $1`,
+		`DELETE FROM agent_provisioning_grant WHERE workspace_id = $1`,
+	}
+	for _, stmt := range stmts {
+		_, _ = testPool.Exec(ctx, stmt, workspaceID)
+	}
+}
+
+func provWaitForLocks(t *testing.T, like string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	var n int
+	for time.Now().Before(deadline) {
+		if err := testPool.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE $1
+		`, like).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n >= want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d lock waits matching %s (saw %d)", want, like, n)
+}
+
+func TestProvisioningConcurrentDelegatedPairCannotPersist(t *testing.T) {
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	runtimeA := provInsertRuntime(t, testWorkspaceID, "prov-pair-a-"+suffix, "public", testUserID)
+	runtimeB := provInsertRuntime(t, testWorkspaceID, "prov-pair-b-"+suffix, "public", testUserID)
+	grantee := provInsertAgent(t, "prov-pair-grantee-"+suffix, runtimeA, testUserID)
+	managed := provInsertAgent(t, "prov-pair-managed-"+suffix, runtimeA, testUserID)
+	provExec(t, `UPDATE agent SET model = 'model-one' WHERE id = $1`, managed)
+	token, taskID := provMintToken(t, grantee, runtimeA, testUserID, testUserID, "running")
+	t.Cleanup(func() {
+		c := context.Background()
+		provDeleteProvisioning(testWorkspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM task_token WHERE task_id = $1`, taskID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent WHERE id = $1 OR id = $2`, grantee, managed)
+		_, _ = testPool.Exec(c, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, runtimeA, runtimeB)
+	})
+
+	code, raw := provCall(t, testToken, http.MethodPost, "/api/agent-provisioning-grants", map[string]any{
+		"agent_id": grantee, "max_new_agents": 0, "max_concurrent_tasks": 1,
+		"invocation_policy": "private",
+		"runtimes": []map[string]any{
+			{"runtime_id": runtimeA, "models": []string{"model-one", "model-two"}},
+			{"runtime_id": runtimeB, "models": []string{"model-one"}},
+		},
+		"skill_ids": []string{}, "managed_agent_ids": []string{managed},
+		"squad_ids": []string{}, "originator_user_ids": []string{testUserID},
+	}, nil)
+	provRequire(t, code, raw, http.StatusCreated, "")
+	grantID := provID(t, raw)
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM agent_provisioning_grant WHERE id = $1 FOR UPDATE`, grantID); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		code int
+		raw  []byte
+		err  error
+	}
+	done := make(chan result, 2)
+	go func() {
+		code, raw, err := provCallResult(token, http.MethodPut, "/api/agents/"+managed, map[string]any{"runtime_id": runtimeB})
+		done <- result{code, raw, err}
+	}()
+	go func() {
+		code, raw, err := provCallResult(token, http.MethodPut, "/api/agents/"+managed, map[string]any{"model": "model-two"})
+		done <- result{code, raw, err}
+	}()
+	provWaitForLocks(t, "%LockActiveProvisioningGrant%", 2)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := map[int]int{}
+	for i := 0; i < 2; i++ {
+		select {
+		case res := <-done:
+			if res.err != nil {
+				t.Fatal(res.err)
+			}
+			statuses[res.code]++
+			if res.code == http.StatusForbidden && !strings.Contains(string(res.raw), "not allowed by the provisioning grant") {
+				t.Fatalf("forbidden body = %s", res.raw)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("concurrent update did not return")
+		}
+	}
+	if statuses[http.StatusOK] != 1 || statuses[http.StatusForbidden] != 1 {
+		t.Fatalf("statuses = %#v, want one 200 and one 403", statuses)
+	}
+	var gotRuntime, gotModel string
+	if err := testPool.QueryRow(ctx, `SELECT runtime_id::text, coalesce(model, '') FROM agent WHERE id = $1`, managed).Scan(&gotRuntime, &gotModel); err != nil {
+		t.Fatal(err)
+	}
+	if gotRuntime == runtimeB && gotModel == "model-two" {
+		t.Fatal("unauthorized combined pair persisted")
+	}
+}
+
+func TestProvisioningConcurrentHumanAndDelegatedPairCannotPersist(t *testing.T) {
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	runtimeA := provInsertRuntime(t, testWorkspaceID, "prov-human-a-"+suffix, "public", testUserID)
+	runtimeB := provInsertRuntime(t, testWorkspaceID, "prov-human-b-"+suffix, "public", testUserID)
+	grantee := provInsertAgent(t, "prov-human-grantee-"+suffix, runtimeA, testUserID)
+	managed := provInsertAgent(t, "prov-human-managed-"+suffix, runtimeA, testUserID)
+	provExec(t, `UPDATE agent SET model = 'model-one' WHERE id = $1`, managed)
+	token, taskID := provMintToken(t, grantee, runtimeA, testUserID, testUserID, "running")
+	t.Cleanup(func() {
+		c := context.Background()
+		provDeleteProvisioning(testWorkspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM task_token WHERE task_id = $1`, taskID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent WHERE id = $1 OR id = $2`, grantee, managed)
+		_, _ = testPool.Exec(c, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, runtimeA, runtimeB)
+	})
+
+	code, raw := provCall(t, testToken, http.MethodPost, "/api/agent-provisioning-grants", map[string]any{
+		"agent_id": grantee, "max_new_agents": 0, "max_concurrent_tasks": 1,
+		"invocation_policy": "private",
+		"runtimes": []map[string]any{
+			{"runtime_id": runtimeA, "models": []string{"model-one", "model-two"}},
+			{"runtime_id": runtimeB, "models": []string{"model-one"}},
+		},
+		"skill_ids": []string{}, "managed_agent_ids": []string{managed},
+		"squad_ids": []string{}, "originator_user_ids": []string{testUserID},
+	}, nil)
+	provRequire(t, code, raw, http.StatusCreated, "")
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM agent WHERE id = $1 FOR UPDATE`, managed); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		code int
+		raw  []byte
+		err  error
+	}
+	done := make(chan result, 2)
+	go func() {
+		code, raw, err := provCallResult(token, http.MethodPut, "/api/agents/"+managed, map[string]any{"runtime_id": runtimeB})
+		done <- result{code, raw, err}
+	}()
+	go func() {
+		code, raw, err := provCallResult(testToken, http.MethodPut, "/api/agents/"+managed, map[string]any{"model": "model-two"})
+		done <- result{code, raw, err}
+	}()
+	provWaitForLocks(t, "%LockUserAgentForUpdate%", 1)
+	provWaitForLocks(t, "%LockActive%", 1)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := map[int]int{}
+	for i := 0; i < 2; i++ {
+		select {
+		case res := <-done:
+			if res.err != nil {
+				t.Fatal(res.err)
+			}
+			statuses[res.code]++
+		case <-time.After(10 * time.Second):
+			t.Fatal("concurrent human/delegated update did not return")
+		}
+	}
+	if statuses[http.StatusOK] != 1 || statuses[http.StatusForbidden] != 1 {
+		t.Fatalf("statuses = %#v, want one 200 and one 403", statuses)
+	}
+	var gotRuntime, gotModel string
+	if err := testPool.QueryRow(ctx, `SELECT runtime_id::text, coalesce(model, '') FROM agent WHERE id = $1`, managed).Scan(&gotRuntime, &gotModel); err != nil {
+		t.Fatal(err)
+	}
+	if gotRuntime == runtimeB && gotModel == "model-two" {
+		t.Fatal("unauthorized combined pair persisted")
+	}
+}
+
+func TestProvisioningHumanAllowlistFollowsLockedRuntime(t *testing.T) {
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	runtimeA := provInsertRuntime(t, testWorkspaceID, "prov-allow-a-"+suffix, "public", testUserID)
+	runtimeB := provInsertRuntime(t, testWorkspaceID, "prov-allow-b-"+suffix, "public", testUserID)
+	grantee := provInsertAgent(t, "prov-allow-grantee-"+suffix, runtimeA, testUserID)
+	managed := provInsertAgent(t, "prov-allow-managed-"+suffix, runtimeA, testUserID)
+	provExec(t, `UPDATE agent SET model = 'model-one' WHERE id = $1`, managed)
+	t.Cleanup(func() {
+		c := context.Background()
+		provDeleteProvisioning(testWorkspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent WHERE id = $1 OR id = $2`, grantee, managed)
+		_, _ = testPool.Exec(c, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, runtimeA, runtimeB)
+	})
+	code, raw := provCall(t, testToken, http.MethodPost, "/api/agent-provisioning-grants", map[string]any{
+		"agent_id": grantee, "max_new_agents": 0, "max_concurrent_tasks": 1,
+		"invocation_policy": "private",
+		"runtimes": []map[string]any{
+			{"runtime_id": runtimeA, "models": []string{"model-one", "model-two"}},
+			{"runtime_id": runtimeB, "models": []string{"model-one"}},
+		},
+		"skill_ids": []string{}, "managed_agent_ids": []string{managed},
+		"squad_ids": []string{}, "originator_user_ids": []string{testUserID},
+	}, nil)
+	provRequire(t, code, raw, http.StatusCreated, "")
+
+	code, raw = provCall(t, testToken, http.MethodPut, "/api/agents/"+managed, map[string]any{"model": "model-two"}, nil)
+	provRequire(t, code, raw, http.StatusOK, "")
+
+	provExec(t, `UPDATE agent SET runtime_id = $2, model = 'model-one' WHERE id = $1`, managed, runtimeB)
+	code, raw = provCall(t, testToken, http.MethodPut, "/api/agents/"+managed, map[string]any{"model": "model-two"}, nil)
+	provRequire(t, code, raw, http.StatusForbidden, `model "model-two" is not allowed by the provisioning grant`)
+	var gotModel string
+	if err := testPool.QueryRow(context.Background(), `SELECT coalesce(model, '') FROM agent WHERE id = $1`, managed).Scan(&gotModel); err != nil {
+		t.Fatal(err)
+	}
+	if gotModel != "model-one" {
+		t.Fatalf("model = %q after forbidden human update", gotModel)
+	}
+}
+
+func TestProvisioningAuditSurvivesAgentAndWorkspaceDelete(t *testing.T) {
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	slug := "prov-audit-" + suffix
+	var wsID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description) VALUES ($1, $2, '') RETURNING id
+	`, "Prov Audit "+suffix, slug).Scan(&wsID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		provDeleteProvisioning(wsID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent WHERE workspace_id = $1`, wsID)
+		_, _ = testPool.Exec(c, `DELETE FROM agent_runtime WHERE workspace_id = $1`, wsID)
+		_, _ = testPool.Exec(c, `DELETE FROM member WHERE workspace_id = $1`, wsID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id = $1`, wsID)
+	})
+	provExec(t, `INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, 'owner')`, wsID, testUserID)
+	runtimeID := provInsertRuntime(t, wsID, "prov-audit-rt-"+suffix, "public", testUserID)
+	var grantee, managed string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		) VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'private', 1, $4)
+		RETURNING id
+	`, wsID, "prov-audit-grantee-"+suffix, runtimeID, testUserID).Scan(&grantee); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		) VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'private', 1, $4)
+		RETURNING id
+	`, wsID, "prov-audit-managed-"+suffix, runtimeID, testUserID).Scan(&managed); err != nil {
+		t.Fatal(err)
+	}
+	var grantID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_provisioning_grant (
+			workspace_id, agent_id, granted_by, max_new_agents, max_concurrent_tasks, invocation_policy
+		) VALUES ($1, $2, $3, 0, 1, 'private') RETURNING id
+	`, wsID, grantee, testUserID).Scan(&grantID); err != nil {
+		t.Fatal(err)
+	}
+	provExec(t, `INSERT INTO agent_provisioning_grant_managed_agent (grant_id, agent_id, source) VALUES ($1, $2, 'allowlist')`, grantID, managed)
+	var auditID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_provisioning_audit (
+			workspace_id, grant_id, actor_type, action, target_type, target_id, outcome, reason
+		) VALUES ($1, $2, 'member', 'create_grant', 'grant', $3, 'success', '') RETURNING id
+	`, wsID, grantID, grantID).Scan(&auditID); err != nil {
+		t.Fatal(err)
+	}
+
+	provExec(t, `DELETE FROM agent WHERE id = $1`, grantee)
+	if provCount(t, `SELECT count(*) FROM agent_provisioning_audit WHERE id = $1`, auditID) != 1 {
+		t.Fatal("deleting the grantee removed the provisioning audit row")
+	}
+	if provCount(t, `SELECT count(*) FROM agent_provisioning_grant WHERE id = $1`, grantID) != 1 {
+		t.Fatal("deleting the grantee removed the provisioning grant")
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, testServer.URL+"/api/workspaces/"+wsID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("X-Workspace-ID", wsID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete workspace status=%d body=%s", resp.StatusCode, body)
+	}
+	if provCount(t, `SELECT count(*) FROM agent_provisioning_grant WHERE id = $1`, grantID) != 0 {
+		t.Fatal("workspace delete left the provisioning grant")
+	}
+	if provCount(t, `SELECT count(*) FROM agent_provisioning_audit WHERE id = $1`, auditID) != 1 {
+		t.Fatal("workspace delete removed the provisioning audit row")
+	}
 }
 
 func provAuditText(t *testing.T) string {
