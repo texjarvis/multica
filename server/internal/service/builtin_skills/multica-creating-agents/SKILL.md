@@ -338,6 +338,35 @@ State-changing (require an explicit instruction — do not run speculatively):
 - "`set` and `add` are interchangeable for skills." `set` replaces all
   bindings; using it when you meant `add` silently removes capabilities.
 
+## Owner-granted provisioning
+
+A human workspace owner grants one agent a bounded capability with
+`multica capability grant`, then inspects it with `multica capability inspect`
+and revokes it with `multica capability revoke`. An agent cannot grant itself.
+Task tokens and cloud-node credentials are rejected on those commands.
+
+The grantee uses the existing commands, and only inside that grant:
+
+```bash
+multica agent create --name <name> --runtime-id <runtime-id> --model <model> --max-concurrent-tasks 1 --visibility workspace --output json
+multica agent update <agent-id> --instructions "<runtime behavior contract>" --output json
+multica agent skills add <agent-id> --skill-ids <skill-id> --output json
+multica agent skills set <agent-id> --skill-ids <skill-id> --output json
+multica squad member add <squad-id> --member-id <agent-id> --type agent --role member --output json
+multica runtime list --output json
+```
+
+`multica agent create` still does not send skill bindings. When the grant
+allows it, the create HTTP body may include `skill_ids` that are already on
+the grant; the CLI follow-up remains `agent skills add` or `agent skills set`.
+
+The grant does not copy secrets and it does not change runtime permissions.
+Instructions and role names are not OS isolation. `custom_env`, `custom_args`,
+`mcp_config`, and `runtime_config` stay forbidden on this path. The grantee
+cannot edit itself, cannot change the grant, and cannot archive, restore, or
+cancel. Creating the grant, changing the grantee's own instructions, and
+changing squad instructions remain owner actions.
+
 ## References
 
 `references/creating-agents-source-map.md` maps every contract above to its

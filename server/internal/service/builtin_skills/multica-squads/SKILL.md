@@ -264,6 +264,15 @@ authorizes them.
   `@`-mentioned into an issue assigned to someone else is a guest: roster and
   delegation rules yes, `multica issue status` no.
 
+## Provisioning membership
+
+A provisioning grant does not create a squad and does not change squad
+instructions. The only squad write it allows is `multica squad member add` for
+an agent the grant manages, into a squad id on the grant, with role `member`
+or an empty role. Adding a workspace member, changing roles, and removing
+members stay denied. Role names are not OS isolation, and the grant does not
+copy secrets or change runtime permissions.
+
 ## References
 
 For source paths, tests, edge cases, and exact routing details, see:

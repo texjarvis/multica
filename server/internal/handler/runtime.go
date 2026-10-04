@@ -682,6 +682,10 @@ func canUseRuntimeForAgent(member db.Member, rt db.AgentRuntime) bool {
 }
 
 func (h *Handler) ListAgentRuntimes(w http.ResponseWriter, r *http.Request) {
+	if isMachineActorRequest(r) {
+		h.listRuntimesForProvisioning(w, r)
+		return
+	}
 	workspaceID := h.resolveWorkspaceID(r)
 
 	var runtimes []db.AgentRuntime

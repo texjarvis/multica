@@ -74,4 +74,14 @@ Workspace repos and project resources are not the same thing:
 
 Do not add a project resource just because `repo checkout` failed. First determine whether the user asked for durable project context or just a task checkout.
 
+## Provisioning catalog
+
+Under an owner grant, `multica runtime list --output json` for that agent
+returns only the grant's runtimes, and only `id`, `workspace_id`, `name`,
+`provider`, `runtime_mode`, `status`, and `visibility`. It omits metadata,
+device info, daemon id, and profile id. The allowed models are the ones the
+owner wrote on the grant; this list does not discover models from the runtime.
+The grant does not change runtime permissions and does not copy secrets.
+Instructions and role names are not OS isolation.
+
 More source-backed details: `references/runtimes-and-repos-source-map.md`.

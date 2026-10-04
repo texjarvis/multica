@@ -78,6 +78,16 @@ only.
 | Qwen Code managed-MCP injection | `pkg/agent/qwen.go` | Non-null `mcp_config` is written to a daemon-owned 0600 temporary JSON file and passed with `--mcp-config`; the file is removed after the process exits, while `null` preserves native inheritance. |
 | Random emoji avatar default | `agent_avatar.go` 11–32; `agent.go` 1583 | Omitted, empty, or whitespace-only `avatar_url` becomes a cryptographically selected `emoji:<glyph>` sentinel; explicit values are preserved. The template handler uses the same helper at `agent_template.go` 458. |
 | `CreateAgent` insert params | `agent.go` create path | Persists avatar_url, runtime_config, instructions, custom_env, custom_args, model, thinking_level, service_tier, mcp_config, visibility, max_concurrent_tasks |
+
+## Owner-granted provisioning
+
+| Contract | Line | Behavior |
+|---|---|---|
+| `multica capability` owner grant/inspect/revoke | `server/cmd/multica/cmd_capability.go` 15 | Human owner CLI. Help states the grant does not copy secrets, does not change runtime permissions, and instructions are not OS isolation |
+| Grant routes | `server/cmd/server/router.go` 1254 | `POST/GET /api/agent-provisioning-grants`, `POST /{id}/revoke`. No machine bypass |
+| Coarse task-token admission | `server/cmd/server/human_only_routes.go` 86 | `provisioningRouteEligible` admits only agent create, skill set/add, and `GET /api/runtimes`, and only when a status=active grant row exists |
+| Create authorization under the grant lock | `server/internal/handler/agent_provisioning.go` 381 | `authorizeProvisioningCreate` checks originator, runtime/model, skills, invocation, concurrency, then increments the new-agent counter in the create transaction |
+| Owner grant handler | `server/internal/handler/agent_provisioning.go` 735 | `CreateProvisioningGrant` rejects machine actors, then requires the workspace owner role |
 | `UpdateAgent` rejects `custom_env` | 2079–2089 | if `custom_env` present in body → 400 "use PUT /api/agents/{id}/env (or `multica agent env set`)" |
 | `UpdateAgent` projects/preserves secret fields | 2090–2218 | runtime config projection → preserve; custom args and MCP require explicit replace/clear intent; blind/full legacy response replay preserves; ambiguous non-empty legacy input against an existing hidden value returns 409 |
 | `description` ≤ 255 on update too | 2042–2047 | same cap re-checked on update |

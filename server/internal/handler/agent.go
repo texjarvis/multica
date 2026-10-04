@@ -21,6 +21,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -1613,8 +1614,12 @@ func rejectMachineAgentUpdate(w http.ResponseWriter, r *http.Request, rawFields 
 }
 
 func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
-	if rejectMachineAgentCreation(w, r) {
-		return
+	actor, taskActorOK := middleware.TaskActorFromRequest(r)
+	source := r.Header.Get("X-Actor-Source")
+	if source == "cloud_pat" || (source == "task_token" && !taskActorOK) {
+		if rejectMachineAgentCreation(w, r) {
+			return
+		}
 	}
 	workspaceID := h.resolveWorkspaceID(r)
 
@@ -1623,6 +1628,12 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	if taskActorOK {
+		if field := firstDisallowedField(rawFields, provisioningCreateFields); field != "" {
+			h.denyProvisioningWithoutMutation(w, r, "create_agent", "agent", "", "forbidden_field:"+field, fmt.Sprintf("field %s is forbidden under a provisioning grant", field))
+			return
+		}
 	}
 	ownerID, ok := requireUserID(w, r)
 	if !ok {
@@ -1774,6 +1785,17 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 	qtx := h.Queries.WithTx(tx)
 
+	var provGrant db.AgentProvisioningGrant
+	var provOriginator pgtype.UUID
+	if taskActorOK {
+		var perr *provisioningError
+		provGrant, provOriginator, perr = h.authorizeProvisioningCreate(r.Context(), qtx, actor, req, perm, runtimeUUID, skillUUIDs)
+		if perr != nil {
+			h.finishProvisioningAuthError(w, r.Context(), tx, qtx, auditFromActor(actor, provGrant, provOriginator, "create_agent", "agent", ""), perr)
+			return
+		}
+	}
+
 	created, err := qtx.CreateAgent(r.Context(), db.CreateAgentParams{
 		WorkspaceID:              wsUUID,
 		Name:                     req.Name,
@@ -1817,6 +1839,20 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 			SkillID: skillID,
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to attach agent skill")
+			return
+		}
+	}
+	if taskActorOK {
+		if err := qtx.InsertProvisioningManagedAgent(r.Context(), db.InsertProvisioningManagedAgentParams{
+			GrantID: provGrant.ID,
+			AgentID: created.ID,
+			Source:  provisioningSourceCreated,
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record provisioned agent")
+			return
+		}
+		if _, err := qtx.InsertProvisioningAudit(r.Context(), auditFromActor(actor, provGrant, provOriginator, "create_agent", "agent", uuidToString(created.ID)).params("success", "")); err != nil {
+			writeError(w, http.StatusInternalServerError, "provisioning audit failed")
 			return
 		}
 	}
@@ -2170,7 +2206,8 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if rejectMachineAgentUpdate(w, r, rawFields) {
+	useProvisioningGrant, stop := h.classifyMachineAgentUpdate(w, r, rawFields)
+	if stop {
 		return
 	}
 
@@ -2629,7 +2666,33 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	updated, err := h.Queries.UpdateAgent(r.Context(), params)
+	writeQ := h.Queries
+	var prov *provisioningWrite
+	if useProvisioningGrant {
+		checkRuntime := req.RuntimeID != nil || req.Model != nil
+		modelForGrant := ""
+		if existing.Model.Valid {
+			modelForGrant = existing.Model.String
+		}
+		if req.Model != nil {
+			modelForGrant = *req.Model
+		} else if params.Model.Valid {
+			modelForGrant = params.Model.String
+		}
+		runtimeForGrant := existing.RuntimeID
+		if params.RuntimeID.Valid {
+			runtimeForGrant = params.RuntimeID
+		}
+		var opened bool
+		prov, opened = h.openProvisioningUpdate(w, r, existing, req, checkRuntime, runtimeForGrant, modelForGrant, replacePermissionTargets, resolvedPerm)
+		if !opened {
+			return
+		}
+		defer prov.rollback(r.Context())
+		writeQ = prov.q
+	}
+
+	updated, err := writeQ.UpdateAgent(r.Context(), params)
 	if err != nil {
 		// Unique constraint on (workspace_id, name) — mirror CreateAgent and
 		// return a clear conflict instead of a 500 that leaks the raw
@@ -2655,7 +2718,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// clear the field. COALESCE in UpdateAgent cannot set a column to NULL, so
 	// mcp_config, thinking_level, and service_tier use dedicated clear queries.
 	if shouldClearMcpConfig {
-		updated, err = h.Queries.ClearAgentMcpConfig(r.Context(), updated.ID)
+		updated, err = writeQ.ClearAgentMcpConfig(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent mcp_config failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear mcp_config: "+err.Error())
@@ -2663,7 +2726,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if shouldClearThinkingLevel {
-		updated, err = h.Queries.ClearAgentThinkingLevel(r.Context(), updated.ID)
+		updated, err = writeQ.ClearAgentThinkingLevel(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent thinking_level failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear thinking_level: "+err.Error())
@@ -2671,7 +2734,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if shouldClearServiceTier {
-		updated, err = h.Queries.ClearAgentServiceTier(r.Context(), updated.ID)
+		updated, err = writeQ.ClearAgentServiceTier(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent service_tier failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear service_tier: "+err.Error())
@@ -2679,7 +2742,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if shouldClearComposioAllowlist {
-		updated, err = h.Queries.ClearAgentComposioToolkitAllowlist(r.Context(), updated.ID)
+		updated, err = writeQ.ClearAgentComposioToolkitAllowlist(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent composio_toolkit_allowlist failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear composio_toolkit_allowlist: "+err.Error())
@@ -2691,11 +2754,14 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// permission. Done after the row update so a permission_mode flip and its
 	// targets land together.
 	if replacePermissionTargets {
-		if err := h.replaceInvocationTargets(r.Context(), updated.ID, parseUUID(requestUserID(r)), resolvedPerm.targets); err != nil {
+		if err := replaceInvocationTargetsWithQueries(r.Context(), writeQ, updated.ID, parseUUID(requestUserID(r)), resolvedPerm.targets); err != nil {
 			slog.Warn("update agent: persist invocation targets failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to update invocation targets: "+err.Error())
 			return
 		}
+	}
+	if prov != nil && !prov.commitSuccess(r.Context(), w) {
+		return
 	}
 
 	resp := agentToResponse(updated)
@@ -2763,6 +2829,9 @@ func (h *Handler) resolveAgentProvider(r *http.Request, workspaceID pgtype.UUID,
 }
 
 func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineAgentLifecycle(w, r, "archive agents") {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, id)
 	if !ok {
@@ -2812,6 +2881,9 @@ func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RestoreAgent(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineAgentLifecycle(w, r, "restore agents") {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, id)
 	if !ok {
@@ -2864,6 +2936,9 @@ type cancelAgentTasksResponse struct {
 }
 
 func (h *Handler) CancelAgentTasks(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineAgentLifecycle(w, r, "cancel agent tasks") {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, id)
 	if !ok {

@@ -4,6 +4,12 @@ This file records source evidence for `multica-squads/SKILL.md`.
 
 Use this when the task requires exact source paths, edge-case behavior, tests, or contract verification.
 
+## Provisioning membership
+
+- `server/internal/handler/agent_provisioning.go` 160 rejects every machine squad create, update, delete, member removal, and role change.
+- `server/internal/handler/squad.go` 769 is the grant path inside `AddSquadMember`. It allows only `member_type=agent` and role `member` or empty, for a managed agent and an allowlisted squad.
+- Adding a human member is denied. The grant does not copy secrets or change runtime permissions. Role names are not OS isolation.
+
 ## Object Model
 
 ### DB shape

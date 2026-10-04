@@ -851,7 +851,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
-		r.Use(requireHumanOnSensitiveRoutes)
+		r.Use(requireHumanOnSensitiveRoutesWithQueries(queries))
 		r.Use(middleware.RefreshCloudFrontCookies(cfSigner))
 
 		// --- User-scoped routes (no workspace context required) ---
@@ -1247,6 +1247,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Delete("/resolve", h.UnresolveComment)
 				r.Post("/reactions", h.AddReaction)
 				r.Delete("/reactions", h.RemoveReaction)
+			})
+
+			// Owner-granted provisioning. Human owners only; the route guard
+			// has no machine bypass for this prefix.
+			r.Route("/api/agent-provisioning-grants", func(r chi.Router) {
+				r.Post("/", h.CreateProvisioningGrant)
+				r.Get("/", h.InspectProvisioningGrant)
+				r.Post("/{id}/revoke", h.RevokeProvisioningGrant)
 			})
 
 			// Agents

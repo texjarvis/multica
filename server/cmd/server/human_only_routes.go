@@ -1,10 +1,20 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+)
+
+const (
+	provisioningBypassFallthrough = iota
+	provisioningBypassAllow
+	provisioningBypassResponded
 )
 
 // requireHumanOnSensitiveRoutes centralizes the protected-API scopes where a
@@ -12,14 +22,82 @@ import (
 // immediately after Auth, which has stripped client actor headers and stamped
 // authoritative task_token/cloud_pat sources.
 func requireHumanOnSensitiveRoutes(next http.Handler) http.Handler {
-	humanOnly := handler.RequireHumanActor(next)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isHumanOnlyProtectedRoute(r.Method, r.URL.Path) {
-			humanOnly.ServeHTTP(w, r)
-			return
-		}
-		next.ServeHTTP(w, r)
+	return requireHumanOnSensitiveRoutesWithQueries(nil)(next)
+}
+
+func requireHumanOnSensitiveRoutesWithQueries(queries *db.Queries) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		humanOnly := handler.RequireHumanActor(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !isHumanOnlyProtectedRoute(r.Method, r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			switch provisioningRouteBypass(w, r, queries) {
+			case provisioningBypassAllow:
+				next.ServeHTTP(w, r)
+			case provisioningBypassResponded:
+				return
+			default:
+				humanOnly.ServeHTTP(w, r)
+			}
+		})
+	}
+}
+
+func provisioningRouteBypass(w http.ResponseWriter, r *http.Request, queries *db.Queries) int {
+	if queries == nil || !provisioningRouteEligible(r.Method, r.URL.Path) {
+		return provisioningBypassFallthrough
+	}
+	if r.Header.Get("X-Actor-Source") != "task_token" {
+		return provisioningBypassFallthrough
+	}
+	actor, ok := middleware.TaskActorFromRequest(r)
+	if !ok {
+		return provisioningBypassFallthrough
+	}
+	workspaceID, err := util.ParseUUID(actor.WorkspaceID)
+	if err != nil {
+		return provisioningBypassFallthrough
+	}
+	agentID, err := util.ParseUUID(actor.AgentID)
+	if err != nil {
+		return provisioningBypassFallthrough
+	}
+	// Includes an expired active row so the handler can deny it as expired
+	// and write the audit. Revoked rows do not match, and this probe is not
+	// itself the authorization decision.
+	exists, err := queries.ActiveProvisioningGrantExists(r.Context(), db.ActiveProvisioningGrantExistsParams{
+		WorkspaceID: workspaceID,
+		AgentID:     agentID,
 	})
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "provisioning authorization unavailable"})
+		return provisioningBypassResponded
+	}
+	if !exists {
+		return provisioningBypassFallthrough
+	}
+	return provisioningBypassAllow
+}
+
+func provisioningRouteEligible(method, path string) bool {
+	path = strings.TrimSuffix(path, "/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if method == http.MethodPost && len(parts) == 2 && parts[0] == "api" && parts[1] == "agents" {
+		return true
+	}
+	if len(parts) >= 4 && parts[0] == "api" && parts[1] == "agents" && parts[2] != "" {
+		if method == http.MethodPut && len(parts) == 4 && parts[3] == "skills" {
+			return true
+		}
+		if method == http.MethodPost && len(parts) == 5 && parts[3] == "skills" && parts[4] == "add" {
+			return true
+		}
+	}
+	return method == http.MethodGet && len(parts) == 2 && parts[0] == "api" && parts[1] == "runtimes"
 }
 
 func isHumanOnlyProtectedRoute(method, path string) bool {
@@ -64,6 +142,7 @@ func isHumanOnlyProtectedRoute(method, path string) bool {
 		"/api/agent-builder",
 		"/api/cloud-runtime",
 		"/api/runtimes",
+		"/api/agent-provisioning-grants",
 		"/api/notification-preferences",
 		"/api/inbox",
 		"/api/dashboard",

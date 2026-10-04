@@ -12,3 +12,4 @@
 - `server/cmd/server/router.go` registers daemon APIs under `/api/daemon`, including workspace repos and task claim.
 - `server/internal/daemon/daemon.go` claims tasks, prepares workdirs, launches provider CLIs, and reports completion.
 - `server/internal/daemon/execenv/runtime_config.go` injects task/project/repo context into agent workdirs.
+- Provisioning catalog: `server/internal/handler/runtime.go` 684 sends machine callers to `listRuntimesForProvisioning` (`server/internal/handler/agent_provisioning.go` 615). The response keeps `id`, `workspace_id`, `name`, `provider`, `runtime_mode`, `status`, and `visibility`. Models stay the owner-declared grant pairs. The read does not change runtime permissions and does not copy secrets. Instructions and role names are not OS isolation.

@@ -64,6 +64,66 @@ type AgentInvocationTarget struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type AgentProvisioningAudit struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	GrantID          pgtype.UUID        `json:"grant_id"`
+	ActorType        string             `json:"actor_type"`
+	ActorID          pgtype.UUID        `json:"actor_id"`
+	TaskID           pgtype.UUID        `json:"task_id"`
+	OriginatorUserID pgtype.UUID        `json:"originator_user_id"`
+	Action           string             `json:"action"`
+	TargetType       string             `json:"target_type"`
+	TargetID         string             `json:"target_id"`
+	Outcome          string             `json:"outcome"`
+	Reason           string             `json:"reason"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type AgentProvisioningGrant struct {
+	ID                 pgtype.UUID        `json:"id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	AgentID            pgtype.UUID        `json:"agent_id"`
+	GrantedBy          pgtype.UUID        `json:"granted_by"`
+	Status             string             `json:"status"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RevokedBy          pgtype.UUID        `json:"revoked_by"`
+	MaxNewAgents       int32              `json:"max_new_agents"`
+	NewAgentsCreated   int32              `json:"new_agents_created"`
+	MaxConcurrentTasks int32              `json:"max_concurrent_tasks"`
+	InvocationPolicy   string             `json:"invocation_policy"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AgentProvisioningGrantManagedAgent struct {
+	GrantID pgtype.UUID `json:"grant_id"`
+	AgentID pgtype.UUID `json:"agent_id"`
+	Source  string      `json:"source"`
+}
+
+type AgentProvisioningGrantOriginator struct {
+	GrantID pgtype.UUID `json:"grant_id"`
+	UserID  pgtype.UUID `json:"user_id"`
+}
+
+type AgentProvisioningGrantRuntime struct {
+	GrantID   pgtype.UUID `json:"grant_id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	Model     string      `json:"model"`
+}
+
+type AgentProvisioningGrantSkill struct {
+	GrantID pgtype.UUID `json:"grant_id"`
+	SkillID pgtype.UUID `json:"skill_id"`
+}
+
+type AgentProvisioningGrantSquad struct {
+	GrantID pgtype.UUID `json:"grant_id"`
+	SquadID pgtype.UUID `json:"squad_id"`
+}
+
 type AgentRuntime struct {
 	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`

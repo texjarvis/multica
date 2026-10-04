@@ -81,6 +81,9 @@ func sameDisabledRuntimeSkill(a, b DisabledRuntimeSkill) bool {
 // SetAgentRuntimeSkillEnabled persists a per-agent override for a skill that
 // is discovered from the agent's currently assigned local runtime.
 func (h *Handler) SetAgentRuntimeSkillEnabled(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSkillControl(w, r) {
+		return
+	}
 	agentID := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, agentID)
 	if !ok {

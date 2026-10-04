@@ -223,6 +223,9 @@ func (h *Handler) ListSquads(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateSquad(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSquadStructure(w, r) {
+		return
+	}
 	workspaceID := workspaceIDFromURL(r, "workspaceId")
 	// Any workspace member can create a squad and becomes its creator
 	// (CreatorID below). This aligns squads with agents/projects, which are
@@ -331,6 +334,9 @@ func (h *Handler) GetSquad(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSquadStructure(w, r) {
+		return
+	}
 	workspaceID := workspaceIDFromURL(r, "workspaceId")
 	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
 	if !ok {
@@ -421,6 +427,9 @@ func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteSquad(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSquadStructure(w, r) {
+		return
+	}
 	workspaceID := workspaceIDFromURL(r, "workspaceId")
 	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
 	if !ok {
@@ -755,7 +764,50 @@ func (h *Handler) AddSquadMember(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sm, err := h.Queries.AddSquadMember(r.Context(), db.AddSquadMemberParams{
+	var sm db.SquadMember
+	var err error
+	if isMachineActorRequest(r) {
+		tx, txErr := h.TxStarter.Begin(r.Context())
+		if txErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "provisioning authorization unavailable")
+			return
+		}
+		defer tx.Rollback(r.Context())
+		qtx := h.Queries.WithTx(tx)
+		audit, perr := h.authorizeProvisioningSquadAdd(r.Context(), qtx, r, squad.ID, req.MemberType, req.Role, memberUUID)
+		if perr != nil {
+			h.finishProvisioningAuthError(w, r.Context(), tx, qtx, audit, perr)
+			return
+		}
+		sm, err = qtx.AddSquadMember(r.Context(), db.AddSquadMemberParams{
+			SquadID:    squad.ID,
+			MemberType: req.MemberType,
+			MemberID:   memberUUID,
+			Role:       req.Role,
+		})
+		if err != nil {
+			if isUniqueViolation(err) {
+				writeError(w, http.StatusConflict, "member already in squad")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "failed to add squad member")
+			return
+		}
+		if _, err := qtx.InsertProvisioningAudit(r.Context(), audit.params("success", "")); err != nil {
+			writeError(w, http.StatusInternalServerError, "provisioning audit failed")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "provisioning audit failed")
+			return
+		}
+		writeJSON(w, http.StatusCreated, squadMemberToResponse(sm))
+		h.publish(protocol.EventSquadUpdated, workspaceID, "member", requestUserID(r), map[string]any{
+			"squad_id": uuidToString(squad.ID),
+		})
+		return
+	}
+	sm, err = h.Queries.AddSquadMember(r.Context(), db.AddSquadMemberParams{
 		SquadID:    squad.ID,
 		MemberType: req.MemberType,
 		MemberID:   memberUUID,
@@ -777,6 +829,9 @@ func (h *Handler) AddSquadMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RemoveSquadMember(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSquadStructure(w, r) {
+		return
+	}
 	workspaceID := workspaceIDFromURL(r, "workspaceId")
 	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
 	if !ok {
@@ -833,6 +888,9 @@ func (h *Handler) RemoveSquadMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateSquadMemberRole(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSquadStructure(w, r) {
+		return
+	}
 	workspaceID := workspaceIDFromURL(r, "workspaceId")
 	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
 	if !ok {

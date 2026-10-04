@@ -2464,6 +2464,17 @@ func (h *Handler) SetAgentSkills(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 
 	qtx := h.Queries.WithTx(tx)
+	if isMachineActorRequest(r) {
+		audit, perr := h.authorizeProvisioningSkills(r.Context(), qtx, r, agent, skillUUIDs, "set_skills")
+		if perr != nil {
+			h.finishProvisioningAuthError(w, r.Context(), tx, qtx, audit, perr)
+			return
+		}
+		if _, err := qtx.InsertProvisioningAudit(r.Context(), audit.params("success", "")); err != nil {
+			writeError(w, http.StatusInternalServerError, "provisioning audit failed")
+			return
+		}
+	}
 
 	if err := qtx.RemoveAllAgentSkills(r.Context(), agent.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to clear agent skills")
@@ -2519,6 +2530,17 @@ func (h *Handler) AddAgentSkills(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 
 	qtx := h.Queries.WithTx(tx)
+	if isMachineActorRequest(r) {
+		audit, perr := h.authorizeProvisioningSkills(r.Context(), qtx, r, agent, skillUUIDs, "add_skills")
+		if perr != nil {
+			h.finishProvisioningAuthError(w, r.Context(), tx, qtx, audit, perr)
+			return
+		}
+		if _, err := qtx.InsertProvisioningAudit(r.Context(), audit.params("success", "")); err != nil {
+			writeError(w, http.StatusInternalServerError, "provisioning audit failed")
+			return
+		}
+	}
 	for _, skillID := range skillUUIDs {
 		if err := qtx.AddAgentSkill(r.Context(), db.AddAgentSkillParams{
 			AgentID: agent.ID,
@@ -2538,6 +2560,9 @@ func (h *Handler) AddAgentSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SetAgentSkillEnabled(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSkillControl(w, r) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, id)
 	if !ok {
@@ -2576,6 +2601,9 @@ func (h *Handler) SetAgentSkillEnabled(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RemoveAgentSkill(w http.ResponseWriter, r *http.Request) {
+	if rejectMachineSkillControl(w, r) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, id)
 	if !ok {
