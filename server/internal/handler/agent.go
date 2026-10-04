@@ -2253,8 +2253,10 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Lock before any value is taken from the pre-lock snapshot. Delegated
-	// updates lock the grant, then the agent. Human runtime/model/thinking/
-	// service-tier updates lock managing grants, then the agent. The params
+	// updates lock the grant, then the agent, and authorize the resulting
+	// runtime/model pair from that locked row. Human runtime/model/thinking/
+	// service-tier updates take the same grant-then-agent locks so they
+	// cannot interleave, without applying the grant allowlist. The params
 	// below are computed from that locked row.
 	var prov *provisioningWrite
 	writeQ := h.Queries
@@ -2710,11 +2712,6 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		if perr := h.authorizeLockedProvisioningUpdate(r, prov, req, pairChanged, runtimeForGrant, modelForGrant, replacePermissionTargets, resolvedPerm); perr != nil {
 			h.finishProvisioningAuthError(w, r.Context(), prov.tx, prov.q, prov.audit, perr)
 			prov.tx = nil
-			return
-		}
-	}
-	if prov != nil && prov.human && pairChanged {
-		if !h.authorizeHumanResultingPair(w, r, prov, existing, runtimeForGrant, modelForGrant) {
 			return
 		}
 	}

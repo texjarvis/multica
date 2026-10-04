@@ -90,12 +90,11 @@ func (a provisioningAudit) params(outcome, reason string) db.InsertProvisioningA
 }
 
 type provisioningWrite struct {
-	tx     pgx.Tx
-	q      *db.Queries
-	audit  provisioningAudit
-	grant  db.AgentProvisioningGrant
-	grants []db.AgentProvisioningGrant
-	human  bool
+	tx    pgx.Tx
+	q     *db.Queries
+	audit provisioningAudit
+	grant db.AgentProvisioningGrant
+	human bool
 }
 
 func (p *provisioningWrite) rollback(ctx context.Context) {
@@ -545,8 +544,12 @@ func (h *Handler) beginProvisioningAgentUpdate(w http.ResponseWriter, r *http.Re
 }
 
 // beginHumanConfigurationUpdate locks every active grant that manages the
-// agent, ordered by id, then the agent row. An agent with no grant still
-// takes the agent lock so a concurrent delegated update cannot interleave.
+// agent, ordered by id, then the agent row. The locks stop a concurrent
+// delegated update from committing against a stale runtime/model snapshot.
+// The grant allowlist is not applied here: a provisioning grant limits
+// delegated machine authority and does not reduce the human owner's
+// existing authority. An agent with no grant still takes the agent lock so
+// a concurrent delegated update cannot interleave.
 func (h *Handler) beginHumanConfigurationUpdate(w http.ResponseWriter, r *http.Request, existing db.Agent) (*provisioningWrite, db.Agent, bool) {
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
@@ -554,11 +557,10 @@ func (h *Handler) beginHumanConfigurationUpdate(w http.ResponseWriter, r *http.R
 		return nil, db.Agent{}, false
 	}
 	q := h.Queries.WithTx(tx)
-	grants, err := q.LockActiveGrantsForManagedAgent(r.Context(), db.LockActiveGrantsForManagedAgentParams{
+	if _, err := q.LockActiveGrantsForManagedAgent(r.Context(), db.LockActiveGrantsForManagedAgentParams{
 		AgentID:     existing.ID,
 		WorkspaceID: existing.WorkspaceID,
-	})
-	if err != nil {
+	}); err != nil {
 		_ = tx.Rollback(r.Context())
 		writeError(w, http.StatusServiceUnavailable, "provisioning authorization unavailable")
 		return nil, db.Agent{}, false
@@ -569,7 +571,7 @@ func (h *Handler) beginHumanConfigurationUpdate(w http.ResponseWriter, r *http.R
 		writeError(w, lockErr.status, lockErr.message)
 		return nil, db.Agent{}, false
 	}
-	return &provisioningWrite{tx: tx, q: q, grants: grants, human: true}, locked, true
+	return &provisioningWrite{tx: tx, q: q, human: true}, locked, true
 }
 
 func (h *Handler) authorizeLockedProvisioningUpdate(
@@ -594,29 +596,6 @@ func (h *Handler) authorizeLockedProvisioningUpdate(
 		return invocationWithinPolicy(prov.grant.InvocationPolicy, perm)
 	}
 	return nil
-}
-
-func (h *Handler) authorizeHumanResultingPair(w http.ResponseWriter, r *http.Request, prov *provisioningWrite, existing db.Agent, runtimeID pgtype.UUID, model string) bool {
-	for _, grant := range prov.grants {
-		perr := h.runtimeModelAllowed(r.Context(), prov.q, grant.ID, runtimeID, model)
-		if perr == nil {
-			continue
-		}
-		actorID, _ := util.ParseUUID(requestUserID(r))
-		audit := provisioningAudit{
-			workspace:  existing.WorkspaceID,
-			grantID:    grant.ID,
-			actorType:  "member",
-			actorID:    actorID,
-			action:     "update_agent",
-			targetType: "agent",
-			targetID:   uuidToString(existing.ID),
-		}
-		h.finishProvisioningAuthError(w, r.Context(), prov.tx, prov.q, audit, perr)
-		prov.tx = nil
-		return false
-	}
-	return true
 }
 
 func (h *Handler) authorizeProvisioningSkills(ctx context.Context, q *db.Queries, r *http.Request, agent db.Agent, skillIDs []pgtype.UUID, action string) (provisioningAudit, *provisioningError) {

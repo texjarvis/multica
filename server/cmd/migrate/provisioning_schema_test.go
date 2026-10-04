@@ -103,15 +103,6 @@ func TestProvisioningForwardMigrationRetainsAudit(t *testing.T) {
 		t.Fatalf("agent_provisioning tables have %d foreign keys", fkCount)
 	}
 
-	var auditID string
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO agent_provisioning_audit (
-			workspace_id, grant_id, actor_type, action, outcome
-		) VALUES (gen_random_uuid(), gen_random_uuid(), 'member', 'create_grant', 'success')
-		RETURNING id::text
-	`).Scan(&auditID); err != nil {
-		t.Fatal(err)
-	}
 	var grantID string
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO agent_provisioning_grant (
@@ -121,15 +112,26 @@ func TestProvisioningForwardMigrationRetainsAudit(t *testing.T) {
 	`).Scan(&grantID); err != nil {
 		t.Fatal(err)
 	}
+	var auditID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO agent_provisioning_audit (
+			workspace_id, grant_id, actor_type, action, outcome
+		) VALUES (gen_random_uuid(), $1, 'member', 'create_grant', 'success')
+		RETURNING id::text
+	`, grantID).Scan(&auditID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `DELETE FROM agent_provisioning_grant WHERE id = $1`, grantID); err != nil {
 		t.Fatal(err)
 	}
 	var remaining int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_provisioning_audit WHERE id = $1`, auditID).Scan(&remaining); err != nil {
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_provisioning_audit WHERE id = $1 AND grant_id = $2
+	`, auditID, grantID).Scan(&remaining); err != nil {
 		t.Fatal(err)
 	}
 	if remaining != 1 {
-		t.Fatal("deleting a grant removed the audit row")
+		t.Fatal("deleting a grant removed the audit row for that grant")
 	}
 
 	downFiles, err := migrations.Files("down")
@@ -170,10 +172,12 @@ func TestProvisioningForwardMigrationRetainsAudit(t *testing.T) {
 	if tableName == "" {
 		t.Fatal("migrate down dropped agent_provisioning_audit")
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_provisioning_audit WHERE id = $1`, auditID).Scan(&remaining); err != nil {
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_provisioning_audit WHERE id = $1 AND grant_id = $2
+	`, auditID, grantID).Scan(&remaining); err != nil {
 		t.Fatal(err)
 	}
 	if remaining != 1 {
-		t.Fatal("migrate down removed the audit row")
+		t.Fatal("migrate down removed the audit row for the deleted grant")
 	}
 }

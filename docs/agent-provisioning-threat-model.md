@@ -39,18 +39,24 @@ creates one through the API below.
   transaction as the write. Lock order is active `agent_provisioning_grant`
   rows `FOR UPDATE` (ordered by id when more than one is taken), then the
   target `agent` row `FOR UPDATE`. Revoke locks the grant by id and does not
-  lock the agent, so the two paths cannot deadlock. The resulting runtime,
-  model, thinking level, service tier, and invocation policy are checked
-  against that locked agent. Two partial updates that are each allowed
-  against a stale snapshot cannot commit as a combination the grant forbids.
+  lock the agent, so the two paths cannot deadlock. A delegated write derives
+  its resulting runtime, model, thinking level, service tier, and invocation
+  policy from that locked agent and checks them against the locked grant.
+  Two delegated partial updates that are each allowed against a stale
+  snapshot cannot commit as a combination the grant forbids. If a human
+  change commits first, the delegated partial update revalidates the new
+  locked state and is denied when that pair is outside the grant.
 - A human update that sets `runtime_id`, `model`, `thinking_level`, or
-  `service_tier` on a managed agent takes the same lock order. The resulting
-  runtime and model must be allowed by every active grant that manages the
-  agent, including an expired grant that is still `status=active`. The owner
-  lifts that limit by revoking the grant. Metadata-only human updates do not
-  take the grant lock. Denial of a forbidden pair writes the same
-  `runtime_not_allowed` / `model_not_allowed` audit reason as a delegated
-  denial. Human successes are not audited.
+  `service_tier` on a managed agent takes the same lock order so it cannot
+  interleave with a delegated write. The grant allowlist does not apply to
+  that human update, including when the grant is expired but still
+  `status=active`. Existing human authorization is unchanged, and the owner
+  does not revoke the grant before editing. The human edit does not revoke
+  or expand the grant. Metadata-only human updates do not take the grant
+  lock. Human successes are not audited. A later authorized human edit may
+  leave a runtime/model pair the grant does not allow; that pair is the
+  owner's edit, not a delegated escape. A following delegated write is still
+  checked against the grant and the new locked state.
 - Skill bind/replace and squad-member add re-lock the target agent inside
   the grant transaction after the grant lock and before the managed-agent
   check. Creating a grant re-reads the agent, runtimes, skills, managed
@@ -107,10 +113,12 @@ limited to managed agents. An expired grant is still
 expired. After revocation, metadata-only updates return to the ungranted
 machine allowlist. Non-metadata updates stay denied.
 
-Human owner and member flows do not borrow the grant to act as the grantee.
-When the target agent is managed by an active grant, a human change to
-runtime or model still has to leave a pair that grant allows. Thinking
-level and service tier are validated against the locked agent's provider.
+Human owner and member flows do not borrow the grant to act as the grantee,
+and the grant does not reduce the authority those humans already have.
+A human who can manage the agent can change its runtime or model while a
+grant is active or expired, without revoking the grant first. Thinking
+level and service tier stay validated against the target runtime's provider.
+Delegated runtime and model changes stay on the grant allowlist.
 
 ## Files
 

@@ -367,6 +367,13 @@ cannot edit itself, cannot change the grant, and cannot archive, restore, or
 cancel. Creating the grant, changing the grantee's own instructions, and
 changing squad instructions remain owner actions.
 
+The grant limits the grantee's delegated writes. It does not reduce a human
+owner's existing authority to edit agents they already manage, including
+runtime and model, and that edit does not require revoking the grant. The
+edit also does not expand or revoke the grant. After the human commits, a
+later delegated update is checked against the new locked runtime and model
+and is denied when that pair is outside the grant.
+
 ## References
 
 `references/creating-agents-source-map.md` maps every contract above to its
