@@ -110,12 +110,23 @@ Human owner and member flows do not enter the grant check.
 
 ## Rollback
 
-Apply `244_agent_provisioning_grant.down.sql` (or `make migrate-down` once,
-while this is the newest migration). That drops the grant and audit tables.
-Previous agent, squad, and runtime rows are not modified by the down
-migration. Deploy the previous server binary so the routes and CLI command
-disappear with the tables. Revoking a grant is the runtime kill switch and
-does not require a schema rollback.
+Apply `244_agent_provisioning_grant.down.sql` with an explicit `DATABASE_URL`
+pointed at the database you intend to change:
+
+```
+cd server && DATABASE_URL='postgres://.../your_db?sslmode=disable' go run ./cmd/migrate down
+```
+
+`make migrate-up` and `make migrate-down` both call
+`scripts/ensure-postgres.sh`. From a checkout whose compose project is
+`multica`, that script runs `docker compose up -d postgres` and can recreate
+the live self-host database. Do not use those Make targets against this
+worktree. Use `go run ./cmd/migrate` with a URL that is not the live stack.
+
+The down migration drops the grant and audit tables. Previous agent, squad,
+and runtime rows are not modified. Deploy the previous server binary so the
+routes and CLI command disappear with the tables. Revoking a grant is the
+runtime kill switch and does not require a schema rollback.
 
 ## Eight specialist configurations
 
